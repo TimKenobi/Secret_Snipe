@@ -1,0 +1,149 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: secretsnipe-postgres
+    environment:
+      POSTGRES_DB: secretsnipe
+      POSTGRES_USER: secretsnipe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - secretsnipe-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secretsnipe -d secretsnipe"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: secretsnipe-redis
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - secretsnipe-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # SecretSnipe Scanner
+  scanner:
+    build: .
+    container_name: secretsnipe-scanner
+    environment:
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Application
+      LOG_LEVEL: INFO
+      DEBUG: "false"
+    volumes:
+      - ./signatures.json:/app/signatures.json:ro
+      - ./config.json:/app/config.json:ro
+      - scan_data:/scan
+      - ./logs:/app/logs
+    networks:
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "secret_snipe_pg.py", "/scan", "--project", "container-scan"]
+
+  # SecretSnipe Visualizer
+  visualizer:
+    build: .
+    container_name: secretsnipe-visualizer
+    environment:
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Application
+      LOG_LEVEL: INFO
+      DEBUG: "false"
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./signatures.json:/app/signatures.json:ro
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+    networks:
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "unified_visualizer_pg.py"]
+
+  # Webhook Service (Optional)
+  webhook-service:
+    build: .
+    container_name: secretsnipe-webhook
+    environment:
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Webhook configuration
+      WEBHOOK_ENABLED: "true"
+      WEBHOOK_URL: ${WEBHOOK_URL:-http://example.com/webhook}
+    volumes:
+      - ./config.json:/app/config.json:ro
+    networks:
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    command: ["python", "webhook_service.py"]
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  scan_data:
+    driver: local
+
+networks:
+  secretsnipe-network:
+    driver: bridge

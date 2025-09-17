@@ -60,7 +60,7 @@ services:
     volumes:
       - ./signatures.json:/app/signatures.json:ro
       - ./config.json:/app/config.json:ro
-      - scan_data:/scan
+      - ${MONITOR_VOLUME:-./monitor_data:/scan:ro}
       - ./logs:/app/logs
     networks:
       - secretsnipe-network
@@ -171,12 +171,14 @@ services:
       REDIS_PORT: 6379
       # Teams webhook for weekly reports
       TEAMS_WEBHOOK_URL: ${TEAMS_WEBHOOK_URL:-}
+      # Volume mount configuration
+      MONITOR_VOLUME: ${MONITOR_VOLUME:-/monitor}
       # Application
       LOG_LEVEL: INFO
       DEBUG: "false"
     volumes:
       - ./config.json:/app/config.json:ro
-      - //o:/monitor:ro
+      - ${MONITOR_VOLUME:-./monitor_data:/monitor:ro}
       - ./logs:/app/logs
     networks:
       - secretsnipe-network
@@ -207,9 +209,11 @@ services:
       # Monitoring settings
       MONITOR_PATH: /app/host_monitor
       ENABLE_CONTINUOUS_MONITORING: "true"
+      # Volume mount configuration
+      HOST_MONITOR_VOLUME: ${HOST_MONITOR_VOLUME:-/app/host_monitor}
     volumes:
       - ./config.json:/app/config.json:ro
-      - "O:/app/host_monitor:ro"
+      - ${HOST_MONITOR_VOLUME:-./monitor_data:/app/host_monitor:ro}
     networks:
       - secretsnipe-network
     depends_on:
@@ -218,7 +222,7 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    command: ["python", "host_monitor.py"]
+    command: ["python", "continuous_monitor_pg.py", "/app/host_monitor", "--project", "host-monitor"]
 
 volumes:
   postgres_data:

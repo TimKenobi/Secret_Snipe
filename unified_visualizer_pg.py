@@ -31,13 +31,14 @@ import threading
 import time
 import re
 import ipaddress
+import os
 from functools import wraps
 
 from database_manager import (
     db_manager, project_manager, scan_session_manager,
     findings_manager, init_database
 )
-from redis_manager import redis_manager, cache_manager, scan_cache
+from redis_manager import redis_manager, cache_manager, scan_cache, init_redis
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -217,7 +218,7 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
             df = pd.DataFrame(findings)
 
             # Sanitize data before caching
-            df = df.applymap(lambda x: sanitize_input(str(x)) if isinstance(x, str) else x)
+            df = df.map(lambda x: sanitize_input(str(x)) if isinstance(x, str) else x)
 
             df['first_seen'] = pd.to_datetime(df['first_seen'])
             df['last_seen'] = pd.to_datetime(df['last_seen'])
@@ -665,8 +666,7 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('dashboard_security.log'),
-            logging.StreamHandler()
+            logging.StreamHandler()  # Only use stream handler for read-only containers
         ]
     )
 
@@ -685,15 +685,15 @@ def main():
         return 1
 
     # Initialize Redis with security validation
-    if not redis_manager.ping():
+    if not init_redis(host=os.getenv('REDIS_HOST', 'redis'), port=int(os.getenv('REDIS_PORT', 6379))):
         logger.warning("⚠️ Redis not available - dashboard will work with reduced caching")
         audit_log('redis_unavailable', 'system', {'impact': 'reduced_caching'})
     else:
         logger.info("✅ Redis connection established")
 
     # Security configuration validation
-    dashboard_host = config.get('DASHBOARD_HOST', '127.0.0.1')  # Default to localhost for security
-    dashboard_port = int(config.get('DASHBOARD_PORT', 8050))
+    dashboard_host = config.dashboard.host
+    dashboard_port = config.dashboard.port
 
     # Validate port range
     if not (1024 <= dashboard_port <= 65535):
@@ -707,7 +707,7 @@ def main():
         logger.warning("⚠️ Consider using a reverse proxy with authentication for production")
 
     # Disable debug mode in production
-    debug_mode = config.get('DEBUG', 'false').lower() == 'true'
+    debug_mode = config.debug
     if debug_mode:
         logger.warning("⚠️ DEBUG MODE ENABLED - Disable for production use")
         audit_log('debug_mode_enabled', 'system', {'warning': 'debug_enabled'})
@@ -718,15 +718,13 @@ def main():
 
     try:
         # Start the server with security configurations
-        app.run_server(
+        app.run(
             host=dashboard_host,
             port=dashboard_port,
             debug=debug_mode,
             # Security: Disable dev tools in production
             dev_tools_ui=debug_mode,
-            dev_tools_props_check=debug_mode,
-            # Security: Prevent external script loading
-            requests_pathname_prefix=None
+            dev_tools_props_check=debug_mode
         )
     except Exception as e:
         logger.error(f"❌ Failed to start dashboard server: {e}")

@@ -7,3 +7,17 @@ ENABLE_CONTINUOUS_MONITORING=true
 # Teams Webhook Configuration
 WEBHOOK_URL= #Your Webhook URL
 TEAMS_WEBHOOK_URL= #Your Teams Webhook URL
+
+# Volume Mount Configuration (for public deployment)
+# For local development (uncomment and modify):
+# MONITOR_VOLUME=./monitor_data:/monitor:ro
+# HOST_MONITOR_VOLUME=./monitor_data:/app/host_monitor:ro
+
+# For production with CIFS share (uncomment and modify):
+# MONITOR_VOLUME=//server/share:/monitor:ro
+# HOST_MONITOR_VOLUME=//server/share:/app/host_monitor:ro
+
+# CIFS Credentials (for authenticated network shares)
+# CIFS_USERNAME=your_domain_username
+# CIFS_PASSWORD=your_password
+# CIFS_DOMAIN=your_domain

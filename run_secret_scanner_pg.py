@@ -20,7 +20,7 @@ from database_manager import (
     db_manager, project_manager, scan_session_manager,
     findings_manager, file_cache_manager, init_database
 )
-from redis_manager import redis_manager, scan_cache
+from redis_manager import redis_manager, cache_manager, scan_cache, init_redis
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -38,9 +38,16 @@ class MultiScannerOrchestrator:
     def _run_custom_scanner(self, directory: Path, project_id: str, session_id: str) -> Dict[str, Any]:
         """Run the custom SecretSnipe scanner"""
         try:
-            from secret_snipe_pg import scan_directory
-            success = scan_directory(directory, f"project_{project_id}", max_workers=config.scanner.threads)
-            return {'success': success, 'findings': 0, 'errors': []}
+            from secret_snipe_pg import scan_directory, load_signatures
+
+            # Load signatures before scanning
+            if not load_signatures():
+                return {'success': False, 'findings': 0, 'errors': ['Failed to load signatures']}
+
+            findings_count = scan_directory(directory, f"project_{project_id}", max_workers=config.scanner.threads)
+            if findings_count < 0:
+                return {'success': False, 'findings': 0, 'errors': ['Scan failed']}
+            return {'success': True, 'findings': findings_count, 'errors': []}
         except Exception as e:
             logger.error(f"Custom scanner error: {e}")
             return {'success': False, 'findings': 0, 'errors': [str(e)]}
@@ -59,7 +66,8 @@ class MultiScannerOrchestrator:
             cmd = [
                 'trufflehog', 'filesystem',
                 '--directory', str(directory),
-                '--json'
+                '--json',
+                '--no-update'  # Disable updater to prevent permission issues
             ]
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -81,7 +89,7 @@ class MultiScannerOrchestrator:
         """Run Gitleaks scanner"""
         try:
             # Check if gitleaks is available
-            result = subprocess.run(['gitleaks', '--version'],
+            result = subprocess.run(['gitleaks', 'version'],
                                   capture_output=True, text=True, timeout=10)
 
             if result.returncode != 0:
@@ -97,7 +105,8 @@ class MultiScannerOrchestrator:
                 'gitleaks', 'detect',
                 '--source', str(directory),
                 '--report-format', 'json',
-                '--report-path', temp_results_path
+                '--report-path', temp_results_path,
+                '--no-git'  # Allow scanning non-git directories
             ]
 
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -184,6 +193,12 @@ class MultiScannerOrchestrator:
         # Initialize database
         if not init_database():
             return {'success': False, 'error': 'Database initialization failed'}
+
+        # Initialize Redis
+        if not init_redis(host=os.getenv('REDIS_HOST', 'redis'), port=int(os.getenv('REDIS_PORT', 6379))):
+            logger.warning("Redis initialization failed - continuing without caching")
+        else:
+            logger.info("Redis connection initialized successfully")
 
         # Create project
         project = project_manager.get_project_by_name(project_name)

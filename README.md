@@ -213,6 +213,86 @@ Configure webhooks in `config.json`:
 }
 ```
 
+### Volume Mounting & CIFS Configuration
+
+SecretSnipe supports monitoring network shares and local directories. Configure volume mounts using environment variables for flexible deployment.
+
+#### Local Directory Monitoring
+
+For local development or small directories:
+
+```bash
+# In your .env file
+MONITOR_VOLUME=./monitor_data:/monitor:ro
+HOST_MONITOR_VOLUME=./monitor_data:/app/host_monitor:ro
+```
+
+#### Network Share (CIFS/SMB) Monitoring
+
+For production with authenticated network shares:
+
+```bash
+# In your .env file
+MONITOR_VOLUME=//server/share:/monitor:ro
+HOST_MONITOR_VOLUME=//server/share:/app/host_monitor:ro
+
+# CIFS Credentials
+CIFS_USERNAME=your_domain_username
+CIFS_PASSWORD=your_password
+CIFS_DOMAIN=your_domain
+```
+
+#### CIFS Mount Setup (Linux/Docker Host)
+
+1. **Install CIFS utilities**:
+```bash
+sudo apt-get update && sudo apt-get install -y cifs-utils
+```
+
+2. **Create credentials file**:
+```bash
+sudo mkdir -p /etc/samba
+sudo tee /etc/samba/credentials > /dev/null <<EOF
+username=YOUR_DOMAIN_USERNAME
+password=YOUR_PASSWORD
+domain=YOUR_DOMAIN
+EOF
+sudo chmod 600 /etc/samba/credentials
+```
+
+3. **Mount the share**:
+```bash
+sudo mkdir -p /mnt/secretsnipe_monitor
+sudo mount -t cifs //shsna1cifs1.stahls.net/open /mnt/secretsnipe_monitor \
+  -o credentials=/etc/samba/credentials,vers=3.0,sec=ntlmssp
+```
+
+4. **Update Docker volumes**:
+```bash
+# In your .env file
+MONITOR_VOLUME=/mnt/secretsnipe_monitor:/monitor:ro
+HOST_MONITOR_VOLUME=/mnt/secretsnipe_monitor:/app/host_monitor:ro
+```
+
+#### Windows Docker Desktop
+
+For Windows hosts with mapped drives:
+
+```bash
+# Use the provided mount_cifs.sh script or manual mount
+# Then configure volumes as above
+```
+
+#### Requirements.txt Notes
+
+The following dependencies are commented out in `requirements-prod.txt`:
+
+- `hawk-scanner>=1.0.0` - Package doesn't exist
+- `Cython>=3.0.0` - Development-only dependency
+- `pyhyperscan>=0.3.0` - Optional, falls back to standard `re` module
+
+These are intentionally commented out as they're either non-existent or not needed for runtime.
+
 ## 🔍 Supported File Types
 
 - **Code Files**: `.py`, `.js`, `.ts`, `.java`, `.cpp`, `.c`, `.php`, `.rb`, `.go`, `.rs`

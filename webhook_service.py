@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from database_manager import (
     db_manager, findings_manager, init_database
 )
-from redis_manager import redis_manager, notification_queue
+from redis_manager import redis_manager, notification_queue, init_redis
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -240,8 +240,12 @@ def main():
         logger.error("Failed to initialize database")
         return 1
 
-    # Initialize Redis
-    if not redis_manager.ping():
+    # Initialize Redis with configuration
+    redis_host = config.redis.host
+    redis_port = config.redis.port
+    redis_password = config.redis.password
+
+    if not init_redis(host=redis_host, port=redis_port, password=redis_password):
         logger.error("Failed to initialize Redis")
         return 1
 

@@ -346,7 +346,11 @@ def process_file(file_path, project_id, scan_session_id):
         return []
 
 def scan_directory(directory_path, project_name="default", max_workers=None):
-    """Scan a directory for secrets using PostgreSQL and Redis"""
+    """Scan a directory for secrets using PostgreSQL and Redis
+
+    Returns:
+        int: Number of findings found, or -1 on error
+    """
 
     # Initialize database connection
     if not init_database():
@@ -428,7 +432,7 @@ def scan_directory(directory_path, project_name="default", max_workers=None):
     )
 
     logging.info(f"Scan completed: {total_findings} findings in {len(files_to_scan)} files")
-    return True
+    return total_findings
 
 def main():
     """Main entry point"""
@@ -461,7 +465,7 @@ def main():
         max_workers=args.workers
     )
 
-    return 0 if success else 1
+    return 0 if success >= 0 else 1
 
 if __name__ == "__main__":
     sys.exit(main())

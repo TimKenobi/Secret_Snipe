@@ -25,9 +25,7 @@ numpy>=1.24.0  # For image processing with EasyOCR
 watchdog>=3.0.0  # For file monitoring
 
 # Optional regex optimization (falls back to standard regex if not available)
-# hawk-scanner>=1.0.0  # Version doesn't exist, removed
-# Cython>=3.0.0  # Not needed for runtime
-# pyhyperscan>=0.3.0  # Falls back to re module if not available
+hyperscan>=0.2.0  # High-performance regex matching
 
 # Scheduling and monitoring
 schedule>=1.2.0  # For scheduled tasks

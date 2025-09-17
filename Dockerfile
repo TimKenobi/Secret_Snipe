@@ -31,6 +31,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     # Required for Trufflehog and Gitleaks
     ca-certificates \
+    # Required for Hyperscan
+    libhyperscan-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Security: Install external scanners as root, then switch to non-root user

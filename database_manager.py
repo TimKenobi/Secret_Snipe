@@ -306,6 +306,38 @@ def init_database():
         logger.error("Database connection failed")
         return False
 
+    # Check if tables exist, if not create them
+    try:
+        with db_manager.get_cursor() as cursor:
+            # Check if core tables exist
+            cursor.execute("""
+                SELECT table_name FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name IN ('projects', 'scan_sessions', 'findings')
+            """)
+            existing_tables = [row['table_name'] for row in cursor.fetchall()]
+            
+            if len(existing_tables) < 3:
+                logger.info("Core tables missing, attempting to create from schema file...")
+                
+                # Try to read and execute schema file
+                import os
+                schema_file = os.path.join(os.path.dirname(__file__), 'database_schema.sql')
+                if os.path.exists(schema_file):
+                    with open(schema_file, 'r', encoding='utf-8') as f:
+                        schema_sql = f.read()
+                    
+                    # Execute schema creation
+                    cursor.execute(schema_sql)
+                    logger.info("Database schema created successfully")
+                else:
+                    logger.warning("Schema file not found, tables may need manual creation")
+            else:
+                logger.info("Database tables already exist")
+
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
+        return False
+
     logger.info("Database connection successful")
     return True
 

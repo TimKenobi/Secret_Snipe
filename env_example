@@ -1,0 +1,9 @@
+# Database Configuration
+POSTGRES_PASSWORD= #Add your Postgress Password here
+
+# Monitoring Configuration
+ENABLE_CONTINUOUS_MONITORING=true
+
+# Teams Webhook Configuration
+WEBHOOK_URL= #Your Webhook URL
+TEAMS_WEBHOOK_URL= #Your Teams Webhook URL

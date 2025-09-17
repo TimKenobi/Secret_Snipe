@@ -153,6 +153,32 @@ python unified_visualizer_pg.py
 # Open http://localhost:8050
 ```
 
+### Continuous Monitoring
+
+Enable continuous monitoring to automatically scan file changes:
+
+```bash
+# Using Docker (with monitoring profile)
+docker-compose --profile monitoring up -d
+
+# Set monitoring path
+export MONITOR_PATH=/path/to/monitor
+
+# Set Teams webhook for weekly reports
+export TEAMS_WEBHOOK_URL=https://outlook.office.com/webhook/your-webhook-url
+
+# Start monitoring
+docker-compose --profile monitoring up continuous-monitor -d
+```
+
+**Weekly Reports**: Automatic Teams notifications every Monday at 9:00 AM with:
+- 📊 Total findings breakdown
+- 🚨 Critical/high severity counts
+- 🔍 Scanner-specific statistics
+- 📈 Trends and patterns
+
+**Real-time Alerts**: Immediate webhook notifications for critical findings.
+
 ## ⚙️ Configuration
 
 ### Environment Variables

@@ -1,0 +1,177 @@
+version: '3.8'
+
+# Minimal Self-Contained SecretSnipe Deployment
+# No external dependencies - completely offline capable
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: secretsnipe-postgres-minimal
+    environment:
+      POSTGRES_DB: secretsnipe
+      POSTGRES_USER: secretsnipe
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"  # Bind to localhost only
+    networks:
+      - secretsnipe-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secretsnipe -d secretsnipe"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Security: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: secretsnipe-redis-minimal
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"  # Bind to localhost only
+    networks:
+      - secretsnipe-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Security: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+
+  # SecretSnipe Scanner
+  scanner:
+    build: .
+    container_name: secretsnipe-scanner-minimal
+    environment:
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Application
+      LOG_LEVEL: INFO
+      DEBUG: "false"
+      # Disable external services
+      WEBHOOK_ENABLED: "false"
+      TEAMS_WEBHOOK_URL: ""
+    volumes:
+      - ./signatures.json:/app/signatures.json:ro
+      - ./config.json:/app/config.json:ro
+      - scan_data:/scan
+      - ./logs:/app/logs
+    networks:
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Security: Enhanced security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Security: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+    command: ["python", "run_secret_scanner_pg.py", "/scan", "--project", "minimal-scan", "--scanners", "custom", "trufflehog", "gitleaks"]
+
+  # SecretSnipe Visualizer
+  visualizer:
+    build: .
+    container_name: secretsnipe-visualizer-minimal
+    environment:
+      # Database
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Dashboard Security
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 8050
+      DASHBOARD_DEBUG: "false"
+      DASHBOARD_RATE_LIMIT: "true"
+      # Application
+      LOG_LEVEL: INFO
+      DEBUG: "false"
+      # Disable external services
+      WEBHOOK_ENABLED: "false"
+      TEAMS_WEBHOOK_URL: ""
+    ports:
+      - "127.0.0.1:8050:8050"  # Bind to localhost for security
+    volumes:
+      - ./signatures.json:/app/signatures.json:ro
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+    networks:
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Security: Enhanced security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Security: Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+    command: ["python", "unified_visualizer_pg.py"]
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  scan_data:
+    driver: local
+
+networks:
+  secretsnipe-network:
+    driver: bridge
+    internal: false  # Set to true for complete network isolation

@@ -117,6 +117,39 @@ class SecurityConfig:
     audit_log_enabled: bool = True
 
 @dataclass
+class DashboardConfig:
+    """Dashboard security and configuration"""
+    host: str = "127.0.0.1"  # Default to localhost for security
+    port: int = 8050
+    debug: bool = False
+    enable_cors: bool = False
+    cors_origins: list = None
+    rate_limit_enabled: bool = True
+    rate_limit_requests: int = 100
+    rate_limit_window_seconds: int = 60
+    session_timeout_minutes: int = 30
+    enable_https: bool = False
+    ssl_cert_path: Optional[str] = None
+    ssl_key_path: Optional[str] = None
+    enable_auth: bool = False
+    auth_username: Optional[str] = None
+    auth_password_hash: Optional[str] = None
+    enable_csrf_protection: bool = True
+    max_input_length: int = 1000
+    enable_audit_log: bool = True
+    audit_log_file: str = "dashboard_audit.log"
+    blocked_ips: list = None
+    allowed_ips: list = None
+
+    def __post_init__(self):
+        if self.cors_origins is None:
+            self.cors_origins = []
+        if self.blocked_ips is None:
+            self.blocked_ips = []
+        if self.allowed_ips is None:
+            self.allowed_ips = []
+
+@dataclass
 class AppConfig:
     """Main application configuration"""
     debug: bool = False
@@ -133,6 +166,7 @@ class AppConfig:
     report: ReportConfig = None
     cache: CacheConfig = None
     security: SecurityConfig = None
+    dashboard: DashboardConfig = None
 
     def __post_init__(self):
         if self.database is None:
@@ -149,6 +183,8 @@ class AppConfig:
             self.cache = CacheConfig()
         if self.security is None:
             self.security = SecurityConfig()
+        if self.dashboard is None:
+            self.dashboard = DashboardConfig()
 
 class ConfigManager:
     """Configuration manager with environment variable and file support"""
@@ -209,11 +245,15 @@ class ConfigManager:
         if os.getenv('REDIS_PASSWORD'):
             env_config.setdefault('redis', {})['password'] = os.getenv('REDIS_PASSWORD')
 
-        # Application settings
-        if os.getenv('DEBUG'):
-            env_config['debug'] = os.getenv('DEBUG').lower() in ('true', '1', 'yes')
-        if os.getenv('LOG_LEVEL'):
-            env_config['log_level'] = os.getenv('LOG_LEVEL')
+        # Dashboard configuration
+        if os.getenv('DASHBOARD_HOST'):
+            env_config.setdefault('dashboard', {})['host'] = os.getenv('DASHBOARD_HOST')
+        if os.getenv('DASHBOARD_PORT'):
+            env_config.setdefault('dashboard', {})['port'] = int(os.getenv('DASHBOARD_PORT'))
+        if os.getenv('DASHBOARD_DEBUG'):
+            env_config.setdefault('dashboard', {})['debug'] = os.getenv('DASHBOARD_DEBUG').lower() in ('true', '1', 'yes')
+        if os.getenv('DASHBOARD_RATE_LIMIT'):
+            env_config.setdefault('dashboard', {})['rate_limit_enabled'] = os.getenv('DASHBOARD_RATE_LIMIT').lower() in ('true', '1', 'yes')
 
         return env_config
 
@@ -247,6 +287,7 @@ class ConfigManager:
             report_config = ReportConfig(**merged_config.get('report', {}))
             cache_config = CacheConfig(**merged_config.get('cache', {}))
             security_config = SecurityConfig(**merged_config.get('security', {}))
+            dashboard_config = DashboardConfig(**merged_config.get('dashboard', {}))
 
             app_config = AppConfig(
                 debug=merged_config.get('debug', False),
@@ -260,7 +301,8 @@ class ConfigManager:
                 webhook=webhook_config,
                 report=report_config,
                 cache=cache_config,
-                security=security_config
+                security=security_config,
+                dashboard=dashboard_config
             )
 
             self._config = app_config

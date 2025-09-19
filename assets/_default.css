@@ -1,0 +1,6 @@
+/* 
+This file is intentionally left blank. 
+It is used to control the load order of CSS assets in Dash.
+By being named `_default.css`, it loads before `custom.css`,
+ensuring our custom styles have the final say.
+*/

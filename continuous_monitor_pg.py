@@ -24,7 +24,8 @@ from database_manager import (
     db_manager, project_manager, scan_session_manager,
     findings_manager, file_cache_manager, init_database
 )
-from redis_manager import redis_manager, scan_cache, notification_queue
+from redis_manager import redis_manager, scan_cache
+import redis_manager as redis_module
 from run_secret_scanner_pg import MultiScannerOrchestrator
 from config import config
 
@@ -36,6 +37,9 @@ class FileChangeHandler(FileSystemEventHandler):
     def __init__(self, monitor):
         self.monitor = monitor
         self.last_modified = {}
+        self.event_cooldown = {}  # Track cooldown periods for files
+        self.cooldown_seconds = 5.0  # Minimum seconds between processing the same file (increased from 2.0)
+        self.processed_events = set()  # Track recently processed events
 
     def on_modified(self, event):
         """Handle file modification events"""
@@ -48,14 +52,40 @@ class FileChangeHandler(FileSystemEventHandler):
         if self._is_excluded(file_path):
             return
 
+        # Create a unique event identifier
+        current_time = time.time()
+        event_key = f"{file_path}:{int(current_time)}"
+
+        # Check if we've already processed this event recently
+        if event_key in self.processed_events:
+            return
+
+        # Check cooldown to prevent rapid successive events
+        if file_path in self.event_cooldown:
+            time_since_last = current_time - self.event_cooldown[file_path]
+            if time_since_last < self.cooldown_seconds:
+                return  # Still in cooldown period
+
         # Check if file actually changed (avoid duplicate events)
         try:
             current_mtime = file_path.stat().st_mtime
-            if file_path in self.last_modified and self.last_modified[file_path] == current_mtime:
-                return
+            # Allow for small timestamp differences (2 second tolerance)
+            if file_path in self.last_modified:
+                time_diff = abs(current_mtime - self.last_modified[file_path])
+                if time_diff < 2.0:  # Less than 2 second difference
+                    return
             self.last_modified[file_path] = current_mtime
         except OSError:
             return
+
+        # Mark this event as processed
+        self.processed_events.add(event_key)
+
+        # Update cooldown timestamp
+        self.event_cooldown[file_path] = current_time
+
+        # Clean up old entries
+        self._cleanup_old_entries()
 
         logger.info(f"File changed: {file_path}")
         self.monitor.queue_file_scan(file_path)
@@ -65,8 +95,45 @@ class FileChangeHandler(FileSystemEventHandler):
         if not event.is_directory:
             file_path = Path(event.src_path)
             if not self._is_excluded(file_path):
+                # Create a unique event identifier
+                current_time = time.time()
+                event_key = f"{file_path}:{int(current_time)}"
+
+                # Check if we've already processed this event recently
+                if event_key in self.processed_events:
+                    return
+
+                # Mark this event as processed
+                self.processed_events.add(event_key)
+
+                # Set cooldown for new files
+                self.event_cooldown[file_path] = current_time
                 logger.info(f"File created: {file_path}")
                 self.monitor.queue_file_scan(file_path)
+
+    def _cleanup_old_entries(self):
+        """Clean up old entries from cooldown and last_modified dictionaries"""
+        current_time = time.time()
+        cutoff_time = current_time - 300  # 5 minutes ago
+
+        # Clean up cooldown entries
+        self.event_cooldown = {
+            path: timestamp for path, timestamp in self.event_cooldown.items()
+            if timestamp > cutoff_time
+        }
+
+        # Clean up processed events (keep only recent ones)
+        current_minute = int(current_time // 60)
+        self.processed_events = {
+            event for event in self.processed_events
+            if int(event.split(':')[1]) // 60 >= current_minute - 5  # Keep last 5 minutes
+        }
+
+        # Clean up last_modified entries (keep last 1000 entries to prevent memory issues)
+        if len(self.last_modified) > 1000:
+            # Sort by modification time and keep most recent 500
+            sorted_entries = sorted(self.last_modified.items(), key=lambda x: x[1], reverse=True)
+            self.last_modified = dict(sorted_entries[:500])
 
     def on_deleted(self, event):
         """Handle file deletion events"""
@@ -114,6 +181,24 @@ class ContinuousMonitor:
         """Start the continuous monitoring service"""
         logger.info(f"Starting continuous monitoring for {self.watch_directory}")
 
+        # Check if watch directory exists
+        if not self.watch_directory.exists():
+            logger.warning(f"Watch directory {self.watch_directory} does not exist, creating it")
+            try:
+                # Try to create in /tmp if /monitor fails
+                if str(self.watch_directory) == "/monitor":
+                    alt_dir = Path("/tmp/monitor")
+                    logger.info(f"Trying alternative directory: {alt_dir}")
+                    alt_dir.mkdir(parents=True, exist_ok=True)
+                    self.watch_directory = alt_dir
+                    logger.info(f"Using alternative watch directory {self.watch_directory}")
+                else:
+                    self.watch_directory.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"Created watch directory {self.watch_directory}")
+            except Exception as e:
+                logger.error(f"Failed to create watch directory {self.watch_directory}: {e}")
+                return False
+
         # Initialize database and project
         if not self._initialize_project():
             logger.error("Failed to initialize monitoring project")
@@ -122,7 +207,7 @@ class ContinuousMonitor:
         # Start file system monitoring
         self.event_handler = FileChangeHandler(self)
         self.observer = Observer()
-        self.observer.schedule(self.event_handler, str(self.watch_directory), recursive=True)
+        self.observer.schedule(self.event_handler, str(self.watch_directory), recursive=False)
         self.observer.start()
 
         # Schedule weekly reports
@@ -234,7 +319,7 @@ class ContinuousMonitor:
 
             for finding in critical_findings:
                 # Queue webhook notification
-                notification_queue.queue_notification('default', finding)
+                redis_module.notification_queue.queue_notification('default', finding)
                 logger.info(f"Queued notification for critical finding: {finding['id']}")
 
         except Exception as e:
@@ -408,7 +493,7 @@ def main():
         return 1
 
     # Initialize Redis
-    if not redis_manager.ping():
+    if not redis_manager or not redis_manager.ping():
         logger.warning("Redis not available - continuing without caching")
 
     # Start continuous monitoring

@@ -275,7 +275,7 @@ def main():
     args = parser.parse_args()
 
     # Initialize Redis
-    if not redis_manager.ping():
+    if not redis_manager or not redis_manager.ping():
         logger.warning("Redis not available - continuing without caching")
 
     # Run multi-scanner

@@ -455,7 +455,7 @@ def main():
         return 1
 
     # Initialize Redis
-    if not redis_manager.ping():
+    if not redis_manager or not redis_manager.ping():
         logging.warning("Redis not available - continuing without caching")
 
     # Scan directory

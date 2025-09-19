@@ -69,7 +69,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: unless-stopped
+    restart: "no"  # Don't restart after completing scan
     command: ["python", "run_secret_scanner_pg.py", "/scan", "--project", "container-scan", "--scanners", "custom", "trufflehog", "gitleaks"]
 
   # SecretSnipe Visualizer
@@ -178,7 +178,7 @@ services:
       DEBUG: "false"
     volumes:
       - ./config.json:/app/config.json:ro
-      - ${MONITOR_VOLUME:-./monitor_data:/monitor:ro}
+      - ${MONITOR_VOLUME:-./monitor_data:/monitor:rw}
       - ./logs:/app/logs
     networks:
       - secretsnipe-network

@@ -33,6 +33,7 @@ class DatabaseConfig:
         return f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}?sslmode={self.ssl_mode}"
 
 @dataclass
+@dataclass
 class RedisConfig:
     """Redis configuration"""
     host: str = "localhost"
@@ -43,6 +44,15 @@ class RedisConfig:
     socket_timeout: int = 5
     retry_on_timeout: bool = True
     max_connections: int = 20
+
+    def __post_init__(self):
+        """Load Redis configuration from environment variables"""
+        if os.getenv('REDIS_HOST'):
+            self.host = os.getenv('REDIS_HOST')
+        if os.getenv('REDIS_PORT'):
+            self.port = int(os.getenv('REDIS_PORT'))
+        if os.getenv('REDIS_PASSWORD'):
+            self.password = os.getenv('REDIS_PASSWORD')
 
 @dataclass
 class ScannerConfig:
@@ -254,6 +264,12 @@ class ConfigManager:
             env_config.setdefault('dashboard', {})['debug'] = os.getenv('DASHBOARD_DEBUG').lower() in ('true', '1', 'yes')
         if os.getenv('DASHBOARD_RATE_LIMIT'):
             env_config.setdefault('dashboard', {})['rate_limit_enabled'] = os.getenv('DASHBOARD_RATE_LIMIT').lower() in ('true', '1', 'yes')
+        if os.getenv('DASH_USERNAME'):
+            env_config.setdefault('dashboard', {})['auth_username'] = os.getenv('DASH_USERNAME')
+            env_config.setdefault('dashboard', {})['enable_auth'] = True
+        if os.getenv('DASH_PASSWORD'):
+            env_config.setdefault('dashboard', {})['auth_password_hash'] = os.getenv('DASH_PASSWORD')
+            env_config.setdefault('dashboard', {})['enable_auth'] = True
 
         return env_config
 

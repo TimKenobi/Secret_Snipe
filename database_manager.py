@@ -267,6 +267,90 @@ class FindingsManager:
             query = "UPDATE findings SET resolution_status = %s WHERE id = %s"
             self.db.execute_update(query, (status, finding_id))
 
+    def cleanup_old_findings(self, days_old: int = 30) -> Dict[str, int]:
+        """Clean up old findings and related data"""
+        cutoff_date = datetime.now() - timedelta(days=days_old)
+
+        results = {
+            'scan_sessions_deleted': 0,
+            'findings_deleted': 0,
+            'cache_entries_deleted': 0
+        }
+
+        try:
+            # Delete old scan sessions (completed/failed only)
+            query = """
+                DELETE FROM scan_sessions
+                WHERE created_at < %s
+                AND status IN ('completed', 'failed')
+            """
+            results['scan_sessions_deleted'] = self.db.execute_update(query, (cutoff_date,))
+
+            # Delete orphaned findings (no associated scan session)
+            query = """
+                DELETE FROM findings
+                WHERE scan_session_id NOT IN (
+                    SELECT id FROM scan_sessions
+                )
+            """
+            results['findings_deleted'] = self.db.execute_update(query, ())
+
+            # Clean up old file cache entries
+            query = """
+                DELETE FROM file_cache
+                WHERE processed_at < %s
+            """
+            results['cache_entries_deleted'] = self.db.execute_update(query, (cutoff_date,))
+
+            logger.info(f"Cleanup completed: {results}")
+            return results
+
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+            raise
+
+    def get_cleanup_stats(self) -> Dict[str, Any]:
+        """Get statistics about data that could be cleaned up"""
+        try:
+            # Count old scan sessions
+            old_sessions_query = """
+                SELECT COUNT(*) as count
+                FROM scan_sessions
+                WHERE created_at < %s
+                AND status IN ('completed', 'failed')
+            """
+            cutoff_date = datetime.now() - timedelta(days=30)
+            old_sessions = self.db.execute_query(old_sessions_query, (cutoff_date,))
+
+            # Count total findings
+            total_findings_query = "SELECT COUNT(*) as count FROM findings"
+            total_findings = self.db.execute_query(total_findings_query, ())
+
+            # Count open findings
+            open_findings_query = "SELECT COUNT(*) as count FROM findings WHERE resolution_status = 'open'"
+            open_findings = self.db.execute_query(open_findings_query, ())
+
+            # Database size estimate
+            db_size_query = """
+                SELECT
+                    pg_size_pretty(pg_database_size(current_database())) as db_size,
+                    pg_size_pretty(pg_total_relation_size('findings')) as findings_size,
+                    pg_size_pretty(pg_total_relation_size('scan_sessions')) as sessions_size
+            """
+            sizes = self.db.execute_query(db_size_query, ())
+
+            return {
+                'old_sessions_count': old_sessions[0]['count'] if old_sessions else 0,
+                'total_findings_count': total_findings[0]['count'] if total_findings else 0,
+                'open_findings_count': open_findings[0]['count'] if open_findings else 0,
+                'database_size': sizes[0] if sizes else {},
+                'cutoff_date': cutoff_date.isoformat()
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting cleanup stats: {e}")
+            return {}
+
 
 class FileCacheManager:
     """File processing cache operations"""

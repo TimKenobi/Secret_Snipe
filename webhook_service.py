@@ -13,11 +13,13 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 
 from database_manager import (
     db_manager, findings_manager, init_database
 )
-from redis_manager import redis_manager, notification_queue, init_redis
+from redis_manager import redis_manager, init_redis
+import redis_manager as redis_module
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -62,7 +64,7 @@ class WebhookProcessor:
         while self.running:
             try:
                 # Get next notification from queue
-                notification = notification_queue.get_next_notification(webhook_config_id)
+                notification = redis_module.notification_queue.get_next_notification(webhook_config_id)
 
                 if notification:
                     self._deliver_notification(webhook_config_id, notification)
@@ -101,7 +103,7 @@ class WebhookProcessor:
                 if attempts < webhook_config.get('max_attempts', 3):
                     # Re-queue for retry
                     notification['attempts'] = attempts
-                    notification_queue.queue_notification(webhook_config_id, notification)
+                    redis_module.notification_queue.queue_notification(webhook_config_id, notification)
                     logger.warning(f"Webhook delivery failed, re-queued (attempt {attempts})")
                 else:
                     # Max attempts reached, log failure
@@ -119,25 +121,125 @@ class WebhookProcessor:
         return dict(result[0]) if result else None
 
     def _prepare_payload(self, finding_data: Dict[str, Any], webhook_config: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare webhook payload"""
+        """Prepare webhook payload with Teams Adaptive Card format"""
+        severity = finding_data.get('severity', 'Unknown')
+        secret_type = finding_data.get('secret_type', 'Unknown')
+        file_path = finding_data.get('file_path', 'Unknown')
+        tool_source = finding_data.get('tool_source', 'Unknown')
+        
+        # Determine severity color and icon
+        if severity == 'Critical':
+            color = 'attention'
+            severity_icon = '🔴'
+        elif severity == 'High':
+            color = 'warning'
+            severity_icon = '🟠'
+        elif severity == 'Medium':
+            color = 'good'
+            severity_icon = '🟡'
+        else:
+            color = 'default'
+            severity_icon = '⚪'
+            
+        # Create Teams Adaptive Card payload
         return {
-            'event': 'secret_found',
-            'timestamp': datetime.now().isoformat(),
-            'finding': {
-                'id': finding_data.get('id'),
-                'file_path': finding_data.get('file_path'),
-                'secret_type': finding_data.get('secret_type'),
-                'severity': finding_data.get('severity'),
-                'tool_source': finding_data.get('tool_source'),
-                'project_id': finding_data.get('project_id'),
-                'scan_session_id': finding_data.get('scan_session_id'),
-                'first_seen': finding_data.get('first_seen'),
-                'context': finding_data.get('context')
-            },
-            'webhook_config': {
-                'id': webhook_config['id'],
-                'name': webhook_config['name']
-            }
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "type": "AdaptiveCard",
+                        "body": [
+                            {
+                                "type": "Container",
+                                "items": [
+                                    {
+                                        "type": "ColumnSet",
+                                        "columns": [
+                                            {
+                                                "type": "Column",
+                                                "items": [
+                                                    {
+                                                        "type": "Image",
+                                                        "url": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/main/assets/Shield/SVG/ic_fluent_shield_error_24_filled.svg",
+                                                        "size": "Medium"
+                                                    }
+                                                ],
+                                                "width": "auto"
+                                            },
+                                            {
+                                                "type": "Column",
+                                                "items": [
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": f"🔒 SecretSnipe Alert: {severity_icon} {severity} Secret Detected",
+                                                        "weight": "Bolder",
+                                                        "size": "Large",
+                                                        "color": color
+                                                    },
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": f"**Secret Type:** {secret_type}",
+                                                        "wrap": True
+                                                    },
+                                                    {
+                                                        "type": "TextBlock", 
+                                                        "text": f"**File:** `{file_path}`",
+                                                        "wrap": True
+                                                    },
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": f"**Scanner:** {tool_source.title()}",
+                                                        "wrap": True
+                                                    },
+                                                    {
+                                                        "type": "TextBlock",
+                                                        "text": f"**First Detected:** {finding_data.get('first_seen', 'Unknown')}",
+                                                        "wrap": True,
+                                                        "size": "Small"
+                                                    }
+                                                ],
+                                                "width": "stretch"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "Container",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": "**Context:**",
+                                        "weight": "Bolder"
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": f"```\n{finding_data.get('context', 'No context available')[:200]}...\n```",
+                                        "wrap": True,
+                                        "fontType": "Monospace"
+                                    }
+                                ],
+                                "style": "emphasis"
+                            }
+                        ],
+                        "actions": [
+                            {
+                                "type": "Action.OpenUrl",
+                                "title": "🔍 View in Dashboard",
+                                "url": "http://localhost:8050"
+                            },
+                            {
+                                "type": "Action.OpenUrl", 
+                                "title": "📚 Security Guidelines",
+                                "url": "https://owasp.org/www-project-top-ten/"
+                            }
+                        ],
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "version": "1.3"
+                    }
+                }
+            ]
         }
 
     def _send_webhook(self, webhook_config: Dict[str, Any], payload: Dict[str, Any]) -> bool:
@@ -180,7 +282,7 @@ class WebhookProcessor:
 
     def queue_notification(self, webhook_config_id: str, finding_data: Dict[str, Any]):
         """Queue a notification for delivery"""
-        notification_queue.queue_notification(webhook_config_id, finding_data)
+        redis_module.notification_queue.queue_notification(webhook_config_id, finding_data)
 
 def check_for_new_findings():
     """Check for new findings that need webhook notifications"""
@@ -209,10 +311,25 @@ def check_for_new_findings():
             for webhook_config in webhook_configs:
                 # Check if finding matches webhook trigger conditions
                 if _matches_webhook_trigger(finding, webhook_config):
-                    processor.queue_notification(webhook_config['id'], finding)
+                    # Convert finding to JSON-serializable format
+                    serializable_finding = _make_json_serializable(dict(finding))
+                    processor.queue_notification(webhook_config['id'], serializable_finding)
 
     except Exception as e:
         logger.error(f"Error checking for new findings: {e}")
+
+def _make_json_serializable(obj: Any) -> Any:
+    """Convert database objects to JSON-serializable types"""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        return {k: _make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_make_json_serializable(item) for item in obj]
+    else:
+        return obj
 
 def _matches_webhook_trigger(finding: Dict[str, Any], webhook_config: Dict[str, Any]) -> bool:
     """Check if finding matches webhook trigger conditions"""

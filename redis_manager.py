@@ -9,7 +9,7 @@ import redis
 import json
 import logging
 from typing import Any, Optional, Dict, List
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
 import pickle
 
@@ -30,25 +30,46 @@ class RedisManager:
 
     @property
     def connection(self) -> redis.Redis:
-        """Lazy connection to Redis"""
-        if self._connection is None:
-            self._connection = redis.Redis(
-                host=self.host,
-                port=self.port,
-                db=self.db,
-                password=self.password,
-                decode_responses=self.decode_responses,
-                socket_connect_timeout=5,
-                socket_timeout=5,
-                retry_on_timeout=True
-            )
+        """Lazy connection to Redis with improved error handling"""
+        if self._connection is None or not self._test_connection():
+            try:
+                self._connection = redis.Redis(
+                    host=self.host,
+                    port=self.port,
+                    db=self.db,
+                    password=self.password,
+                    decode_responses=self.decode_responses,
+                    socket_connect_timeout=5,
+                    socket_timeout=5,
+                    retry_on_timeout=True,
+                    max_connections=10,
+                    retry_on_error=[redis.ConnectionError, redis.TimeoutError]
+                )
+                # Test the connection
+                self._connection.ping()
+            except redis.RedisError as e:
+                logger.warning(f"Failed to establish Redis connection: {e}")
+                self._connection = None
+                raise
         return self._connection
 
+    def _test_connection(self) -> bool:
+        """Test if current connection is still valid"""
+        if self._connection is None:
+            return False
+        try:
+            self._connection.ping()
+            return True
+        except redis.RedisError:
+            self._connection = None
+            return False
+
     def ping(self) -> bool:
-        """Test Redis connection"""
+        """Test Redis connection with retry"""
         try:
             return self.connection.ping()
         except redis.ConnectionError:
+            logger.warning("Redis connection failed during ping")
             return False
 
     def close(self):
@@ -69,25 +90,31 @@ class CacheManager:
         return f"{namespace}:{key}"
 
     def get(self, namespace: str, key: str) -> Optional[Any]:
-        """Get value from cache"""
+        """Get value from cache with graceful fallback"""
         cache_key = self._make_key(namespace, key)
         try:
+            if not self.redis.ping():
+                logger.debug(f"Redis unavailable for get {cache_key}")
+                return None
             data = self.redis.connection.get(cache_key)
             if data:
                 return json.loads(data)
-        except (redis.RedisError, json.JSONDecodeError) as e:
-            logger.warning(f"Cache get error for {cache_key}: {e}")
+        except (redis.RedisError, json.JSONDecodeError, ConnectionError) as e:
+            logger.debug(f"Cache get error for {cache_key}: {e}")
         return None
 
     def set(self, namespace: str, key: str, value: Any,
             ttl_seconds: Optional[int] = None) -> bool:
-        """Set value in cache with optional TTL"""
+        """Set value in cache with graceful fallback"""
         cache_key = self._make_key(namespace, key)
         try:
+            if not self.redis.ping():
+                logger.debug(f"Redis unavailable for set {cache_key}")
+                return False
             data = json.dumps(value, default=str)
             return self.redis.connection.set(cache_key, data, ex=ttl_seconds)
-        except (redis.RedisError, TypeError) as e:
-            logger.warning(f"Cache set error for {cache_key}: {e}")
+        except (redis.RedisError, TypeError, ConnectionError) as e:
+            logger.debug(f"Cache set error for {cache_key}: {e}")
             return False
 
     def delete(self, namespace: str, key: str) -> bool:
@@ -259,27 +286,44 @@ class NotificationQueue:
 
 
 # Global instances (to be initialized in main application)
-redis_manager = RedisManager()
-cache_manager = CacheManager(redis_manager)
-session_manager = SessionManager(redis_manager)
-scan_cache = ScanResultCache(cache_manager)
-notification_queue = NotificationQueue(redis_manager)
+_redis_manager = None
+_cache_manager = None
+_session_manager = None
+_scan_cache = None
+_notification_queue = None
+
+# Provide backward compatibility
+redis_manager = _redis_manager
+cache_manager = _cache_manager
+session_manager = _session_manager
+scan_cache = _scan_cache
+notification_queue = _notification_queue
 
 
 def init_redis(host: str = 'localhost', port: int = 6379,
                db: int = 0, password: Optional[str] = None) -> bool:
     """Initialize Redis connection"""
+    logger.info(f"init_redis called with host={host}, port={port}, db={db}")
+    global _redis_manager, _cache_manager, _session_manager, _scan_cache, _notification_queue
     global redis_manager, cache_manager, session_manager, scan_cache, notification_queue
 
-    redis_manager = RedisManager(host, port, db, password)
-    if not redis_manager.ping():
+    _redis_manager = RedisManager(host, port, db, password)
+    logger.info(f"Created RedisManager with host={_redis_manager.host}, port={_redis_manager.port}")
+    if not _redis_manager.ping():
         logger.error("Failed to connect to Redis")
         return False
 
-    cache_manager = CacheManager(redis_manager)
-    session_manager = SessionManager(redis_manager)
-    scan_cache = ScanResultCache(cache_manager)
-    notification_queue = NotificationQueue(redis_manager)
+    _cache_manager = CacheManager(_redis_manager)
+    _session_manager = SessionManager(_redis_manager)
+    _scan_cache = ScanResultCache(_cache_manager)
+    _notification_queue = NotificationQueue(_redis_manager)
+
+    # Update module globals for backward compatibility
+    redis_manager = _redis_manager
+    cache_manager = _cache_manager
+    session_manager = _session_manager
+    scan_cache = _scan_cache
+    notification_queue = _notification_queue
 
     logger.info("Redis connection initialized successfully")
     return True

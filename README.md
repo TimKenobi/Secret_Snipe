@@ -401,34 +401,43 @@ flake8 .
 mypy .
 ```
 
-## 📚 API Documentation
+## 📚 Documentation
 
-### REST Endpoints
+Complete documentation is available in the [`docs/`](./docs/) directory:
 
-- `GET /api/projects` - List projects
-- `GET /api/findings` - Get findings with filters
-- `POST /api/scan` - Start new scan
-- `GET /api/reports` - Generate reports
+### 🚀 Getting Started
+- **[Installation Guide](./docs/user-guides/installation.md)** - Step-by-step setup instructions
+- **[First Scan](./docs/user-guides/first-scan.md)** - Your first secret scan
+- **[Dashboard Setup](./docs/user-guides/dashboard-setup.md)** - Web interface configuration
 
-### Webhook Payload
+### ⚙️ Configuration
+- **[Environment Variables](./docs/configuration/environment-variables.md)** - All configuration options
+- **[Docker Setup](./docs/configuration/docker-setup.md)** - Container deployment guide
+- **[Database Configuration](./docs/configuration/database-configuration.md)** - PostgreSQL setup
+- **[Network Shares](./docs/configuration/network-shares.md)** - CIFS/SMB integration
 
-```json
-{
-  "event": "new_finding",
-  "finding": {
-    "id": "uuid",
-    "file_path": "/path/to/file",
-    "secret_type": "API Key",
-    "severity": "High",
-    "context": "line context...",
-    "timestamp": "2025-01-15T10:30:00Z"
-  },
-  "project": {
-    "id": "uuid",
-    "name": "my-project"
-  }
-}
-```
+### 🔧 API & Integration
+- **[REST API](./docs/api/rest-api.md)** - Complete API reference
+- **[Webhooks](./docs/api/webhooks.md)** - Real-time notifications
+- **[Authentication](./docs/api/authentication.md)** - API security
+
+### 🛠️ Development
+- **[Architecture](./docs/development/architecture.md)** - System design overview
+- **[Adding Detectors](./docs/development/adding-detectors.md)** - Extend detection capabilities
+- **[Testing](./docs/development/testing.md)** - Development workflow
+- **[Contributing](./docs/development/contributing.md)** - How to contribute
+
+### 🔍 Troubleshooting
+- **[Common Issues](./docs/troubleshooting/common-issues.md)** - Problem resolution
+- **[Performance](./docs/troubleshooting/performance.md)** - Optimization guide
+- **[Logs](./docs/troubleshooting/logs.md)** - Log analysis
+- **[Database](./docs/troubleshooting/database.md)** - Database issues
+
+### 📖 User Guides
+- **[Advanced Scanning](./docs/user-guides/advanced-scanning.md)** - Advanced scan options
+- **[Continuous Monitoring](./docs/user-guides/continuous-monitoring.md)** - Real-time monitoring
+- **[Reports](./docs/user-guides/reports.md)** - Report generation
+- **[Security](./docs/user-guides/security.md)** - Security best practices
 
 ## 🤝 Contributing
 

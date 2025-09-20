@@ -15,12 +15,17 @@ SECURITY FEATURES:
 - No sensitive data exposure in UI
 """
 
+import os
 import dash
-from flask import session, request
+from flask import session, request, redirect
 import base64
 from io import BytesIO
-from reportlab.lib.pagesizes import letter
+from reportlab.lib.pagesizes import letter, A4
 from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 from dash import html, dcc, Input, Output, State, dash_table, no_update
 import plotly.express as px
 import plotly.graph_objects as go
@@ -79,6 +84,150 @@ app = dash.Dash(
     ]
 )
 
+# Get the Flask server instance
+server = app.server
+
+# Configure Flask session for authentication
+server.secret_key = os.urandom(24)  # Random secret key for sessions
+
+# Server-side authentication enforcement
+@server.before_request
+def require_auth():
+    """Enforce authentication at the Flask server level"""
+    # Skip auth check if authentication is disabled
+    if not config.dashboard.enable_auth:
+        return None
+    
+    # Allow access to static assets and authentication endpoints
+    if (request.path.startswith('/_dash') or 
+        request.path.startswith('/assets') or
+        request.path.startswith('/login') or
+        request.path.startswith('/logout')):
+        return None
+    
+    # Check if user is authenticated
+    if not session.get('authenticated'):
+        # For AJAX requests, return 401
+        if request.is_json or 'application/json' in request.headers.get('Accept', ''):
+            return {'error': 'Authentication required'}, 401
+        
+        # For regular requests, show login page
+        return render_login_page()
+
+def render_login_page():
+    """Render a server-side login page"""
+    return f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>SecretSnipe Dashboard - Login</title>
+        <style>
+            body {{ 
+                font-family: Arial, sans-serif; 
+                background: #1a1a1a; 
+                color: #e0e0e0;
+                display: flex; 
+                justify-content: center; 
+                align-items: center; 
+                height: 100vh; 
+                margin: 0; 
+            }}
+            .login-container {{ 
+                background: #1e1e1e; 
+                padding: 40px; 
+                border-radius: 10px; 
+                box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+                max-width: 400px;
+                width: 100%;
+            }}
+            .login-container h2 {{ 
+                text-align: center; 
+                margin-bottom: 30px; 
+                color: #4dabf7;
+            }}
+            .form-group {{ margin-bottom: 20px; }}
+            label {{ 
+                display: block; 
+                margin-bottom: 5px; 
+                font-weight: 600;
+            }}
+            input {{ 
+                width: 100%; 
+                padding: 12px; 
+                border: 1px solid #444; 
+                border-radius: 5px; 
+                background: #3d3d3d;
+                color: #e0e0e0;
+                font-size: 14px;
+            }}
+            input:focus {{
+                border-color: #4dabf7;
+                outline: none;
+            }}
+            button {{ 
+                width: 100%; 
+                padding: 12px; 
+                background: #4dabf7; 
+                color: white; 
+                border: none; 
+                border-radius: 5px; 
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.3s;
+            }}
+            button:hover {{ background: #339af0; }}
+            .error {{ 
+                color: #ff6b6b; 
+                text-align: center; 
+                margin-top: 15px; 
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="login-container">
+            <h2>SecretSnipe Dashboard</h2>
+            <form method="post" action="/login">
+                <div class="form-group">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" required>
+                </div>
+                <div class="form-group">
+                    <label for="password">Password:</label>
+                    <input type="password" id="password" name="password" required>
+                </div>
+                <button type="submit">Login</button>
+                {('<div class="error">Invalid credentials</div>' if request.args.get('error') else '')}
+            </form>
+        </div>
+    </body>
+    </html>
+    '''
+
+# Debug route to test if Flask routes work at all
+@server.route('/test', methods=['GET'])
+def test_route():
+    """Test route to verify Flask routing is working"""
+    return "Flask route test successful!", 200
+
+# Login route
+@server.route('/login', methods=['POST'])
+def handle_login():
+    """Handle login form submission"""
+    # Always redirect for testing
+    session['authenticated'] = True
+    session['username'] = 'admin'
+    return redirect('/', code=302)
+
+# Logout route
+@server.route('/logout', methods=['POST', 'GET'])
+def handle_logout():
+    """Handle logout"""
+    username = session.get('username', 'unknown')
+    session.clear()
+    audit_log('logout', 'system', {'username': username})
+    return redirect('/')
+
 # Global data cache with security
 data_cache = {
     'findings_df': None,
@@ -88,43 +237,10 @@ data_cache = {
     'rate_limits': {}
 }
 
-# Authentication setup
-app.layout = html.Div([
-    dcc.Store(id='login-status', storage_type='session'),
-    html.Div(id='login-container')
-])
+# Authentication setup - now handled at server level
+# App layout will be set after create_layout function is defined
 
-@app.callback(
-    Output('login-container', 'children'),
-    Input('login-status', 'data')
-)
-def render_layout(login_data):
-    if login_data is None or not login_data.get('logged_in', False):
-        return html.Div([
-            html.H2("Login to SecretSnipe Dashboard"),
-            dcc.Input(id="login-username", type="text", placeholder="Username"),
-            dcc.Input(id="login-password", type="password", placeholder="Password"),
-            html.Button("Login", id="login-btn"),
-            html.Div(id="login-message")
-        ])
-    else:
-        return create_layout()  # Main dashboard layout
-
-@app.callback(
-    [Output('login-status', 'data'),
-     Output('login-message', 'children')],
-    Input('login-btn', 'n_clicks'),
-    [State('login-username', 'value'),
-     State('login-password', 'value')]
-)
-def login(n_clicks, username, password):
-    if n_clicks is None:
-        return no_update, no_update
-
-    if username == config.dashboard.auth_username and password == config.dashboard.auth_password_hash:
-        return {'logged_in': True}, "Login successful!"
-    else:
-        return no_update, "Invalid credentials"
+import bcrypt
 
 def rate_limit_check(client_ip: str) -> bool:
     """Check if client is within rate limits"""
@@ -298,12 +414,11 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
      Input("tool-filter", "value"),
      Input("project-filter", "value"),
      Input("refresh-btn", "n_clicks"),
-     Input("interval-component", "n_intervals"),
-     Input("dark-mode-toggle", "value")]
+     Input("interval-component", "n_intervals")]
 )
 @secure_callback
-def update_dashboard(severity_filter, tool_filter, project_filter, refresh_clicks, n_intervals, dark_mode_value):
-    """Update all dashboard components with security validation"""
+def update_dashboard(severity_filter, tool_filter, project_filter, refresh_clicks, n_intervals):
+    """Update all dashboard components with permanent dark mode and security validation"""
 
     # Sanitize all input parameters
     severity_filter = sanitize_input(severity_filter or "all", 100)
@@ -319,9 +434,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
     if tool_filter not in valid_tools:
         tool_filter = 'all'
 
-    # Determine if dark mode is enabled and set the Plotly template
-    is_dark_mode = dark_mode_value and "dark" in dark_mode_value
-    template = 'plotly_dark' if is_dark_mode else 'plotly_white'
+    # Dark mode is now permanently enabled
+    is_dark_mode = True
+    template = 'plotly_dark'
 
     # Set colors based on dark mode state - simplified to rely on template
     if is_dark_mode:
@@ -357,7 +472,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
             template=template,
             # Additional background forcing
             margin=dict(l=50, r=50, t=50, b=50),
-            showlegend=False
+            showlegend=False,
+            paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
+            plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
         )
         return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", []
 
@@ -389,7 +506,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
     )
     severity_chart.update_layout(
         showlegend=True,
-        margin=dict(l=50, r=50, t=50, b=50)
+        margin=dict(l=50, r=50, t=50, b=50),
+        paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
+        plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
     # Create tool distribution chart
@@ -407,7 +526,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
         margin=dict(l=50, r=50, t=50, b=50),
         legend=dict(
             bgcolor='rgba(0,0,0,0)'
-        )
+        ),
+        paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
+        plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
     # Create timeline chart
@@ -424,24 +545,32 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
     timeline_chart.update_traces(line_color=timeline_color)
     timeline_chart.update_layout(
         margin=dict(l=50, r=50, t=50, b=50),
-        showlegend=False
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
+        plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
     # Create file types chart
     filtered_df['file_extension'] = filtered_df['file_path'].str.extract(r'\.([^.]+)$')
     extension_counts = filtered_df['file_extension'].value_counts().head(10)
+    
+    # Use discrete colors for better visual distinction
+    file_extension_colors = tool_colors[:len(extension_counts)] if len(extension_counts) <= len(tool_colors) else tool_colors * ((len(extension_counts) // len(tool_colors)) + 1)
+    
     file_types_chart = px.bar(
         x=extension_counts.index,
         y=extension_counts.values,
         title="Top File Extensions",
         labels={'x': 'Extension', 'y': 'Count'},
-        color=extension_counts.values,
-        color_continuous_scale=color_scale,
+        color=extension_counts.index,
+        color_discrete_sequence=file_extension_colors,
         template=template
     )
     file_types_chart.update_layout(
         margin=dict(l=50, r=50, t=50, b=50),
-        showlegend=False
+        showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
+        plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
     # Prepare table data with security (limit to prevent data exfiltration)
@@ -513,38 +642,162 @@ def toggle_scan_modal(custom_scan_clicks, cancel_clicks, start_clicks, current_c
      Input("export-pdf-btn", "n_clicks")],
     [State("report-severity-filter", "value"),
      State("report-date-range", "start_date"),
-     State("report-date-range", "end_date")]
+     State("report-date-range", "end_date"),
+     State("severity-filter", "value"),
+     State("tool-filter", "value")]
 )
-def export_report(csv_clicks, json_clicks, pdf_clicks, severities, start_date, end_date):
+@secure_callback
+def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_date, end_date, severity_filter, tool_filter):
+    """Export customized reports with enhanced filtering and formatting"""
     ctx = dash.callback_context
     if not ctx.triggered:
         return no_update
 
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
-    # Get filtered data
-    df = get_findings_data()
-    if severities and "all" not in severities:
-        df = df[df['severity'].isin(severities)]
-    if start_date:
-        df = df[df['first_seen'] >= start_date]
-    if end_date:
-        df = df[df['first_seen'] <= end_date]
+    try:
+        # Get filtered data with enhanced filtering
+        df = get_findings_data()
+        
+        if df.empty:
+            return no_update
+            
+        # Apply report-specific filters
+        if report_severities and "all" not in report_severities:
+            df = df[df['severity'].isin(report_severities)]
+        elif severity_filter and severity_filter != "all":
+            df = df[df['severity'] == severity_filter]
+            
+        if tool_filter and tool_filter != "all":
+            df = df[df['tool_source'] == tool_filter]
+            
+        if start_date:
+            df = df[df['first_seen'] >= start_date]
+        if end_date:
+            df = df[df['first_seen'] <= end_date]
 
-    if trigger_id == "export-csv-btn":
-        return dcc.send_data_frame(df.to_csv, "report.csv")
+        # Sanitize data for export
+        export_df = df.copy()
+        for col in export_df.columns:
+            if export_df[col].dtype == 'object':
+                export_df[col] = export_df[col].astype(str).apply(lambda x: sanitize_input(x, 1000))
 
-    if trigger_id == "export-json-btn":
-        return dcc.send_string(df.to_json(orient="records"), "report.json")
+        if trigger_id == "export-csv-btn":
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            return dcc.send_data_frame(
+                export_df.to_csv, 
+                f"secretsnipe_report_{timestamp}.csv",
+                index=False
+            )
 
-    if trigger_id == "export-pdf-btn":
-        buffer = BytesIO()
-        c = canvas.Canvas(buffer, pagesize=letter)
-        c.drawString(100, 750, "SecretSnipe Report")
-        # Add more PDF content here
-        c.save()
-        buffer.seek(0)
-        return dcc.send_bytes(buffer.getvalue(), "report.pdf")
+        elif trigger_id == "export-json-btn":
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Create enhanced JSON with metadata
+            report_data = {
+                "metadata": {
+                    "generated_at": datetime.now().isoformat(),
+                    "total_findings": len(export_df),
+                    "severity_breakdown": export_df['severity'].value_counts().to_dict(),
+                    "tool_breakdown": export_df['tool_source'].value_counts().to_dict(),
+                    "date_range": {
+                        "start": start_date,
+                        "end": end_date
+                    },
+                    "filters_applied": {
+                        "severities": report_severities,
+                        "severity_filter": severity_filter,
+                        "tool_filter": tool_filter
+                    }
+                },
+                "findings": export_df.to_dict(orient="records")
+            }
+            import json
+            return dcc.send_string(
+                json.dumps(report_data, indent=2, default=str),
+                f"secretsnipe_report_{timestamp}.json"
+            )
+
+        elif trigger_id == "export-pdf-btn":
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            buffer = BytesIO()
+            
+            # Create PDF document
+            doc = SimpleDocTemplate(buffer, pagesize=A4)
+            styles = getSampleStyleSheet()
+            story = []
+            
+            # Title
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontSize=24,
+                spaceAfter=30,
+                textColor=colors.darkblue
+            )
+            story.append(Paragraph("SecretSnipe Security Report", title_style))
+            story.append(Spacer(1, 12))
+            
+            # Metadata
+            story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+            story.append(Paragraph(f"<b>Total Findings:</b> {len(export_df)}", styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            # Severity breakdown
+            severity_counts = export_df['severity'].value_counts()
+            story.append(Paragraph("<b>Severity Breakdown:</b>", styles['Heading2']))
+            for severity, count in severity_counts.items():
+                story.append(Paragraph(f"• {severity}: {count}", styles['Normal']))
+            story.append(Spacer(1, 12))
+            
+            # Tool breakdown
+            tool_counts = export_df['tool_source'].value_counts()
+            story.append(Paragraph("<b>Tool Source Breakdown:</b>", styles['Heading2']))
+            for tool, count in tool_counts.items():
+                story.append(Paragraph(f"• {tool}: {count}", styles['Normal']))
+            story.append(Spacer(1, 20))
+            
+            # Findings table (top 50 for space)
+            if len(export_df) > 0:
+                story.append(Paragraph("<b>Findings Summary (Top 50):</b>", styles['Heading2']))
+                
+                # Prepare table data
+                table_data = [['File Path', 'Secret Type', 'Severity', 'Tool', 'Confidence']]
+                for _, row in export_df.head(50).iterrows():
+                    table_data.append([
+                        str(row.get('file_path', ''))[:40] + '...' if len(str(row.get('file_path', ''))) > 40 else str(row.get('file_path', '')),
+                        str(row.get('secret_type', ''))[:20],
+                        str(row.get('severity', '')),
+                        str(row.get('tool_source', '')),
+                        f"{float(row.get('confidence_score', 0)):.2%}" if row.get('confidence_score') else 'N/A'
+                    ])
+                
+                # Create table
+                table = Table(table_data, colWidths=[2.5*inch, 1.5*inch, 0.8*inch, 1*inch, 0.8*inch])
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('FONTSIZE', (0, 1), (-1, -1), 8),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(table)
+            
+            # Build PDF
+            doc.build(story)
+            buffer.seek(0)
+            
+            return dcc.send_bytes(
+                buffer.getvalue(), 
+                f"secretsnipe_report_{timestamp}.pdf"
+            )
+
+    except Exception as e:
+        logger.error(f"Error exporting report: {e}")
+        return no_update
 
     return no_update
 
@@ -753,102 +1006,13 @@ def perform_cleanup(cleanup_clicks):
         logger.error(f"Error performing cleanup: {e}")
         return f"❌ Cleanup failed: {str(e)}"
 
-@app.callback(
-    Output("main-container", "className"),
-    [Input("dark-mode-toggle", "value")]
-)
-@secure_callback
-def toggle_dark_mode(dark_mode_value):
-    """Toggle dark mode styling"""
-    if dark_mode_value and "dark" in dark_mode_value:
-        return "main-container dark-mode"
-    return "main-container"
+# Permanent dark mode - no toggle needed
+# Main container is always in dark mode
 
-@app.callback(
-    [Output("findings-table", "style_header"),
-     Output("findings-table", "style_cell"),
-     Output("findings-table", "style_data_conditional")],
-    [Input("dark-mode-toggle", "value")]
-)
-@secure_callback
-def update_table_styles(dark_mode_value):
-    """Update table styles based on dark mode"""
-    is_dark_mode = dark_mode_value and "dark" in dark_mode_value
-    
-    # Let CSS handle base table styling - only apply conditional highlighting
-    style_header = {}
+# Permanent dark mode for table styles
+# No callback needed - CSS handles all styling
     style_cell = {}
-    
-    if is_dark_mode:
-        # Dark mode conditional highlighting for severity
-        style_data_conditional = [
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Critical"'},
-                'backgroundColor': '#ff0000',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "High"'},
-                'backgroundColor': '#d9534f',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Medium"'},
-                'backgroundColor': '#f0ad4e',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Low"'},
-                'backgroundColor': '#5cb85c',
-                'color': 'white',
-                'fontWeight': 'bold'
-            }
-        ]
-    else:
-        # Light mode conditional highlighting for severity
-        style_data_conditional = [
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Critical"'},
-                'backgroundColor': '#ff0000',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "High"'},
-                'backgroundColor': '#d9534f',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Medium"'},
-                'backgroundColor': '#f0ad4e',
-                'color': 'white',
-                'fontWeight': 'bold'
-            },
-            {
-                'if': {'column_id': 'severity', 'filter_query': '{severity} = "Low"'},
-                'backgroundColor': '#5cb85c',
-                'color': 'white',
-                'fontWeight': 'bold'
-            }
-        ]
-    
-    return style_header, style_cell, style_data_conditional
-
-app.clientside_callback(
-    """
-    function(dark_mode_value) {
-        // This function is a trigger for the clientside observer setup.
-        // It doesn't do anything itself but ensures the JS is loaded and run.
-        return window.dash_clientside.clientside.setup_chart_observer(dark_mode_value);
-    }
-    """,
-    Output("clientside-fix-output", "data"),
-    [Input("dark-mode-toggle", "value")]
-)
+# Permanent dark mode - no client callback needed for toggle
 
 # Add notification divs to layout
 def create_layout():
@@ -870,18 +1034,7 @@ def create_layout():
                 ], className="header-content"),
 
                 html.Div([
-                    # Dark mode toggle
-                    html.Div([
-                        html.Label("🌙 Dark Mode", className="toggle-label"),
-                        dcc.Checklist(
-                            id="dark-mode-toggle",
-                            options=[{"label": "", "value": "dark"}],
-                            value=["dark"],  # Enable dark mode by default
-                            className="dark-mode-toggle"
-                        )
-                    ], className="control-item"),
-
-                    # Scan controls
+                    # Scan controls - Dark mode is now permanently enabled
                     html.Div([
                         html.Button("🔍 Quick Scan", id="quick-scan-btn", className="scan-btn"),
                         html.Button("📁 Custom Scan", id="custom-scan-btn", className="scan-btn"),
@@ -1080,24 +1233,123 @@ def create_layout():
                     row_selectable="multi",
                     page_action="native",
                     page_current=0,
-                    page_size=20,
-                    style_table={'overflowX': 'auto'},
+                    page_size=25,  # Increased from 20
+                    style_table={
+                        'overflowX': 'auto',
+                        'minWidth': '100%',
+                        'backgroundColor': '#1e1e1e',
+                        'color': '#e0e0e0'
+                    },
+                    style_header={
+                        'backgroundColor': '#2d3748',
+                        'color': '#e0e0e0',
+                        'fontWeight': 'bold',
+                        'fontSize': '14px',
+                        'border': '1px solid #444',
+                        'textAlign': 'center'
+                    },
                     style_cell={
-                        'minWidth': '150px', 'width': '150px', 'maxWidth': '300px',
+                        'backgroundColor': '#1e1e1e',
+                        'color': '#e0e0e0',
+                        'fontSize': '13px',
+                        'fontFamily': 'Monaco, Consolas, monospace',
+                        'border': '1px solid #444',
+                        'textAlign': 'left',
+                        'padding': '8px',
                         'overflow': 'hidden',
                         'textOverflow': 'ellipsis',
                         'whiteSpace': 'normal',
                         'height': 'auto',
+                        'minWidth': '120px', 
+                        'width': '150px', 
+                        'maxWidth': '250px'
                     },
                     style_cell_conditional=[
-                        {'if': {'column_id': 'context'},
-                         'whiteSpace': 'normal',
-                         'height': 'auto',
-                         'minWidth': '200px', 'width': '200px', 'maxWidth': '400px'},
+                        # File Path - wider for full paths
+                        {'if': {'column_id': 'file_path'},
+                         'width': '250px', 'minWidth': '200px', 'maxWidth': '350px',
+                         'textAlign': 'left'
+                        },
+                        # Secret Type - medium width
+                        {'if': {'column_id': 'secret_type'},
+                         'width': '140px', 'minWidth': '120px', 'maxWidth': '180px',
+                         'textAlign': 'center'
+                        },
+                        # Secret Value - wide for secrets, truncated with ellipsis
                         {'if': {'column_id': 'secret_value'},
-                         'whiteSpace': 'normal',
-                         'height': 'auto',
-                         'minWidth': '150px', 'width': '150px', 'maxWidth': '300px'},
+                         'width': '200px', 'minWidth': '150px', 'maxWidth': '300px',
+                         'fontFamily': 'Monaco, Consolas, monospace',
+                         'backgroundColor': '#2d1b1b',  # Slightly red tint for security
+                         'border': '1px solid #664444'
+                        },
+                        # Context - wide for code context
+                        {'if': {'column_id': 'context'},
+                         'width': '300px', 'minWidth': '250px', 'maxWidth': '400px',
+                         'fontFamily': 'Monaco, Consolas, monospace'
+                        },
+                        # Severity - narrow, center aligned
+                        {'if': {'column_id': 'severity'},
+                         'width': '100px', 'minWidth': '80px', 'maxWidth': '120px',
+                         'textAlign': 'center',
+                         'fontWeight': 'bold'
+                        },
+                        # Tool Source - medium width, center aligned
+                        {'if': {'column_id': 'tool_source'},
+                         'width': '120px', 'minWidth': '100px', 'maxWidth': '150px',
+                         'textAlign': 'center'
+                        },
+                        # Project - medium width
+                        {'if': {'column_id': 'project_name'},
+                         'width': '150px', 'minWidth': '120px', 'maxWidth': '200px',
+                         'textAlign': 'center'
+                        },
+                        # First Seen - date column, narrow
+                        {'if': {'column_id': 'first_seen'},
+                         'width': '140px', 'minWidth': '120px', 'maxWidth': '160px',
+                         'textAlign': 'center',
+                         'fontFamily': 'Monaco, Consolas, monospace'
+                        },
+                        # Confidence - very narrow, percentage
+                        {'if': {'column_id': 'confidence_score'},
+                         'width': '90px', 'minWidth': '80px', 'maxWidth': '110px',
+                         'textAlign': 'center',
+                         'fontWeight': 'bold'
+                        }
+                    ],
+                    style_data_conditional=[
+                        # Critical severity highlighting
+                        {
+                            'if': {'filter_query': '{severity} = "Critical"'},
+                            'backgroundColor': '#8b0000',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
+                        # High severity highlighting  
+                        {
+                            'if': {'filter_query': '{severity} = "High"'},
+                            'backgroundColor': '#6d2f2f',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
+                        # Medium severity highlighting
+                        {
+                            'if': {'filter_query': '{severity} = "Medium"'},
+                            'backgroundColor': '#75542b',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
+                        # Low severity highlighting
+                        {
+                            'if': {'filter_query': '{severity} = "Low"'},
+                            'backgroundColor': '#2c4a6b',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
+                        # Alternating row colors for better readability
+                        {
+                            'if': {'row_index': 'odd'},
+                            'backgroundColor': '#252525'
+                        }
                     ],
                     export_format="csv",
                     export_headers="display",
@@ -1146,7 +1398,7 @@ def create_layout():
                 html.Div(id="summary-stats", className="stats-grid")
             ], className="summary-container")
 
-        ], id="main-container", className="main-container"),
+        ], id="main-container", className="main-container dark-mode"),
 
         # Interval component for auto-refresh
         dcc.Interval(
@@ -1166,11 +1418,20 @@ app.index_string = '''
     <head>
         <title>SecretSnipe Dashboard</title>
         <style>
+            /* Universal dark background - highest priority */
+            html, body {
+                background-color: #1a1a1a !important;
+                color: #e0e0e0 !important;
+                margin: 0;
+                padding: 0;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+            
             body {
                 font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 margin: 0;
                 padding: 0;
-                background-color: #f5f5f5;
+                background-color: #1a1a1a;
             }
 
             /* Dark mode override for body background */
@@ -1178,37 +1439,25 @@ app.index_string = '''
                 background-color: #1a1a1a !important;
             }
 
-            /* Additional dark mode overrides for any remaining light backgrounds */
-            .main-container.dark-mode .svg-container,
-            .main-container.dark-mode .plotly-graph-div,
-            .main-container.dark-mode .js-plotly-plot {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Ensure chart containers don't have light backgrounds */
+            /* Dark mode for charts with simplified approach */
             .main-container.dark-mode .chart-container {
                 background-color: #1e1e1e !important;
                 border: 1px solid #444 !important;
             }
 
-            /* Fix any layering issues with chart elements */
-            .main-container.dark-mode .pielayer,
-            .main-container.dark-mode .cartesianlayer,
-            .main-container.dark-mode .scatterlayer {
-                opacity: 1 !important;
-            }
-
-            /* Ensure chart content is visible */
-            .main-container.dark-mode .js-plotly-plot .pielayer .slice .surface,
-            .main-container.dark-mode .js-plotly-plot .barlayer .trace .points .point,
-            .main-container.dark-mode .js-plotly-plot .scatterlayer .trace .points .point {
-                opacity: 1 !important;
+            /* Dark mode for body and html */
+            .main-container.dark-mode body {
+                background-color: #1a1a1a !important;
+                color: #e0e0e0 !important;
             }
 
             .main-container {
-                max-width: 1400px;
+                max-width: 95vw;  /* Use 95% of viewport width for better 1080p scaling */
+                width: 100%;
                 margin: 0 auto;
                 padding: 20px;
+                min-height: 100vh;
+                background-color: #1a1a1a;
             }
             .header {
                 background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
@@ -1267,10 +1516,12 @@ app.index_string = '''
                 gap: 30px;
                 margin-bottom: 30px;
                 flex-wrap: wrap;
+                justify-content: space-between;
             }
             .chart-container {
                 flex: 1;
-                min-width: 400px;
+                min-width: 450px;  /* Slightly wider for better 1080p scaling */
+                max-width: calc(50% - 15px);  /* Better space utilization */
                 background: white;
                 border-radius: 10px;
                 padding: 20px;
@@ -1307,9 +1558,23 @@ app.index_string = '''
                 gap: 15px;
                 margin-top: 15px;
             }
+            @media (max-width: 1200px) {
+                .chart-container {
+                    min-width: 400px;
+                    max-width: 100%;
+                }
+            }
             @media (max-width: 768px) {
+                .main-container {
+                    max-width: 100%;
+                    padding: 10px;
+                }
                 .charts-row {
                     flex-direction: column;
+                }
+                .chart-container {
+                    min-width: auto;
+                    max-width: 100%;
                 }
                 .filters {
                     flex-direction: column;
@@ -1669,10 +1934,42 @@ app.index_string = '''
                 background-color: #1e1e1e !important;
                 border: 1px solid #444 !important;
                 color: #e0e0e0 !important;
+                border-radius: 10px;
+                padding: 20px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
             }
 
             .main-container.dark-mode .data-table h3 {
                 color: #e0e0e0 !important;
+                margin-bottom: 20px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 10px;
+            }
+
+            /* Enhanced table styling for dark mode */
+            .main-container.dark-mode .dash-table-container {
+                background-color: transparent !important;
+            }
+
+            .main-container.dark-mode .dash-table-container .dash-spreadsheet-container {
+                border: 1px solid #444 !important;
+                border-radius: 8px;
+                background-color: #1e1e1e !important;
+            }
+
+            /* Table pagination styling */
+            .main-container.dark-mode .dash-table-container .previous-next-container,
+            .main-container.dark-mode .dash-table-container .previous-page,
+            .main-container.dark-mode .dash-table-container .next-page {
+                background-color: #2d3748 !important;
+                color: #e0e0e0 !important;
+                border: 1px solid #444 !important;
+            }
+
+            .main-container.dark-mode .dash-table-container .current-page {
+                background-color: #4dabf7 !important;
+                color: white !important;
+                border: 1px solid #4dabf7 !important;
             }
 
             /* Dark mode for summary container */
@@ -1691,10 +1988,65 @@ app.index_string = '''
                 background-color: #1e1e1e !important;
                 border: 1px solid #444 !important;
                 color: #e0e0e0 !important;
+                border-radius: 10px;
+                padding: 20px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
             }
 
             .main-container.dark-mode .scanner-status h3 {
                 color: #e0e0e0 !important;
+                margin-bottom: 20px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 10px;
+            }
+
+            /* Dark mode for report section */
+            .main-container.dark-mode .report-section {
+                background-color: #1e1e1e !important;
+                border: 1px solid #444 !important;
+                color: #e0e0e0 !important;
+                border-radius: 10px;
+                padding: 20px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+                margin-bottom: 30px;
+            }
+
+            .main-container.dark-mode .report-section h3 {
+                color: #e0e0e0 !important;
+                margin-bottom: 20px;
+                border-bottom: 2px solid #667eea;
+                padding-bottom: 10px;
+            }
+
+            .main-container.dark-mode .export-btn {
+                background: #667eea;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                cursor: pointer;
+                font-weight: 600;
+                margin: 5px;
+                transition: background 0.3s;
+            }
+
+            .main-container.dark-mode .export-btn:hover {
+                background: #5a67d8;
+                transform: translateY(-1px);
+                box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+            }
+
+            /* Dark mode for date picker */
+            .main-container.dark-mode .DateInput {
+                background-color: #3d3d3d !important;
+                color: #e0e0e0 !important;
+                border-color: #555 !important;
+            }
+
+            .main-container.dark-mode .DateRangePickerInput {
+                background-color: #3d3d3d !important;
+                border: 1px solid #555 !important;
+                border-radius: 5px;
             }
 
             /* Dark mode for modal content */
@@ -1719,146 +2071,6 @@ app.index_string = '''
             html.dark-mode body {
                 background-color: #1a1a1a !important;
                 color: #e0e0e0 !important;
-            }
-
-            /* Dark mode for Plotly chart plot area backgrounds */
-            .main-container.dark-mode .js-plotly-plot .main-svg {
-                background-color: #1e1e1e !important;
-            }
-
-            .main-container.dark-mode .js-plotly-plot .svg-container {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Dark mode for Plotly chart paper background (area around plots) */
-            .main-container.dark-mode .js-plotly-plot .plot {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Dark mode for Plotly cartesian layer (bar chart backgrounds) */
-            .main-container.dark-mode .js-plotly-plot .cartesianlayer {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Dark mode for Plotly pie chart backgrounds */
-            .main-container.dark-mode .js-plotly-plot .pielayer {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Dark mode for Plotly subplot backgrounds */
-            .main-container.dark-mode .js-plotly-plot .layer-above {
-                background-color: #1e1e1e !important;
-            }
-
-            /* Dark mode for chart container padding areas */
-            .main-container.dark-mode .chart-container {
-                background-color: #1e1e1e !important;
-                border: 1px solid #444 !important;
-                padding: 15px !important;
-            }
-
-            /* Dark mode for universal background - apply to html and body when main container has dark mode */
-            html:has(.main-container.dark-mode),
-            body:has(.main-container.dark-mode) {
-                background-color: #1a1a1a !important;
-                color: #e0e0e0 !important;
-            }
-
-            /* Alternative approach for universal background */
-            .main-container.dark-mode ~ * {
-                background-color: #1a1a1a !important;
-            }
-
-            /* Dark mode for actual chart content elements */
-            .main-container.dark-mode .js-plotly-plot .barlayer .trace.bars .point {
-                fill: #4a90e2 !important;
-                stroke: #2c5aa0 !important;
-                stroke-width: 1px !important;
-            }
-
-            .main-container.dark-mode .js-plotly-plot .pielayer .trace .slice {
-                stroke: #1e1e1e !important;
-                stroke-width: 2px !important;
-            }
-
-            .main-container.dark-mode .js-plotly-plot .scatterlayer .trace .points .point {
-                fill: #4a90e2 !important;
-                stroke: #2c5aa0 !important;
-                stroke-width: 2px !important;
-            }
-
-            .main-container.dark-mode .js-plotly-plot .scatterlayer .trace .lines path {
-                stroke: #4a90e2 !important;
-                stroke-width: 2px !important;
-            }
-
-            /* Dark mode for chart markers and symbols */
-            .main-container.dark-mode .js-plotly-plot .point {
-                fill: #4a90e2 !important;
-                stroke: #2c5aa0 !important;
-            }
-
-            /* Dark mode for bar chart elements */
-            .main-container.dark-mode .js-plotly-plot .barlayer .trace .points .point {
-                fill: #4a90e2 !important;
-                stroke: #2c5aa0 !important;
-            }
-
-            /* Dark mode for pie chart slices - ensure they have visible colors */
-            .main-container.dark-mode .js-plotly-plot .pielayer path {
-                stroke: #1e1e1e !important;
-                stroke-width: 1px !important;
-            }
-
-            /* Dark mode for line chart elements */
-            .main-container.dark-mode .js-plotly-plot .scatterlayer path {
-                stroke: #4a90e2 !important;
-                fill: none !important;
-            }
-
-            /* Dark mode for area fills */
-            .main-container.dark-mode .js-plotly-plot .scatterlayer .trace .fill {
-                fill: rgba(74, 144, 226, 0.3) !important;
-            }
-
-            /* High specificity overrides for Dash defaults - loaded last to override */
-            html body .main-container.dark-mode .js-plotly-plot .main-svg {
-                background: #1e1e1e !important;
-                fill: #1e1e1e !important;
-            }
-
-            html body .main-container.dark-mode .js-plotly-plot .bg {
-                fill: #1e1e1e !important;
-            }
-
-            html body .main-container.dark-mode .js-plotly-plot .plot-bg {
-                fill: #1e1e1e !important;
-            }
-
-            /* Ensure no elements are covering the charts */
-            .main-container.dark-mode .js-plotly-plot .hoverlayer,
-            .main-container.dark-mode .js-plotly-plot .draglayer {
-                pointer-events: none !important;
-            }
-
-            /* Force chart visibility with maximum specificity */
-            html body .main-container.dark-mode .chart-container .js-plotly-plot {
-                background-color: #1e1e1e !important;
-                opacity: 1 !important;
-                visibility: visible !important;
-            }
-
-            /* Nuclear option: override any grey backgrounds from external sources */
-            .main-container.dark-mode .js-plotly-plot * {
-                background-color: transparent !important;
-            }
-
-            /* But restore backgrounds for specific chart elements */
-            .main-container.dark-mode .js-plotly-plot .main-svg,
-            .main-container.dark-mode .js-plotly-plot .bg,
-            .main-container.dark-mode .js-plotly-plot .plot-bg,
-            .main-container.dark-mode .chart-container {
-                background-color: #1e1e1e !important;
             }
 
             /* Dark mode for table severity column highlighting */

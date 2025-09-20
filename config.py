@@ -68,10 +68,21 @@ class ScannerConfig:
     def __post_init__(self):
         if self.supported_extensions is None:
             self.supported_extensions = [
+                # Text-based files
                 '.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.php', '.rb',
                 '.go', '.rs', '.swift', '.kt', '.scala', '.clj', '.hs', '.ml',
                 '.txt', '.md', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini',
-                '.cfg', '.conf', '.properties', '.env', '.sh', '.bat', '.ps1'
+                '.cfg', '.conf', '.properties', '.env', '.sh', '.bat', '.ps1',
+                '.sql', '.html', '.css', '.scss', '.sass', '.less',
+                
+                # Document files (PDF, Office)
+                '.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt',
+                
+                # Image files (OCR supported)
+                '.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.gif',
+                
+                # Archive files
+                '.zip', '.tar', '.gz', '.bz2', '.7z', '.rar'
             ]
         if self.excluded_paths is None:
             self.excluded_paths = [
@@ -80,6 +91,18 @@ class ScannerConfig:
             ]
         if self.ocr_languages is None:
             self.ocr_languages = ['en']
+
+        # Load from environment variables
+        if os.getenv('SUPPORTED_EXTENSIONS'):
+            env_extensions = os.getenv('SUPPORTED_EXTENSIONS').split(',')
+            self.supported_extensions = [ext.strip() for ext in env_extensions]
+        
+        if os.getenv('EXCLUDED_EXTENSIONS'):
+            env_excluded = os.getenv('EXCLUDED_EXTENSIONS').split(',')
+            self.excluded_paths.extend([ext.strip() for ext in env_excluded])
+            
+        if os.getenv('OCR_LANGUAGES'):
+            self.ocr_languages = os.getenv('OCR_LANGUAGES').split(',')
 
 @dataclass
 class WebhookConfig:

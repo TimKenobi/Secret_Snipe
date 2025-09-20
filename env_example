@@ -1,23 +1,135 @@
-# Database Configuration
-POSTGRES_PASSWORD= #Add your Postgress Password here
+# SecretSnipe Production Environment Configuration Template
+# Copy this file to .env and configure for your deployment
 
+# =============================================================================
+# Database Configuration (Required)
+# =============================================================================
+POSTGRES_PASSWORD=your_secure_postgres_password_here
+POSTGRES_DB=secretsnipe
+POSTGRES_USER=secretsnipe
+
+# =============================================================================
+# Authentication & Security (Required for Production)
+# =============================================================================
+# Dashboard login credentials (change these!)
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=SecretSnipe2024!
+
+# JWT Secret for session management (generate a strong random string)
+JWT_SECRET_KEY=your_jwt_secret_key_here_minimum_32_characters
+
+# Security settings
+ENABLE_RATE_LIMITING=true
+ENABLE_CSRF_PROTECTION=true
+ENABLE_AUDIT_LOGGING=true
+SESSION_TIMEOUT=3600
+
+# =============================================================================
 # Monitoring Configuration
+# =============================================================================
 ENABLE_CONTINUOUS_MONITORING=true
+SCAN_INTERVAL_HOURS=24
+MAX_FILE_SIZE_MB=100
 
+# =============================================================================
+# Notification Configuration
+# =============================================================================
 # Teams Webhook Configuration
-WEBHOOK_URL= #Your Webhook URL
-TEAMS_WEBHOOK_URL= #Your Teams Webhook URL
+WEBHOOK_URL=https://your-domain.webhook.office.com/webhookb2/your-webhook-url
+TEAMS_WEBHOOK_URL=https://your-domain.webhook.office.com/webhookb2/your-teams-webhook-url
 
-# Volume Mount Configuration (for public deployment)
+# Notification settings
+NOTIFY_ON_CRITICAL=true
+NOTIFY_ON_HIGH=true
+NOTIFY_ON_MEDIUM=false
+NOTIFY_ON_LOW=false
+
+# =============================================================================
+# Volume Mount Configuration
+# =============================================================================
 # For local development (uncomment and modify):
 # MONITOR_VOLUME=./monitor_data:/monitor:ro
 # HOST_MONITOR_VOLUME=./monitor_data:/app/host_monitor:ro
 
 # For production with CIFS share (uncomment and modify):
-# MONITOR_VOLUME=//server/share:/monitor:ro
-# HOST_MONITOR_VOLUME=//server/share:/app/host_monitor:ro
+# MONITOR_VOLUME=//server.domain.com/share:/monitor:ro,uid=1000,gid=1000,file_mode=0644,dir_mode=0755
+# HOST_MONITOR_VOLUME=//server.domain.com/share:/app/host_monitor:ro,uid=1000,gid=1000,file_mode=0644,dir_mode=0755
 
+# =============================================================================
 # CIFS Credentials (for authenticated network shares)
+# =============================================================================
 # CIFS_USERNAME=your_domain_username
-# CIFS_PASSWORD=your_password
-# CIFS_DOMAIN=your_domain
+# CIFS_PASSWORD=your_secure_cifs_password
+# CIFS_DOMAIN=your_domain.com
+
+# =============================================================================
+# Advanced Configuration (Optional)
+# =============================================================================
+# Redis Configuration
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+
+# Logging Configuration
+LOG_LEVEL=INFO
+LOG_RETENTION_DAYS=30
+AUDIT_LOG_RETENTION_DAYS=90
+
+# Dashboard Configuration
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8050
+DASHBOARD_DEBUG=false
+
+# Performance Settings
+POSTGRES_MAX_CONNECTIONS=100
+REDIS_MAX_CONNECTIONS=50
+WORKER_PROCESSES=2
+
+# File Processing Configuration
+# Add or remove file extensions to scan (comma-separated)
+# SUPPORTED_EXTENSIONS=.py,.js,.pdf,.docx,.jpg,.png,.zip
+# EXCLUDED_EXTENSIONS=.exe,.dll,.bin
+# OCR_LANGUAGES=en,es,fr
+
+# Advanced Configuration (Optional)
+# Redis Configuration
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+
+# Logging Configuration
+LOG_LEVEL=INFO
+LOG_RETENTION_DAYS=30
+AUDIT_LOG_RETENTION_DAYS=90
+
+# Dashboard Configuration
+DASHBOARD_HOST=0.0.0.0
+DASHBOARD_PORT=8050
+DASHBOARD_DEBUG=false
+
+# Performance Settings
+POSTGRES_MAX_CONNECTIONS=100
+REDIS_MAX_CONNECTIONS=50
+WORKER_PROCESSES=2
+
+# File Processing
+MAX_SCAN_DEPTH=10
+# EXCLUDED_EXTENSIONS=.jpg,.png,.gif,.pdf,.zip,.tar,.gz  # REMOVED - Now supports these file types
+EXCLUDED_DIRECTORIES=node_modules,.git,venv,__pycache__
+
+# OCR Configuration
+ENABLE_OCR=true
+OCR_LANGUAGES=en
+
+# =============================================================================
+# Production Deployment Notes
+# =============================================================================
+# 1. Change all default passwords and secrets
+# 2. Configure proper CIFS credentials for network shares
+# 3. Set up HTTPS with proper certificates
+# 4. Configure firewall rules (expose only necessary ports)
+# 5. Enable backup strategy for PostgreSQL database
+# 6. Monitor disk space for logs and database growth
+# 7. Set up log rotation and monitoring alerts

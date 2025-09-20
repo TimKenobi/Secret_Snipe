@@ -10,6 +10,9 @@ plotly>=5.0.0
 networkx>=3.0
 scipy>=1.10.0
 
+# Authentication
+bcrypt>=4.0.0  # For password hashing
+
 # Scanner dependencies
 PyMuPDF>=1.20.0
 openpyxl>=3.0.0

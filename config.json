@@ -32,7 +32,10 @@
       ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".php", ".rb", ".go",
       ".rs", ".swift", ".kt", ".scala", ".clj", ".hs", ".ml", ".txt", ".md",
       ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
-      ".properties", ".env", ".sh", ".bat", ".ps1"
+      ".properties", ".env", ".sh", ".bat", ".ps1",
+      ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+      ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".gif", ".webp",
+      ".zip", ".tar", ".gz", ".bz2", ".rar", ".7z"
     ],
     "excluded_paths": [
       ".git", "__pycache__", "node_modules", ".venv", "venv",
@@ -71,5 +74,28 @@
     "max_secret_length": 100,
     "encryption_enabled": false,
     "audit_log_enabled": true
+  },
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8050,
+    "debug": false,
+    "enable_cors": false,
+    "cors_origins": [],
+    "rate_limit_enabled": true,
+    "rate_limit_requests": 100,
+    "rate_limit_window_seconds": 60,
+    "session_timeout_minutes": 30,
+    "enable_https": false,
+    "ssl_cert_path": null,
+    "ssl_key_path": null,
+    "enable_auth": true,
+    "auth_username": "admin",
+    "auth_password_hash": "$2b$12$0jXWt7IPV5FyVNBbiKsN8eSWxUeD5HfK.5hrGHpae.fySSC7QzEtK",
+    "enable_csrf_protection": true,
+    "max_input_length": 1000,
+    "enable_audit_log": true,
+    "audit_log_file": "dashboard_audit.log",
+    "blocked_ips": [],
+    "allowed_ips": []
   }
 }

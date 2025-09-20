@@ -34,6 +34,27 @@ RUN apt-get update && apt-get install -y \
     # Required for Hyperscan
     libhyperscan-dev \
     python3-dev \
+    # OCR and Image Processing Dependencies
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgthread-2.0-0 \
+    libgtk-3-0 \
+    libgdk-pixbuf2.0-0 \
+    libcairo-gobject2 \
+    libpango-1.0-0 \
+    libatk1.0-0 \
+    libcairo-gobject2 \
+    libgtk-3-0 \
+    libgdk-pixbuf2.0-0 \
+    # Additional dependencies for PyTorch/EasyOCR
+    libjpeg-dev \
+    libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Security: Install external scanners as root, then switch to non-root user

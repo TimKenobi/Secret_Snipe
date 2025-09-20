@@ -221,6 +221,165 @@ body {
 }
 
 /* ==========================================================================
+   Dropdown and Input Styling - React-Select Components (High Specificity)
+   ========================================================================== */
+
+/* Main Select Control - Multiple selectors for higher specificity */
+.Select-control,
+div.Select-control,
+.dcc-dropdown .Select-control,
+div[class*="Select-control"] {
+    background-color: var(--table-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 5px !important;
+    box-shadow: none !important;
+}
+
+.Select-control:hover,
+div.Select-control:hover {
+    border-color: var(--table-border) !important;
+}
+
+/* Select Value Container */
+.Select-value,
+.Select-multi-value-wrapper,
+div.Select-value,
+div.Select-multi-value-wrapper {
+    background-color: var(--table-bg) !important;
+}
+
+/* Select Value Labels - High specificity */
+.Select-value-label,
+span.Select-value-label,
+.Select-value span.Select-value-label,
+div.Select-value span.Select-value-label {
+    color: var(--table-text) !important;
+    background-color: var(--stat-bg) !important;
+    border-radius: 3px !important;
+    padding: 2px 6px !important;
+}
+
+/* Select Placeholder */
+.Select-placeholder,
+div.Select-placeholder {
+    color: var(--table-text) !important;
+    opacity: 0.7 !important;
+}
+
+/* Select Arrow Zone and Arrow */
+.Select-arrow-zone,
+span.Select-arrow-zone {
+    background-color: var(--table-bg) !important;
+}
+
+.Select-arrow,
+span.Select-arrow {
+    border-color: var(--table-text) transparent transparent !important;
+    border-style: solid !important;
+    border-width: 5px 5px 0 !important;
+}
+
+.Select-arrow-zone:hover .Select-arrow,
+span.Select-arrow-zone:hover span.Select-arrow {
+    border-top-color: var(--text-color) !important;
+}
+
+/* Select Clear Button */
+.Select-clear-zone,
+span.Select-clear-zone {
+    background-color: var(--table-bg) !important;
+}
+
+.Select-clear,
+span.Select-clear {
+    color: var(--table-text) !important;
+}
+
+.Select-clear:hover,
+span.Select-clear:hover {
+    color: var(--text-color) !important;
+}
+
+/* Select Value Icon (X button for multi-select) */
+.Select-value-icon,
+span.Select-value-icon {
+    background-color: var(--table-border) !important;
+    border-right: 1px solid var(--table-border) !important;
+    color: var(--table-text) !important;
+    border-radius: 2px 0 0 2px !important;
+}
+
+.Select-value-icon:hover,
+span.Select-value-icon:hover {
+    background-color: #dc3545 !important;
+    color: white !important;
+}
+
+/* Dropdown Menu - High specificity */
+.Select-menu-outer,
+div.Select-menu-outer {
+    background-color: var(--table-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 5px !important;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2) !important;
+    z-index: 9999 !important;
+}
+
+.Select-menu,
+div.Select-menu {
+    background-color: var(--table-bg) !important;
+    border-radius: 5px !important;
+}
+
+/* Dropdown Options - High specificity */
+.Select-option,
+div.Select-option {
+    background-color: var(--table-bg) !important;
+    color: var(--table-text) !important;
+    padding: 10px 12px !important;
+    border-bottom: 1px solid var(--table-border) !important;
+}
+
+.Select-option:last-child,
+div.Select-option:last-child {
+    border-bottom: none !important;
+}
+
+.Select-option:hover,
+.Select-option.is-focused,
+div.Select-option:hover,
+div.Select-option.is-focused {
+    background-color: var(--stat-bg) !important;
+    color: var(--text-color) !important;
+}
+
+.Select-option.is-selected,
+div.Select-option.is-selected {
+    background-color: #667eea !important;
+    color: white !important;
+}
+
+.Select-option.is-selected:hover,
+div.Select-option.is-selected:hover {
+    background-color: #5a6fd8 !important;
+}
+
+/* Input field inside Select */
+.Select-input > input,
+div.Select-input > input {
+    background-color: transparent !important;
+    color: var(--table-text) !important;
+    border: none !important;
+    outline: none !important;
+}
+
+/* Dark mode enhancements */
+.dark-mode .Select-menu-outer,
+.dark-mode div.Select-menu-outer {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+}
+
+/* ==========================================================================
    Charts
    ========================================================================== */
 
@@ -376,6 +535,233 @@ body {
     border-radius: 8px;
     text-align: center;
     color: var(--stat-text);
+}
+
+/* ==========================================================================
+   Report Export Section
+   ========================================================================== */
+
+.report-section {
+    background: var(--chart-bg);
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    margin-bottom: 30px;
+}
+
+.report-section h3 {
+    margin-top: 0;
+    color: var(--text-color);
+    border-bottom: 2px solid #667eea;
+    padding-bottom: 10px;
+}
+
+.report-section .filter-item {
+    margin-bottom: 20px;
+}
+
+.report-section .filter-item label {
+    color: var(--text-color) !important;
+    font-weight: 600;
+    margin-bottom: 8px;
+    display: block;
+}
+
+/* Export buttons styling */
+.export-btn {
+    background: #667eea;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: 600;
+    margin-right: 10px;
+    margin-top: 10px;
+    transition: background 0.3s;
+}
+
+.export-btn:hover {
+    background: #5a6fd8;
+}
+
+/* Date picker styling - React DayPicker Components (High Specificity) */
+.DateInput_input,
+input.DateInput_input,
+.DateInput_input_1,
+input.DateInput_input_1 {
+    background-color: var(--table-bg) !important;
+    color: var(--table-text) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 5px !important;
+    padding: 8px 12px !important;
+    font-size: 14px !important;
+}
+
+.DateInput_input:focus,
+.DateInput_input__focused,
+.DateInput_input__focused_2,
+input.DateInput_input:focus,
+input.DateInput_input__focused {
+    border-color: #667eea !important;
+    outline: none !important;
+    box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2) !important;
+    background-color: var(--table-bg) !important;
+    color: var(--table-text) !important;
+}
+
+.DateInput_input::placeholder,
+input.DateInput_input::placeholder {
+    color: var(--table-text) !important;
+    opacity: 0.6 !important;
+}
+
+/* Date Range Picker Container */
+.DateRangePickerInput,
+div.DateRangePickerInput {
+    background-color: var(--table-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 5px !important;
+    display: flex !important;
+}
+
+.DateRangePickerInput__withBorder,
+div.DateRangePickerInput__withBorder {
+    border: 1px solid var(--table-border) !important;
+}
+
+/* Date Range Arrow */
+.DateRangePickerInput_arrow,
+div.DateRangePickerInput_arrow {
+    background-color: var(--table-bg) !important;
+    color: var(--table-text) !important;
+}
+
+.DateRangePickerInput_arrow_svg,
+svg.DateRangePickerInput_arrow_svg {
+    fill: var(--table-text) !important;
+}
+
+/* Calendar Popup */
+.DayPicker,
+div.DayPicker {
+    background: var(--table-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2) !important;
+    padding: 16px !important;
+}
+
+/* Calendar Navigation */
+.DayPickerNavigation_button,
+button.DayPickerNavigation_button {
+    background: var(--stat-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 4px !important;
+    color: var(--text-color) !important;
+}
+
+.DayPickerNavigation_button:hover,
+button.DayPickerNavigation_button:hover {
+    background: var(--table-border) !important;
+}
+
+.DayPickerNavigation_svg__horizontal,
+svg.DayPickerNavigation_svg__horizontal {
+    fill: var(--text-color) !important;
+}
+
+/* Calendar Month/Year Header */
+.DayPicker_weekHeader,
+div.DayPicker_weekHeader {
+    background: var(--stat-bg) !important;
+    color: var(--text-color) !important;
+    border-bottom: 1px solid var(--table-border) !important;
+}
+
+.DayPicker_weekHeader_li,
+li.DayPicker_weekHeader_li {
+    color: var(--text-color) !important;
+    font-weight: 600 !important;
+}
+
+/* Calendar Days */
+.CalendarDay,
+td.CalendarDay {
+    background: var(--table-bg) !important;
+    color: var(--table-text) !important;
+    border: 1px solid var(--table-border) !important;
+    border-radius: 4px !important;
+}
+
+.CalendarDay:hover,
+td.CalendarDay:hover {
+    background: var(--stat-bg) !important;
+    color: var(--text-color) !important;
+    border-color: var(--text-color) !important;
+}
+
+.CalendarDay__selected,
+.CalendarDay__selected_span,
+td.CalendarDay__selected,
+td.CalendarDay__selected_span {
+    background: #667eea !important;
+    color: white !important;
+    border-color: #667eea !important;
+}
+
+.CalendarDay__selected:hover,
+.CalendarDay__selected_span:hover,
+td.CalendarDay__selected:hover,
+td.CalendarDay__selected_span:hover {
+    background: #5a6fd8 !important;
+    border-color: #5a6fd8 !important;
+}
+
+.CalendarDay__blocked_out_of_range,
+td.CalendarDay__blocked_out_of_range {
+    background: var(--table-bg) !important;
+    color: var(--table-border) !important;
+    opacity: 0.5 !important;
+}
+
+.CalendarDay__today,
+td.CalendarDay__today {
+    background: var(--stat-bg) !important;
+    color: var(--text-color) !important;
+    font-weight: bold !important;
+}
+
+/* Calendar Month Title */
+.DayPicker_caption,
+div.DayPicker_caption {
+    color: var(--text-color) !important;
+    font-weight: 600 !important;
+}
+
+/* Input fields styling - General */
+input[type="text"],
+input[type="email"],
+input[type="password"],
+input[type="number"],
+input[type="date"],
+textarea {
+    background-color: var(--table-bg) !important;
+    border: 1px solid var(--table-border) !important;
+    color: var(--table-text) !important;
+    border-radius: 5px !important;
+    padding: 8px 12px !important;
+}
+
+input[type="text"]:focus,
+input[type="email"]:focus,
+input[type="password"]:focus,
+input[type="number"]:focus,
+input[type="date"]:focus,
+textarea:focus {
+    border-color: #667eea !important;
+    outline: none !important;
+    box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2) !important;
 }
 
 /* ==========================================================================

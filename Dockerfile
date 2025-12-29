@@ -38,23 +38,23 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgomp1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgthread-2.0-0 \
     libgtk-3-0 \
     libgdk-pixbuf2.0-0 \
     libcairo-gobject2 \
     libpango-1.0-0 \
     libatk1.0-0 \
-    libcairo-gobject2 \
-    libgtk-3-0 \
-    libgdk-pixbuf2.0-0 \
+    # Tesseract OCR (low-memory alternative to EasyOCR)
+    tesseract-ocr \
+    tesseract-ocr-eng \
     # Additional dependencies for PyTorch/EasyOCR
     libjpeg-dev \
     libpng-dev \
+    # Media processing libraries for imageio[pyav]
+    ffmpeg \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswscale-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Security: Install external scanners as root, then switch to non-root user
@@ -97,6 +97,13 @@ COPY --chown=secretsnipe:secretsnipe requirements-prod.txt .
 
 # Install Python dependencies as non-root user
 RUN pip install --no-cache-dir --user -r requirements-prod.txt
+
+# Install additional imageio backends to handle more file formats
+RUN pip install --no-cache-dir --user imageio[pyav] imageio[ffmpeg] || true
+
+# Pre-download EasyOCR models to avoid runtime downloads
+RUN mkdir -p /home/secretsnipe/.EasyOCR/model && \
+    python -c "import easyocr; easyocr.Reader(['en'], model_storage_directory='/home/secretsnipe/.EasyOCR/model')" || true
 
 # Copy application code
 COPY --chown=secretsnipe:secretsnipe . .

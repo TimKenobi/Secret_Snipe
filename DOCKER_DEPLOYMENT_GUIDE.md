@@ -24,7 +24,7 @@ For complete functionality including external integrations:
 
 ```bash
 # Start all services including webhooks and monitoring
-docker-compose --profile monitoring up
+docker compose --profile monitoring up
 ```
 
 This adds:

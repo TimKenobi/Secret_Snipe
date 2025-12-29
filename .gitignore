@@ -62,3 +62,6 @@ logs/
 .env
 /.github
 security_audit_report.txt
+
+# Jira credentials (contains API tokens)
+jira_config/

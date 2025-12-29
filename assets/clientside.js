@@ -60,3 +60,218 @@ window.dash_clientside = Object.assign({}, window.dash_clientside, {
         }
     }
 });
+// Dark mode dropdown styling - runs on page load
+document.addEventListener('DOMContentLoaded', function() {
+    // Create a style element for dropdown dark mode
+    const style = document.createElement('style');
+    style.textContent = `
+        /* Dash Dropdown Dark Mode - High Specificity Overrides */
+        .Select-control,
+        .dash-dropdown .Select-control,
+        div[class*="Select"] .Select-control {
+            background-color: #2d2d2d !important;
+            border-color: #555 !important;
+        }
+        
+        .Select-value-label,
+        .Select-placeholder,
+        .dash-dropdown .Select-value-label,
+        .dash-dropdown .Select-placeholder {
+            color: #e0e0e0 !important;
+        }
+        
+        .Select-menu-outer,
+        .Select-menu,
+        .dash-dropdown .Select-menu-outer,
+        .dash-dropdown .Select-menu {
+            background-color: #2d2d2d !important;
+            border-color: #555 !important;
+        }
+        
+        .Select-option,
+        .VirtualizedSelectOption,
+        .dash-dropdown .Select-option {
+            background-color: #2d2d2d !important;
+            color: #e0e0e0 !important;
+        }
+        
+        .Select-option:hover,
+        .Select-option.is-focused,
+        .VirtualizedSelectFocusedOption {
+            background-color: #444 !important;
+            color: #ffffff !important;
+        }
+        
+        .Select-option.is-selected {
+            background-color: #667eea !important;
+            color: #ffffff !important;
+        }
+        
+        .Select-arrow {
+            border-color: #e0e0e0 transparent transparent !important;
+        }
+        
+        .Select-input input {
+            color: #e0e0e0 !important;
+        }
+        
+        /* Also target modern react-select classes */
+        [class*="-menu"],
+        [class*="-menuList"],
+        [class*="-MenuList"] {
+            background-color: #2d2d2d !important;
+        }
+        
+        [class*="-option"] {
+            background-color: #2d2d2d !important;
+            color: #e0e0e0 !important;
+        }
+        
+        [class*="-option"]:hover {
+            background-color: #444 !important;
+            color: #fff !important;
+        }
+        
+        [class*="-control"] {
+            background-color: #2d2d2d !important;
+            border-color: #555 !important;
+        }
+        
+        [class*="-singleValue"],
+        [class*="-placeholder"] {
+            color: #e0e0e0 !important;
+        }
+        
+        /* Column resize handle styles */
+        .column-resize-handle {
+            position: absolute;
+            right: 0;
+            top: 0;
+            bottom: 0;
+            width: 8px;
+            cursor: col-resize;
+            background: transparent;
+            z-index: 100;
+        }
+        
+        .column-resize-handle:hover,
+        .column-resize-handle.resizing {
+            background: #667eea;
+        }
+        
+        .dash-spreadsheet th {
+            position: relative !important;
+        }
+    `;
+    document.head.appendChild(style);
+    
+    // Initialize column resizing for DataTable
+    initColumnResizing();
+    
+    // Also observe for dynamically added dropdown menus
+    const observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+            mutation.addedNodes.forEach(function(node) {
+                if (node.nodeType === 1) {
+                    // Check for dropdown menu elements
+                    if (node.classList && (
+                        node.classList.contains('Select-menu-outer') ||
+                        node.classList.contains('Select-menu') ||
+                        node.className.includes('-menu')
+                    )) {
+                        node.style.backgroundColor = '#2d2d2d';
+                        node.style.borderColor = '#555';
+                    }
+                    // Style any option elements
+                    const options = node.querySelectorAll('.Select-option, [class*="-option"]');
+                    options.forEach(function(opt) {
+                        opt.style.backgroundColor = '#2d2d2d';
+                        opt.style.color = '#e0e0e0';
+                    });
+                    
+                    // Re-initialize column resizing when table updates
+                    if (node.classList && node.classList.contains('dash-spreadsheet')) {
+                        setTimeout(initColumnResizing, 100);
+                    }
+                }
+            });
+        });
+    });
+    
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+});
+
+// Column resizing functionality
+function initColumnResizing() {
+    const tables = document.querySelectorAll('.dash-spreadsheet');
+    
+    tables.forEach(function(table) {
+        const headerCells = table.querySelectorAll('th');
+        
+        headerCells.forEach(function(th, index) {
+            // Skip if already has resize handle
+            if (th.querySelector('.column-resize-handle')) return;
+            
+            // Create resize handle
+            const handle = document.createElement('div');
+            handle.className = 'column-resize-handle';
+            handle.setAttribute('data-col-index', index);
+            th.style.position = 'relative';
+            th.appendChild(handle);
+            
+            let startX, startWidth, columnIndex;
+            
+            handle.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                startX = e.pageX;
+                columnIndex = parseInt(this.getAttribute('data-col-index'));
+                startWidth = th.offsetWidth;
+                
+                handle.classList.add('resizing');
+                
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+            
+            function onMouseMove(e) {
+                const diff = e.pageX - startX;
+                const newWidth = Math.max(50, startWidth + diff);
+                
+                // Update the header cell width
+                th.style.width = newWidth + 'px';
+                th.style.minWidth = newWidth + 'px';
+                th.style.maxWidth = newWidth + 'px';
+                
+                // Update all cells in this column
+                const allRows = table.querySelectorAll('tr');
+                allRows.forEach(function(row) {
+                    const cells = row.querySelectorAll('td, th');
+                    if (cells[columnIndex]) {
+                        cells[columnIndex].style.width = newWidth + 'px';
+                        cells[columnIndex].style.minWidth = newWidth + 'px';
+                        cells[columnIndex].style.maxWidth = newWidth + 'px';
+                    }
+                });
+            }
+            
+            function onMouseUp() {
+                handle.classList.remove('resizing');
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+            }
+        });
+    });
+}
+
+// Re-run on interval to catch dynamically loaded tables
+setInterval(function() {
+    const tables = document.querySelectorAll('.dash-spreadsheet th:not(:has(.column-resize-handle))');
+    if (tables.length > 0) {
+        initColumnResizing();
+    }
+}, 2000);

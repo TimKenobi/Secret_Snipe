@@ -60,8 +60,15 @@ class ScannerConfig:
     threads: int = 4
     timeout_seconds: int = 300
     max_file_size_mb: int = 100
+    memory_limit_mb: int = 512
+    trufflehog_concurrency: int = 2
+    trufflehog_max_depth: int = 5
+    gitleaks_max_file_size_mb: int = 10
+    gitleaks_max_depth: int = 10
+    max_findings_per_scan: int = 10000
     supported_extensions: list = None
     excluded_paths: list = None
+    excluded_extensions: list = None
     enable_ocr: bool = True
     ocr_languages: list = None
 
@@ -89,6 +96,8 @@ class ScannerConfig:
                 '.git', '__pycache__', 'node_modules', '.venv', 'venv',
                 'build', 'dist', 'target', '.next', '.nuxt', 'coverage'
             ]
+        if self.excluded_extensions is None:
+            self.excluded_extensions = []
         if self.ocr_languages is None:
             self.ocr_languages = ['en']
 
@@ -99,10 +108,70 @@ class ScannerConfig:
         
         if os.getenv('EXCLUDED_EXTENSIONS'):
             env_excluded = os.getenv('EXCLUDED_EXTENSIONS').split(',')
-            self.excluded_paths.extend([ext.strip() for ext in env_excluded])
+            self.excluded_extensions.extend([ext.strip() for ext in env_excluded])
             
         if os.getenv('OCR_LANGUAGES'):
             self.ocr_languages = os.getenv('OCR_LANGUAGES').split(',')
+
+        # Load scanner timeout from environment
+        if os.getenv('SCANNER_TIMEOUT_SECONDS'):
+            try:
+                timeout_val = int(os.getenv('SCANNER_TIMEOUT_SECONDS'))
+                self.timeout_seconds = timeout_val
+            except ValueError:
+                logger.warning(f"Invalid SCANNER_TIMEOUT_SECONDS value: {os.getenv('SCANNER_TIMEOUT_SECONDS')}")
+
+        # Load worker/thread count from environment
+        if os.getenv('WORKER_PROCESSES'):
+            try:
+                worker_val = int(os.getenv('WORKER_PROCESSES'))
+                self.threads = worker_val
+            except ValueError:
+                logger.warning(f"Invalid WORKER_PROCESSES value: {os.getenv('WORKER_PROCESSES')}")
+
+        if os.getenv('ENABLE_OCR'):
+            self.enable_ocr = os.getenv('ENABLE_OCR').lower() in ('true', '1', 'yes')
+
+        if os.getenv('EXCLUDED_DIRECTORIES'):
+            env_excluded_dirs = os.getenv('EXCLUDED_DIRECTORIES').split(',')
+            self.excluded_paths.extend([dir.strip() for dir in env_excluded_dirs])
+        
+        # Load memory optimization settings from environment
+        if os.getenv('SCANNER_MEMORY_LIMIT_MB'):
+            try:
+                self.memory_limit_mb = int(os.getenv('SCANNER_MEMORY_LIMIT_MB'))
+            except ValueError:
+                logger.warning(f"Invalid SCANNER_MEMORY_LIMIT_MB value: {os.getenv('SCANNER_MEMORY_LIMIT_MB')}")
+        
+        if os.getenv('TRUFFLEHOG_CONCURRENCY'):
+            try:
+                self.trufflehog_concurrency = int(os.getenv('TRUFFLEHOG_CONCURRENCY'))
+            except ValueError:
+                logger.warning(f"Invalid TRUFFLEHOG_CONCURRENCY value: {os.getenv('TRUFFLEHOG_CONCURRENCY')}")
+        
+        if os.getenv('TRUFFLEHOG_MAX_DEPTH'):
+            try:
+                self.trufflehog_max_depth = int(os.getenv('TRUFFLEHOG_MAX_DEPTH'))
+            except ValueError:
+                logger.warning(f"Invalid TRUFFLEHOG_MAX_DEPTH value: {os.getenv('TRUFFLEHOG_MAX_DEPTH')}")
+        
+        if os.getenv('GITLEAKS_MAX_FILE_SIZE_MB'):
+            try:
+                self.gitleaks_max_file_size_mb = int(os.getenv('GITLEAKS_MAX_FILE_SIZE_MB'))
+            except ValueError:
+                logger.warning(f"Invalid GITLEAKS_MAX_FILE_SIZE_MB value: {os.getenv('GITLEAKS_MAX_FILE_SIZE_MB')}")
+        
+        if os.getenv('GITLEAKS_MAX_DEPTH'):
+            try:
+                self.gitleaks_max_depth = int(os.getenv('GITLEAKS_MAX_DEPTH'))
+            except ValueError:
+                logger.warning(f"Invalid GITLEAKS_MAX_DEPTH value: {os.getenv('GITLEAKS_MAX_DEPTH')}")
+        
+        if os.getenv('MAX_FINDINGS_PER_SCAN'):
+            try:
+                self.max_findings_per_scan = int(os.getenv('MAX_FINDINGS_PER_SCAN'))
+            except ValueError:
+                logger.warning(f"Invalid MAX_FINDINGS_PER_SCAN value: {os.getenv('MAX_FINDINGS_PER_SCAN')}")
 
 @dataclass
 class WebhookConfig:
@@ -148,6 +217,47 @@ class SecurityConfig:
     encryption_enabled: bool = False
     encryption_key: Optional[str] = None
     audit_log_enabled: bool = True
+
+@dataclass
+class JiraConfig:
+    """Jira integration configuration"""
+    enabled: bool = False
+    server_url: str = ""  # e.g., https://your-company.atlassian.net
+    username: str = ""  # email for Jira Cloud
+    api_token: str = ""  # API token (not password)
+    project_key: str = ""  # e.g., SEC, SECOPS
+    issue_type: str = "Task"  # Task, Bug, Story, etc.
+    default_priority: str = "Medium"
+    priority_mapping: Dict[str, str] = None  # Map severity to Jira priority
+    custom_fields: Dict[str, str] = None  # Additional fields to set
+    labels: list = None  # Default labels for tickets
+
+    def __post_init__(self):
+        if self.priority_mapping is None:
+            # Map SecretSnipe severity to Jira priority names
+            self.priority_mapping = {
+                'Critical': 'Highest',
+                'High': 'High',
+                'Medium': 'Medium',
+                'Low': 'Low'
+            }
+        if self.custom_fields is None:
+            self.custom_fields = {}
+        if self.labels is None:
+            self.labels = ['secretsnipe', 'security', 'secret-detection']
+        
+        # Load from environment variables
+        if os.getenv('JIRA_SERVER_URL'):
+            self.server_url = os.getenv('JIRA_SERVER_URL')
+            self.enabled = True
+        if os.getenv('JIRA_USERNAME'):
+            self.username = os.getenv('JIRA_USERNAME')
+        if os.getenv('JIRA_API_TOKEN'):
+            self.api_token = os.getenv('JIRA_API_TOKEN')
+        if os.getenv('JIRA_PROJECT_KEY'):
+            self.project_key = os.getenv('JIRA_PROJECT_KEY')
+        if os.getenv('JIRA_ISSUE_TYPE'):
+            self.issue_type = os.getenv('JIRA_ISSUE_TYPE')
 
 @dataclass
 class DashboardConfig:
@@ -200,6 +310,7 @@ class AppConfig:
     cache: CacheConfig = None
     security: SecurityConfig = None
     dashboard: DashboardConfig = None
+    jira: JiraConfig = None
 
     def __post_init__(self):
         if self.database is None:
@@ -218,6 +329,8 @@ class AppConfig:
             self.security = SecurityConfig()
         if self.dashboard is None:
             self.dashboard = DashboardConfig()
+        if self.jira is None:
+            self.jira = JiraConfig()
 
 class ConfigManager:
     """Configuration manager with environment variable and file support"""

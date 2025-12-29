@@ -52,6 +52,7 @@ from database_manager import (
 )
 from redis_manager import cache_manager, scan_cache, init_redis
 import redis_manager
+from jira_manager import jira_manager, update_jira_config
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,10 @@ app = dash.Dash(
         {"http-equiv": "X-Frame-Options", "content": "DENY"},
         {"http-equiv": "X-XSS-Protection", "content": "1; mode=block"},
         {"http-equiv": "Strict-Transport-Security", "content": "max-age=31536000; includeSubDomains"},
-        {"name": "referrer", "content": "strict-origin-when-cross-origin"}
+        {"name": "referrer", "content": "strict-origin-when-cross-origin"},
+        {"http-equiv": "Cache-Control", "content": "no-cache, no-store, must-revalidate"},
+        {"http-equiv": "Pragma", "content": "no-cache"},
+        {"http-equiv": "Expires", "content": "0"}
     ]
 )
 
@@ -248,11 +252,11 @@ def rate_limit_check(client_ip: str) -> bool:
     client_key = f"rate_limit:{client_ip}"
 
     # Get current request count
-    current_count = cache_manager.get('security', client_key) or 0 if cache_manager else 0
+    current_count = redis_manager.cache_manager.get('security', client_key) or 0 if redis_manager.cache_manager else 0
 
     # Reset counter if window expired
     if current_count == 0:
-        cache_manager.set('security', client_key, 1, ttl_seconds=SECURITY_CONFIG['rate_limit_window']) if cache_manager else None
+        redis_manager.cache_manager.set('security', client_key, 1, ttl_seconds=SECURITY_CONFIG['rate_limit_window']) if redis_manager.cache_manager else None
         return True
 
     if current_count >= SECURITY_CONFIG['rate_limit_requests']:
@@ -260,7 +264,7 @@ def rate_limit_check(client_ip: str) -> bool:
         return False
 
     # Increment counter
-    cache_manager.set('security', client_key, current_count + 1, ttl_seconds=SECURITY_CONFIG['rate_limit_window']) if cache_manager else None
+    redis_manager.cache_manager.set('security', client_key, current_count + 1, ttl_seconds=SECURITY_CONFIG['rate_limit_window']) if redis_manager.cache_manager else None
     return True
 
 def sanitize_input(input_str: str, max_length: int = None) -> str:
@@ -360,18 +364,18 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
 
     try:
         # Secure parameterized query to prevent SQL injection
+        # Limit to 5000 most recent for performance - stats come from separate count queries
         query = """
             SELECT
                 f.id, f.file_path, f.secret_type, f.secret_value, f.context, f.severity, f.tool_source,
-                f.first_seen, f.last_seen, f.confidence_score,
-                p.name as project_name, ss.scan_type,
-                CASE WHEN f.resolution_status = 'open' THEN 1 ELSE 0 END as is_open
+                f.first_seen, f.last_seen, f.confidence_score, f.resolution_status,
+                f.fp_reason, f.fp_marked_by, f.fp_marked_at,
+                p.name as project_name, ss.scan_type
             FROM findings f
             JOIN projects p ON f.project_id = p.id
             JOIN scan_sessions ss ON f.scan_session_id = ss.id
-            WHERE f.resolution_status = 'open'
             ORDER BY f.first_seen DESC
-            LIMIT 10000
+            LIMIT 5000
         """
 
         findings = db_manager.execute_query(query)
@@ -409,7 +413,8 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
      Output("findings-table", "data"),
      Output("summary-stats", "children"),
      Output("last-update", "children"),
-     Output("project-filter", "options")],
+     Output("project-filter", "options"),
+     Output("fp-count-badge", "children")],
     [Input("severity-filter", "value"),
      Input("tool-filter", "value"),
      Input("project-filter", "value"),
@@ -465,6 +470,14 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
     # Get data
     df = get_findings_data(force_refresh=(refresh_clicks is not None and refresh_clicks > 0))
 
+    # Get FP count for badge
+    fp_count = 0
+    try:
+        fp_count = findings_manager.get_false_positive_count()
+    except Exception:
+        pass
+    fp_badge = f"🚫 {fp_count} False Positives"
+
     if df.empty:
         empty_fig = go.Figure()
         empty_fig.update_layout(
@@ -476,10 +489,14 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
             paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
             plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
         )
-        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", []
+        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge
 
     # Apply filters with validation
     filtered_df = df.copy()
+
+    # Always exclude false positives from main table (use FP Viewer to see them)
+    if 'resolution_status' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['resolution_status'] != 'false_positive']
 
     if severity_filter != "all":
         filtered_df = filtered_df[filtered_df['severity'] == severity_filter]
@@ -573,26 +590,86 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Prepare table data with security (limit to prevent data exfiltration)
-    table_data = filtered_df.head(100).to_dict('records')
+    # Prepare table data - limited to 5000 for performance
+    table_data = filtered_df.to_dict('records')
 
-    # Sanitize table data
+    # Sanitize table data (truncate long strings for display)
     for row in table_data:
         for key, value in row.items():
             if isinstance(value, str):
-                row[key] = sanitize_input(value, 500)  # Limit field length
+                row[key] = sanitize_input(value, 500)  # Limit field length for display
 
-    # Create summary stats
-    total_findings = len(filtered_df)
-    critical_count = len(filtered_df[filtered_df['severity'] == 'Critical'])
-    high_count = len(filtered_df[filtered_df['severity'] == 'High'])
-    avg_confidence = filtered_df['confidence_score'].mean()
+    # Get accurate counts from database (fast COUNT queries)
+    try:
+        # Total count
+        total_query = "SELECT COUNT(*) as count FROM findings WHERE resolution_status != 'false_positive'"
+        total_result = db_manager.execute_query(total_query)
+        total_in_db = total_result[0]['count'] if total_result else 0
+        
+        # Severity counts
+        severity_query = """
+            SELECT severity, COUNT(*) as count 
+            FROM findings 
+            WHERE resolution_status != 'false_positive'
+            GROUP BY severity
+        """
+        severity_result = db_manager.execute_query(severity_query)
+        severity_counts = {r['severity']: r['count'] for r in severity_result} if severity_result else {}
+        
+        # Tool counts
+        tool_query = """
+            SELECT tool_source, COUNT(*) as count 
+            FROM findings 
+            WHERE resolution_status != 'false_positive'
+            GROUP BY tool_source
+        """
+        tool_result = db_manager.execute_query(tool_query)
+        tool_counts = {r['tool_source']: r['count'] for r in tool_result} if tool_result else {}
+        
+        critical_count = severity_counts.get('Critical', 0)
+        high_count = severity_counts.get('High', 0)
+        medium_count = severity_counts.get('Medium', 0)
+        low_count = severity_counts.get('Low', 0)
+        
+        custom_count = tool_counts.get('custom', 0)
+        gitleaks_count = tool_counts.get('gitleaks', 0)
+        trufflehog_count = tool_counts.get('trufflehog', 0)
+        
+    except Exception as e:
+        logger.warning(f"Error getting DB counts: {e}")
+        # Fallback to dataframe counts
+        total_in_db = len(df)
+        critical_count = len(filtered_df[filtered_df['severity'] == 'Critical'])
+        high_count = len(filtered_df[filtered_df['severity'] == 'High'])
+        medium_count = len(filtered_df[filtered_df['severity'] == 'Medium'])
+        low_count = len(filtered_df[filtered_df['severity'] == 'Low'])
+        custom_count = len(filtered_df[filtered_df['tool_source'] == 'custom'])
+        gitleaks_count = len(filtered_df[filtered_df['tool_source'] == 'gitleaks'])
+        trufflehog_count = len(filtered_df[filtered_df['tool_source'] == 'trufflehog'])
+    
+    total_filtered = len(filtered_df)  # What's shown in table (up to 5000)
+    open_count = len(filtered_df[filtered_df['resolution_status'] == 'open'])
 
     summary_stats = [
-        html.Div([html.Strong("Total Findings:"), f" {total_findings}"], className="stat-item"),
-        html.Div([html.Strong("Critical:"), f" {critical_count}"], className="stat-item"),
-        html.Div([html.Strong("High:"), f" {high_count}"], className="stat-item"),
-        html.Div([html.Strong("Avg Confidence:"), f" {avg_confidence:.2%}"], className="stat-item")
+        html.Div([
+            html.H4("📊 Overview", style={'marginBottom': '10px', 'color': '#60a5fa'}),
+            html.Div([html.Strong("Total in Database:"), f" {total_in_db:,}"], className="stat-item"),
+            html.Div([html.Strong("Showing in Table:"), f" {total_filtered:,} (max 5,000)"], className="stat-item"),
+            html.Div([html.Strong("Open Issues:"), f" {open_count:,}"], className="stat-item"),
+        ], style={'marginRight': '30px'}),
+        html.Div([
+            html.H4("🎯 By Severity", style={'marginBottom': '10px', 'color': '#f59e0b'}),
+            html.Div([html.Strong("Critical:"), html.Span(f" {critical_count:,}", style={'color': '#ff0000'})], className="stat-item"),
+            html.Div([html.Strong("High:"), html.Span(f" {high_count:,}", style={'color': '#d9534f'})], className="stat-item"),
+            html.Div([html.Strong("Medium:"), html.Span(f" {medium_count:,}", style={'color': '#f0ad4e'})], className="stat-item"),
+            html.Div([html.Strong("Low:"), html.Span(f" {low_count:,}", style={'color': '#5cb85c'})], className="stat-item"),
+        ], style={'marginRight': '30px'}),
+        html.Div([
+            html.H4("🔧 By Tool", style={'marginBottom': '10px', 'color': '#22c55e'}),
+            html.Div([html.Strong("Custom Scanner:"), f" {custom_count:,}"], className="stat-item"),
+            html.Div([html.Strong("Gitleaks:"), f" {gitleaks_count:,}"], className="stat-item"),
+            html.Div([html.Strong("TruffleHog:"), f" {trufflehog_count:,}"], className="stat-item"),
+        ]),
     ]
 
     # Last update time
@@ -608,7 +685,7 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
         ])
 
     return (severity_chart, tool_chart, timeline_chart, file_types_chart,
-            table_data, summary_stats, last_update, project_options)
+            table_data, summary_stats, last_update, project_options, fp_badge)
 
 # New Callbacks for Enhanced Features
 
@@ -634,6 +711,120 @@ def toggle_scan_modal(custom_scan_clicks, cancel_clicks, start_clicks, current_c
         return "modal-container"
 
     return current_class
+
+
+# Finding Detail Modal Callbacks
+@app.callback(
+    [Output("finding-detail-modal", "className"),
+     Output("finding-detail-content", "children")],
+    [Input("findings-table", "active_cell"),
+     Input("close-detail-modal-btn-bottom", "n_clicks")],
+    [State("findings-table", "data"),
+     State("finding-detail-modal", "className")]
+)
+@secure_callback
+def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_class):
+    """Show detailed view of a finding when clicking a table row"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return "modal-container", []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Close button clicked
+    if trigger_id == "close-detail-modal-btn-bottom":
+        return "modal-container", []
+    
+    # Table cell clicked
+    if trigger_id == "findings-table" and active_cell and table_data:
+        row_idx = active_cell.get('row')
+        if row_idx is not None and row_idx < len(table_data):
+            row = table_data[row_idx]
+            
+            # Build detailed view
+            detail_content = html.Div([
+                # Severity badge
+                html.Div([
+                    html.Span(
+                        row.get('severity', 'Unknown'),
+                        className=f"severity-badge severity-{row.get('severity', 'unknown').lower()}"
+                    ),
+                    html.Span(f" • {row.get('tool_source', 'Unknown Tool')}", className="tool-badge")
+                ], className="detail-badges"),
+                
+                # Main fields
+                html.Div([
+                    html.Label("📁 File Path:"),
+                    html.Pre(row.get('file_path', 'N/A'), className="detail-value file-path-value")
+                ], className="detail-field"),
+                
+                html.Div([
+                    html.Label("🏷️ Secret Type:"),
+                    html.Div(row.get('secret_type', 'N/A'), className="detail-value")
+                ], className="detail-field"),
+                
+                html.Div([
+                    html.Label("🔑 Secret Value:"),
+                    html.Pre(row.get('secret_value', 'N/A'), className="detail-value secret-value-full")
+                ], className="detail-field"),
+                
+                html.Div([
+                    html.Label("📝 Full Context:"),
+                    html.Pre(row.get('context', 'N/A'), className="detail-value context-value-full")
+                ], className="detail-field"),
+                
+                # Metadata row
+                html.Div([
+                    html.Div([
+                        html.Label("📅 First Seen:"),
+                        html.Div(row.get('first_seen', 'N/A'), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("📊 Confidence:"),
+                        html.Div(str(row.get('confidence_score', 'N/A')), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("📂 Project:"),
+                        html.Div(row.get('project_name', 'N/A'), className="detail-value")
+                    ], className="detail-field-small")
+                ], className="detail-metadata-row"),
+                
+                # False Positive info (only show if marked as FP)
+                html.Div([
+                    html.Div([
+                        html.Label("🚫 False Positive Status:"),
+                        html.Div([
+                            html.Span("⚠️ Marked as False Positive", style={'color': '#f59e0b', 'fontWeight': 'bold'}),
+                        ], className="detail-value")
+                    ], className="detail-field"),
+                    html.Div([
+                        html.Label("📝 FP Reason:"),
+                        html.Pre(row.get('fp_reason', 'No reason provided'), className="detail-value", 
+                                style={'whiteSpace': 'pre-wrap', 'backgroundColor': '#2d2d2d', 'padding': '10px', 'borderRadius': '4px'})
+                    ], className="detail-field"),
+                    html.Div([
+                        html.Div([
+                            html.Label("👤 Marked By:"),
+                            html.Div(row.get('fp_marked_by', 'N/A'), className="detail-value")
+                        ], className="detail-field-small"),
+                        html.Div([
+                            html.Label("📅 Marked At:"),
+                            html.Div(str(row.get('fp_marked_at', 'N/A')), className="detail-value")
+                        ], className="detail-field-small"),
+                    ], className="detail-metadata-row")
+                ], className="fp-info-section", style={
+                    'marginTop': '15px', 
+                    'padding': '15px', 
+                    'backgroundColor': '#3d3522', 
+                    'borderRadius': '8px',
+                    'border': '1px solid #f59e0b'
+                }) if row.get('resolution_status') == 'false_positive' else html.Div()
+            ], className="finding-detail-container")
+            
+            return "modal-container show", detail_content
+    
+    return current_class or "modal-container", []
+
 
 @app.callback(
     Output("report-download", "data"),
@@ -801,6 +992,512 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
 
     return no_update
 
+
+# False Positive Management Callbacks
+@app.callback(
+    [Output("fp-reason-modal", "style"),
+     Output("selected-rows-for-fp", "data")],
+    [Input("btn-mark-fp", "n_clicks"),
+     Input("btn-cancel-fp", "n_clicks"),
+     Input("btn-confirm-fp", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def toggle_fp_modal(mark_clicks, cancel_clicks, confirm_clicks, selected_rows, table_data):
+    """Toggle the false positive reason modal"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return {'display': 'none'}, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-mark-fp":
+        if selected_rows and table_data:
+            # Get the IDs of selected rows
+            selected_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
+            if selected_ids:
+                return {
+                    'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                    'zIndex': '1000', 'paddingTop': '100px'
+                }, selected_ids
+        return {'display': 'none'}, []
+    
+    # Cancel or confirm closes the modal
+    return {'display': 'none'}, []
+
+
+@app.callback(
+    [Output("fp-action-result", "children"),
+     Output("fp-action-result", "style"),
+     Output("findings-table", "selected_rows")],
+    [Input("btn-confirm-fp", "n_clicks"),
+     Input("btn-restore-fp", "n_clicks")],
+    [State("selected-rows-for-fp", "data"),
+     State("fp-reason-input", "value"),
+     State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def handle_fp_actions(confirm_clicks, restore_clicks, selected_ids_for_fp, fp_reason, 
+                     selected_rows, table_data):
+    """Handle false positive marking and restoration"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return "", {'display': 'none'}, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    try:
+        if trigger_id == "btn-confirm-fp" and selected_ids_for_fp:
+            # Mark as false positive
+            result = findings_manager.mark_as_false_positive(
+                finding_ids=selected_ids_for_fp,
+                reason=fp_reason or "Marked as false positive by user",
+                marked_by="dashboard_user"
+            )
+            
+            # Force cache refresh
+            data_cache['findings_df'] = None
+            data_cache['last_update'] = None
+            
+            if result['success'] > 0:
+                return (
+                    f"✅ Successfully marked {result['success']} finding(s) as false positive",
+                    {
+                        'display': 'block', 'padding': '10px 15px',
+                        'backgroundColor': '#16a34a', 'color': 'white',
+                        'borderRadius': '6px', 'marginBottom': '10px'
+                    },
+                    []  # Clear selection
+                )
+            else:
+                return (
+                    "❌ Failed to mark findings as false positive",
+                    {
+                        'display': 'block', 'padding': '10px 15px',
+                        'backgroundColor': '#dc2626', 'color': 'white',
+                        'borderRadius': '6px', 'marginBottom': '10px'
+                    },
+                    selected_rows
+                )
+        
+        elif trigger_id == "btn-restore-fp" and selected_rows and table_data:
+            # Get selected finding IDs (only those that are false positives)
+            selected_ids = []
+            for i in selected_rows:
+                if i < len(table_data):
+                    row = table_data[i]
+                    if row.get('resolution_status') == 'false_positive':
+                        selected_ids.append(row.get('id'))
+            
+            if not selected_ids:
+                return (
+                    "⚠️ No false positive findings selected to restore",
+                    {
+                        'display': 'block', 'padding': '10px 15px',
+                        'backgroundColor': '#d97706', 'color': 'white',
+                        'borderRadius': '6px', 'marginBottom': '10px'
+                    },
+                    selected_rows
+                )
+            
+            result = findings_manager.restore_from_false_positive(selected_ids)
+            
+            # Force cache refresh
+            data_cache['findings_df'] = None
+            data_cache['last_update'] = None
+            
+            if result['success'] > 0:
+                return (
+                    f"✅ Successfully restored {result['success']} finding(s) from false positive",
+                    {
+                        'display': 'block', 'padding': '10px 15px',
+                        'backgroundColor': '#16a34a', 'color': 'white',
+                        'borderRadius': '6px', 'marginBottom': '10px'
+                    },
+                    []  # Clear selection
+                )
+    
+    except Exception as e:
+        logger.error(f"Error in FP action: {e}")
+        return (
+            f"❌ Error: {str(e)}",
+            {
+                'display': 'block', 'padding': '10px 15px',
+                'backgroundColor': '#dc2626', 'color': 'white',
+                'borderRadius': '6px', 'marginBottom': '10px'
+            },
+            selected_rows
+        )
+    
+    return "", {'display': 'none'}, selected_rows
+
+
+# False Positives Viewer Modal Callbacks
+@app.callback(
+    [Output("fp-viewer-modal", "style"),
+     Output("fp-viewer-table-container", "children")],
+    [Input("btn-view-fps", "n_clicks"),
+     Input("close-fp-viewer-btn", "n_clicks")],
+    [State("fp-viewer-modal", "style")],
+    prevent_initial_call=True
+)
+@secure_callback
+def toggle_fp_viewer_modal(view_clicks, close_clicks, current_style):
+    """Toggle the False Positives viewer modal and load data"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Close button clicked
+    if trigger_id == "close-fp-viewer-btn":
+        return {**current_style, 'display': 'none'}, []
+    
+    # View button clicked - open modal and load data
+    if trigger_id == "btn-view-fps":
+        try:
+            # Query false positives with reasons
+            query = """
+                SELECT 
+                    f.id, f.file_path, f.secret_type, f.secret_value, 
+                    f.severity, f.tool_source, f.fp_reason, 
+                    f.fp_marked_by, f.fp_marked_at
+                FROM findings f
+                WHERE f.resolution_status = 'false_positive'
+                ORDER BY f.fp_marked_at DESC
+                LIMIT 500
+            """
+            fps = db_manager.execute_query(query)
+            
+            if not fps:
+                return (
+                    {**current_style, 'display': 'block'},
+                    html.Div([
+                        html.P("✅ No false positives found!", style={'color': '#22c55e', 'fontSize': '18px', 'textAlign': 'center', 'padding': '40px'})
+                    ])
+                )
+            
+            # Build a table to display FPs
+            fp_table = dash_table.DataTable(
+                id='fp-viewer-table',
+                columns=[
+                    {"name": "ID", "id": "id"},
+                    {"name": "File Path", "id": "file_path"},
+                    {"name": "Secret Type", "id": "secret_type"},
+                    {"name": "Severity", "id": "severity"},
+                    {"name": "Tool", "id": "tool_source"},
+                    {"name": "Reason Marked as FP", "id": "fp_reason"},
+                    {"name": "Marked By", "id": "fp_marked_by"},
+                    {"name": "Marked At", "id": "fp_marked_at"},
+                ],
+                data=[dict(row) for row in fps],
+                row_selectable="multi",
+                selected_rows=[],
+                page_size=20,
+                page_action="native",
+                sort_action="native",
+                filter_action="native",
+                style_table={'overflowX': 'auto'},
+                style_header={
+                    'backgroundColor': '#1e293b',
+                    'color': '#e0e0e0',
+                    'fontWeight': 'bold',
+                    'border': '1px solid #444'
+                },
+                style_cell={
+                    'backgroundColor': '#2d3748',
+                    'color': '#e0e0e0',
+                    'border': '1px solid #444',
+                    'textAlign': 'left',
+                    'padding': '10px',
+                    'maxWidth': '200px',
+                    'overflow': 'hidden',
+                    'textOverflow': 'ellipsis'
+                },
+                style_cell_conditional=[
+                    {'if': {'column_id': 'fp_reason'}, 'maxWidth': '300px', 'whiteSpace': 'normal'},
+                    {'if': {'column_id': 'file_path'}, 'maxWidth': '250px'},
+                    {'if': {'column_id': 'id'}, 'width': '60px'},
+                ],
+                style_data_conditional=[
+                    {
+                        'if': {'filter_query': '{severity} = "Critical"'},
+                        'backgroundColor': '#4a1f1f'
+                    },
+                    {
+                        'if': {'filter_query': '{severity} = "High"'},
+                        'backgroundColor': '#4a2f1f'
+                    },
+                ],
+            )
+            
+            return (
+                {**current_style, 'display': 'block'},
+                html.Div([
+                    html.P(f"Found {len(fps)} false positive(s)", style={'color': '#9ca3af', 'marginBottom': '10px'}),
+                    fp_table
+                ])
+            )
+            
+        except Exception as e:
+            logger.error(f"Error loading false positives: {e}")
+            return (
+                {**current_style, 'display': 'block'},
+                html.Div([
+                    html.P(f"❌ Error loading false positives: {str(e)}", style={'color': '#ef4444'})
+                ])
+            )
+    
+    raise PreventUpdate
+
+
+@app.callback(
+    Output("fp-viewer-action-result", "children"),
+    [Input("btn-restore-from-viewer", "n_clicks")],
+    [State("fp-viewer-table", "selected_rows"),
+     State("fp-viewer-table", "data")],
+    prevent_initial_call=True
+)
+@secure_callback
+def restore_from_fp_viewer(n_clicks, selected_rows, table_data):
+    """Restore selected items from the FP viewer"""
+    if not n_clicks or not selected_rows or not table_data:
+        raise PreventUpdate
+    
+    try:
+        selected_ids = [table_data[i]['id'] for i in selected_rows if i < len(table_data)]
+        
+        if not selected_ids:
+            return "⚠️ No items selected"
+        
+        result = findings_manager.restore_from_false_positive(selected_ids)
+        
+        # Force cache refresh
+        data_cache['findings_df'] = None
+        data_cache['last_update'] = None
+        
+        if result['success'] > 0:
+            return f"✅ Restored {result['success']} finding(s). Close and reopen to refresh."
+        else:
+            return "⚠️ No items were restored"
+            
+    except Exception as e:
+        logger.error(f"Error restoring from FP viewer: {e}")
+        return f"❌ Error: {str(e)}"
+
+
+# Jira Integration Callbacks
+@app.callback(
+    Output("jira-settings-modal", "style"),
+    [Input("btn-jira-settings", "n_clicks"),
+     Input("btn-close-jira-settings", "n_clicks"),
+     Input("btn-save-jira", "n_clicks")]
+)
+def toggle_jira_settings_modal(open_clicks, close_clicks, save_clicks):
+    """Toggle the Jira settings modal"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return {'display': 'none'}
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-jira-settings":
+        return {
+            'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+            'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+            'zIndex': '1000', 'paddingTop': '50px'
+        }
+    
+    return {'display': 'none'}
+
+
+@app.callback(
+    Output("jira-connection-status", "children"),
+    [Input("btn-test-jira", "n_clicks")],
+    [State("jira-server-url", "value"),
+     State("jira-username", "value"),
+     State("jira-api-token", "value"),
+     State("jira-project-key", "value")]
+)
+def test_jira_connection(n_clicks, server_url, username, api_token, project_key):
+    """Test Jira connection with provided settings"""
+    if not n_clicks:
+        # Show current config status on initial load
+        if jira_manager.is_configured:
+            return html.Span([
+                html.Span("✅ ", style={'color': '#22c55e'}),
+                f"Configured for {config.jira.project_key}"
+            ], style={'color': '#e0e0e0'})
+        return html.Span("⚠️ Not configured", style={'color': '#f59e0b'})
+    
+    # Temporarily update config to test
+    if server_url and username and api_token and project_key:
+        update_jira_config(
+            server_url=server_url,
+            username=username,
+            api_token=api_token,
+            project_key=project_key
+        )
+        
+        result = jira_manager.test_connection()
+        
+        if result.get('success'):
+            return html.Span([
+                html.Span("✅ ", style={'color': '#22c55e'}),
+                f"Connected as {result.get('user', 'Unknown')}"
+            ], style={'color': '#e0e0e0'})
+        else:
+            return html.Span([
+                html.Span("❌ ", style={'color': '#ef4444'}),
+                result.get('error', 'Connection failed')
+            ], style={'color': '#e0e0e0'})
+    
+    return html.Span("⚠️ Please fill in all fields", style={'color': '#f59e0b'})
+
+
+@app.callback(
+    Output("jira-save-status", "children"),
+    [Input("btn-save-jira", "n_clicks")],
+    [State("jira-server-url", "value"),
+     State("jira-username", "value"),
+     State("jira-api-token", "value"),
+     State("jira-project-key", "value"),
+     State("jira-issue-type", "value")],
+    prevent_initial_call=True
+)
+def save_jira_settings(n_clicks, server_url, username, api_token, project_key, issue_type):
+    """Save Jira configuration settings"""
+    if not n_clicks:
+        raise PreventUpdate
+    
+    if not all([server_url, username, api_token, project_key]):
+        return html.Span("⚠️ Please fill in all required fields", style={'color': '#f59e0b'})
+    
+    try:
+        update_jira_config(
+            server_url=server_url.strip(),
+            username=username.strip(),
+            api_token=api_token.strip(),
+            project_key=project_key.strip(),
+            issue_type=issue_type.strip() if issue_type else 'Task'
+        )
+        
+        logger.info(f"Jira settings saved for project: {project_key}")
+        return html.Span([
+            html.Span("✅ ", style={'color': '#22c55e'}),
+            "Settings saved successfully!"
+        ], style={'color': '#e0e0e0'})
+    
+    except Exception as e:
+        logger.error(f"Error saving Jira settings: {e}")
+        return html.Span([
+            html.Span("❌ ", style={'color': '#ef4444'}),
+            f"Error: {str(e)}"
+        ], style={'color': '#e0e0e0'})
+
+
+@app.callback(
+    [Output("jira-action-result", "children"),
+     Output("jira-action-result", "style")],
+    [Input("btn-create-jira", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def create_jira_tickets(n_clicks, selected_rows, table_data):
+    """Create Jira tickets for selected findings"""
+    if not n_clicks or not selected_rows or not table_data:
+        return "", {'display': 'none'}
+    
+    # Check if Jira is configured
+    if not jira_manager.is_configured:
+        return (
+            "⚠️ Jira is not configured. Click 'Jira Settings' to set up the connection.",
+            {
+                'display': 'block', 'padding': '10px 15px',
+                'backgroundColor': '#d97706', 'color': 'white',
+                'borderRadius': '6px', 'marginBottom': '10px'
+            }
+        )
+    
+    # Get selected findings (exclude false positives)
+    findings_to_create = []
+    for i in selected_rows:
+        if i < len(table_data):
+            row = table_data[i]
+            # Skip false positives
+            if row.get('resolution_status') != 'false_positive':
+                findings_to_create.append(row)
+    
+    if not findings_to_create:
+        return (
+            "⚠️ No valid findings selected (false positives are excluded)",
+            {
+                'display': 'block', 'padding': '10px 15px',
+                'backgroundColor': '#d97706', 'color': 'white',
+                'borderRadius': '6px', 'marginBottom': '10px'
+            }
+        )
+    
+    try:
+        # Create tickets
+        results = jira_manager.create_bulk_tickets(findings_to_create)
+        
+        success_count = results.get('success_count', 0)
+        failed_count = results.get('failed_count', 0)
+        tickets = results.get('created_tickets', [])
+        
+        if success_count > 0:
+            ticket_links = []
+            for t in tickets[:5]:  # Show first 5 tickets
+                ticket_links.append(
+                    html.A(
+                        t['key'], 
+                        href=t['url'], 
+                        target='_blank',
+                        style={'color': '#60a5fa', 'marginRight': '10px'}
+                    )
+                )
+            
+            if len(tickets) > 5:
+                ticket_links.append(html.Span(f"... and {len(tickets) - 5} more"))
+            
+            return (
+                html.Div([
+                    f"✅ Created {success_count} Jira ticket(s): ",
+                    *ticket_links,
+                    f" ({failed_count} failed)" if failed_count > 0 else ""
+                ]),
+                {
+                    'display': 'block', 'padding': '10px 15px',
+                    'backgroundColor': '#16a34a', 'color': 'white',
+                    'borderRadius': '6px', 'marginBottom': '10px'
+                }
+            )
+        else:
+            errors = results.get('errors', ['Unknown error'])
+            return (
+                f"❌ Failed to create tickets: {errors[0] if errors else 'Unknown error'}",
+                {
+                    'display': 'block', 'padding': '10px 15px',
+                    'backgroundColor': '#dc2626', 'color': 'white',
+                    'borderRadius': '6px', 'marginBottom': '10px'
+                }
+            )
+    
+    except Exception as e:
+        logger.error(f"Error creating Jira tickets: {e}")
+        return (
+            f"❌ Error: {str(e)}",
+            {
+                'display': 'block', 'padding': '10px 15px',
+                'backgroundColor': '#dc2626', 'color': 'white',
+                'borderRadius': '6px', 'marginBottom': '10px'
+            }
+        )
+
+
 @app.callback(
     [Output("scanner-status-custom", "children"),
      Output("scanner-status-custom", "className"),
@@ -814,93 +1511,114 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
 )
 @secure_callback
 def update_scanner_status(n_intervals):
-    """Update scanner status display"""
+    """Update scanner status display with real-time progress from Redis"""
     try:
-        # Check Redis connectivity for caching status
-        redis_status = "✅ Connected" if (redis_manager.redis_manager and redis_manager.redis_manager.ping()) else "❌ Disconnected"
+        # Check Redis connectivity
+        redis_connected = redis_manager.redis_manager and redis_manager.redis_manager.ping()
+        redis_status = "✅ Connected" if redis_connected else "❌ Disconnected"
 
-        # Get recent scan sessions to determine scanner status
-        query = """
-            SELECT 
-                ss.scan_type,
-                ss.status,
-                ss.completed_at,
-                ss.error_message,
-                ss.started_at,
-                COUNT(f.id) as findings_count
-            FROM scan_sessions ss
-            LEFT JOIN findings f ON ss.id = f.scan_session_id
-            WHERE ss.started_at >= NOW() - INTERVAL '24 hours'
-            GROUP BY ss.id, ss.scan_type, ss.status, ss.completed_at, ss.error_message, ss.started_at
-            ORDER BY ss.started_at DESC
-            LIMIT 10
-        """
-        recent_scans = db_manager.execute_query(query)
+        # Try to get real-time progress from Redis
+        custom_progress = None
+        trufflehog_progress = None
+        gitleaks_progress = None
+        
+        if redis_connected and redis_manager.cache_manager:
+            try:
+                custom_progress = redis_manager.cache_manager.get('scan_progress', 'custom')
+                trufflehog_progress = redis_manager.cache_manager.get('scan_progress', 'trufflehog')
+                gitleaks_progress = redis_manager.cache_manager.get('scan_progress', 'gitleaks')
+            except Exception:
+                pass
 
         scanner_statuses = {
-            'custom': {'status': 'Unknown', 'class': 'status-item'},
-            'trufflehog': {'status': 'Unknown', 'class': 'status-item'},
-            'gitleaks': {'status': 'Unknown', 'class': 'status-item'}
+            'custom': {'status': '⏸️ Idle', 'class': 'status-item'},
+            'trufflehog': {'status': '⏳ Waiting (runs after custom)', 'class': 'status-item'},
+            'gitleaks': {'status': '⏳ Waiting (runs after custom)', 'class': 'status-item'}
         }
 
-        if recent_scans:
-            for scan in recent_scans:
-                scan_type = scan['scan_type']
-                
-                if scan_type == 'custom':
-                    # Custom scans can contain findings from multiple tools
-                    if scan['status'] == 'completed':
+        # Update custom scanner status with real progress
+        if custom_progress and custom_progress.get('status') == 'running':
+            files = custom_progress.get('files_processed', 0)
+            total_files = custom_progress.get('total_files', 0)
+            findings = custom_progress.get('total_findings', 0)
+            batches = custom_progress.get('batch_count', 0)
+            
+            # Calculate progress percentage if total is known
+            if total_files > 0:
+                pct = (files / total_files) * 100
+                progress_str = f"🔄 Scanning: {files:,} / {total_files:,} files ({pct:.1f}%) - {findings:,} findings"
+            else:
+                progress_str = f"🔄 Running: {files:,} files scanned, {findings:,} findings (batch {batches})"
+            
+            scanner_statuses['custom'] = {
+                'status': progress_str,
+                'class': 'status-item status-running'
+            }
+        elif custom_progress and custom_progress.get('status') == 'completed':
+            files = custom_progress.get('files_processed', 0)
+            findings = custom_progress.get('total_findings', 0)
+            scanner_statuses['custom'] = {
+                'status': f"✅ Completed: {files:,} files, {findings:,} findings",
+                'class': 'status-item status-success'
+            }
+
+        # Update trufflehog status
+        if trufflehog_progress and trufflehog_progress.get('status') == 'running':
+            scanner_statuses['trufflehog'] = {
+                'status': f"🔄 Running...",
+                'class': 'status-item status-running'
+            }
+        elif trufflehog_progress and trufflehog_progress.get('status') == 'completed':
+            findings = trufflehog_progress.get('findings', 0)
+            scanner_statuses['trufflehog'] = {
+                'status': f"✅ Completed: {findings:,} findings",
+                'class': 'status-item status-success'
+            }
+
+        # Update gitleaks status
+        if gitleaks_progress and gitleaks_progress.get('status') == 'running':
+            scanner_statuses['gitleaks'] = {
+                'status': f"🔄 Running...",
+                'class': 'status-item status-running'
+            }
+        elif gitleaks_progress and gitleaks_progress.get('status') == 'completed':
+            findings = gitleaks_progress.get('findings', 0)
+            scanner_statuses['gitleaks'] = {
+                'status': f"✅ Completed: {findings:,} findings",
+                'class': 'status-item status-success'
+            }
+
+        # Fall back to database scan sessions if no Redis progress
+        if not custom_progress:
+            query = """
+                SELECT scan_type, status, completed_at, error_message, started_at,
+                       (SELECT COUNT(*) FROM findings WHERE scan_session_id = ss.id) as findings_count
+                FROM scan_sessions ss
+                WHERE ss.started_at >= NOW() - INTERVAL '24 hours'
+                ORDER BY ss.started_at DESC
+                LIMIT 5
+            """
+            recent_scans = db_manager.execute_query(query)
+
+            if recent_scans:
+                for scan in recent_scans:
+                    scan_type = scan['scan_type']
+                    if scan_type in ['custom', 'combined'] and scan['status'] == 'running':
                         scanner_statuses['custom'] = {
-                            'status': f"✅ Last run: {scan['completed_at'].strftime('%H:%M') if scan['completed_at'] else 'Recent'} ({scan['findings_count']} findings)",
-                            'class': 'status-item'
+                            'status': "🔄 Running... (waiting for progress data)",
+                            'class': 'status-item status-running'
                         }
-                    elif scan['status'] == 'failed':
-                        scanner_statuses['custom'] = {
-                            'status': f"❌ Failed: {scan['error_message'][:50] if scan['error_message'] else 'Unknown error'}",
-                            'class': 'status-item status-error'
-                        }
-                    elif scan['status'] == 'running':
-                        scanner_statuses['custom'] = {
-                            'status': "🔄 Running...",
-                            'class': 'status-item status-warning'
-                        }
-                
-                elif scan_type == 'combined':
-                    # Combined scans run both Trufflehog and Gitleaks
-                    if scan['status'] == 'completed':
-                        status_text = f"✅ Last run: {scan['completed_at'].strftime('%H:%M') if scan['completed_at'] else 'Recent'}"
-                        scanner_statuses['trufflehog'] = {
-                            'status': status_text,
-                            'class': 'status-item'
-                        }
-                        scanner_statuses['gitleaks'] = {
-                            'status': status_text,
-                            'class': 'status-item'
-                        }
-                    elif scan['status'] == 'failed':
-                        error_text = f"❌ Failed: {scan['error_message'][:50] if scan['error_message'] else 'Unknown error'}"
-                        scanner_statuses['trufflehog'] = {
-                            'status': error_text,
-                            'class': 'status-item status-error'
-                        }
-                        scanner_statuses['gitleaks'] = {
-                            'status': error_text,
-                            'class': 'status-item status-error'
-                        }
-                    elif scan['status'] == 'running':
-                        scanner_statuses['trufflehog'] = {
-                            'status': "🔄 Running...",
-                            'class': 'status-item status-warning'
-                        }
-                        scanner_statuses['gitleaks'] = {
-                            'status': "🔄 Running...",
-                            'class': 'status-item status-warning'
-                        }
+                        break
+
+        # Get total findings count from database
+        total_query = "SELECT COUNT(*) as total FROM findings"
+        total_result = db_manager.execute_query(total_query)
+        total_findings = total_result[0]['total'] if total_result else 0
 
         custom_status = f"Custom Scanner: {scanner_statuses['custom']['status']}"
         trufflehog_status = f"Trufflehog: {scanner_statuses['trufflehog']['status']}"
         gitleaks_status = f"Gitleaks: {scanner_statuses['gitleaks']['status']}"
-        overall_status = f"Redis Cache: {redis_status}"
+        overall_status = f"📊 Total Findings: {total_findings:,} | Redis: {redis_status}"
 
         return (
             custom_status, scanner_statuses['custom']['class'],
@@ -928,7 +1646,9 @@ def update_scanner_status(n_intervals):
 )
 @secure_callback
 def perform_scan(quick_clicks, custom_clicks, scan_path, project_name, selected_scanners):
-    """Perform scan operation"""
+    """Perform scan operation - Note: This dashboard is primarily for viewing results.
+    Scans are automatically performed by the scanner container.
+    These buttons provide manual trigger capability."""
     ctx = dash.callback_context
     if not ctx.triggered:
         return ""
@@ -952,15 +1672,34 @@ def perform_scan(quick_clicks, custom_clicks, scan_path, project_name, selected_
         # Validate inputs
         scan_path = sanitize_input(scan_path, 500)
         project_name = sanitize_input(project_name, 100)
-
-        # Run scan in background (would need to be implemented)
-        # For now, just return a notification
         scanners_str = ", ".join(selected_scanners)
-        return f"🔄 Scan started: {project_name} on {scan_path} using {scanners_str}"
+        
+        # Note: The scanner container runs continuously. This notification informs
+        # the user that scans are handled by the background scanner service.
+        return html.Div([
+            html.Strong("ℹ️ Scan Information"),
+            html.P([
+                "The scanner container runs continuously and automatically scans the /scan directory. ",
+                "Current scan configuration:"
+            ], style={'marginTop': '5px'}),
+            html.Ul([
+                html.Li(f"Path: {scan_path}"),
+                html.Li(f"Project: {project_name}"),
+                html.Li(f"Scanners: {scanners_str}"),
+            ]),
+            html.P("Check the 'Scanner Status' section above for real-time progress.", 
+                   style={'fontStyle': 'italic', 'marginTop': '10px'})
+        ], style={
+            'backgroundColor': '#1e40af', 'color': 'white', 'padding': '15px',
+            'borderRadius': '8px', 'marginBottom': '10px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.3)'
+        })
 
     except Exception as e:
         logger.error(f"Error performing scan: {e}")
-        return f"❌ Scan failed: {str(e)}"
+        return html.Div(f"❌ Error: {str(e)}", style={
+            'backgroundColor': '#dc2626', 'color': 'white', 'padding': '15px',
+            'borderRadius': '8px', 'marginBottom': '10px'
+        })
 
 @app.callback(
     Output("cleanup-result-notification", "children"),
@@ -968,43 +1707,67 @@ def perform_scan(quick_clicks, custom_clicks, scan_path, project_name, selected_
 )
 @secure_callback
 def perform_cleanup(cleanup_clicks):
-    """Perform cleanup of old data"""
+    """Perform cleanup of old data - removes findings older than 30 days"""
     if not cleanup_clicks:
         return ""
 
     try:
+        # Get count before cleanup
+        count_query = "SELECT COUNT(*) as count FROM findings"
+        before_count = db_manager.execute_query(count_query)
+        before_total = before_count[0]['count'] if before_count else 0
+        
         # Cleanup old findings (older than 30 days)
         cutoff_date = datetime.now() - timedelta(days=30)
 
-        # Delete old scan sessions and their findings
-        query = """
+        # Delete old findings directly
+        delete_findings_query = """
+            DELETE FROM findings
+            WHERE first_seen < %s
+        """
+        db_manager.execute_update(delete_findings_query, (cutoff_date,))
+
+        # Delete old scan sessions
+        delete_sessions_query = """
             DELETE FROM scan_sessions
             WHERE created_at < %s
             AND status IN ('completed', 'failed')
         """
-        deleted_sessions = db_manager.execute_query(query, (cutoff_date,))
+        db_manager.execute_update(delete_sessions_query, (cutoff_date,))
 
-        # Delete orphaned findings
-        query = """
-            DELETE FROM findings
-            WHERE scan_session_id NOT IN (
-                SELECT id FROM scan_sessions
-            )
-        """
-        deleted_findings = db_manager.execute_query(query, ())
+        # Get count after cleanup
+        after_count = db_manager.execute_query(count_query)
+        after_total = after_count[0]['count'] if after_count else 0
+        deleted_count = before_total - after_total
 
-        # Clear old cache entries
-        try:
-            # This would need Redis cleanup logic
-            cache_cleanup = "Redis cache entries older than 7 days cleared"
-        except:
-            cache_cleanup = "Redis cache cleanup skipped"
+        # Clear data cache to force refresh
+        data_cache['findings_df'] = None
+        data_cache['last_update'] = None
 
-        return f"✅ Cleanup completed: Removed old scan data (30+ days). Cache: {cache_cleanup}"
+        return html.Div([
+            html.Strong("✅ Cleanup Completed"),
+            html.P([
+                f"Removed {deleted_count:,} findings older than 30 days."
+            ], style={'marginTop': '5px'}),
+            html.P([
+                f"Before: {before_total:,} findings → After: {after_total:,} findings"
+            ]),
+            html.P("Click 'Refresh Data' to update the dashboard.", 
+                   style={'fontStyle': 'italic', 'marginTop': '10px'})
+        ], style={
+            'backgroundColor': '#16a34a', 'color': 'white', 'padding': '15px',
+            'borderRadius': '8px', 'marginBottom': '10px', 'boxShadow': '0 4px 6px rgba(0,0,0,0.3)'
+        })
 
     except Exception as e:
         logger.error(f"Error performing cleanup: {e}")
-        return f"❌ Cleanup failed: {str(e)}"
+        return html.Div([
+            html.Strong("❌ Cleanup Failed"),
+            html.P(str(e), style={'marginTop': '5px'})
+        ], style={
+            'backgroundColor': '#dc2626', 'color': 'white', 'padding': '15px',
+            'borderRadius': '8px', 'marginBottom': '10px'
+        })
 
 # Permanent dark mode - no toggle needed
 # Main container is always in dark mode
@@ -1019,9 +1782,14 @@ def create_layout():
     """Create the main dashboard layout"""
     # Aggressive CSS overrides to fix dark mode rendering issues
     return html.Div([
-        # Hidden notification divs for callbacks
-        html.Div(id="scan-result-notification", style={"display": "none"}),
-        html.Div(id="cleanup-result-notification", style={"display": "none"}),
+        # Notification area - visible at top
+        html.Div([
+            html.Div(id="scan-result-notification", className="notification-area"),
+            html.Div(id="cleanup-result-notification", className="notification-area"),
+        ], id="notification-container", style={
+            'position': 'fixed', 'top': '10px', 'right': '10px', 'zIndex': '9999',
+            'maxWidth': '400px'
+        }),
 
         # Main container
         html.Div([
@@ -1036,9 +1804,14 @@ def create_layout():
                 html.Div([
                     # Scan controls - Dark mode is now permanently enabled
                     html.Div([
-                        html.Button("🔍 Quick Scan", id="quick-scan-btn", className="scan-btn"),
-                        html.Button("📁 Custom Scan", id="custom-scan-btn", className="scan-btn"),
-                        html.Button("🧹 Cleanup Old Data", id="cleanup-btn", className="cleanup-btn")
+                        html.Button("� Refresh Data", id="refresh-btn", className="refresh-btn",
+                            title="Refresh findings data from database"),
+                        html.Button("🔍 Quick Scan", id="quick-scan-btn", className="scan-btn",
+                            title="Run all scanners on /scan directory (custom + gitleaks + trufflehog)"),
+                        html.Button("📁 Custom Scan", id="custom-scan-btn", className="scan-btn",
+                            title="Configure and run a custom scan with specific settings"),
+                        html.Button("🧹 Cleanup Old Data", id="cleanup-btn", className="cleanup-btn",
+                            title="Remove findings older than 30 days to free up database space")
                     ], className="control-item")
                 ], className="header-controls")
             ], className="header"),
@@ -1106,7 +1879,7 @@ def create_layout():
             # Filters
             html.Div([
                 html.Div([
-                    html.Label("Severity Filter:"),
+                    html.Label("Severity Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
                     dcc.Dropdown(
                         id="severity-filter",
                         options=[
@@ -1117,12 +1890,13 @@ def create_layout():
                             {"label": "Low", "value": "Low"}
                         ],
                         value="all",
-                        clearable=False
+                        clearable=False,
+                        style={'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
                     )
                 ], className="filter-item"),
 
                 html.Div([
-                    html.Label("Tool Source Filter:"),
+                    html.Label("Tool Source Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
                     dcc.Dropdown(
                         id="tool-filter",
                         options=[
@@ -1132,19 +1906,20 @@ def create_layout():
                             {"label": "Gitleaks", "value": "gitleaks"}
                         ],
                         value="all",
-                        clearable=False
+                        clearable=False,
+                        style={'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
                     )
                 ], className="filter-item"),
 
                 html.Div([
-                    html.Label("Project Filter:"),
+                    html.Label("Project Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
                     dcc.Dropdown(
                         id="project-filter",
                         options=[{"label": "All Projects", "value": "all"}],
                         value="all",
                         clearable=False,
-                        optionHeight=50,  # Increase height for multi-line text
-                        style={'minWidth': '200px'}
+                        optionHeight=50,
+                        style={'minWidth': '200px', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
                     )
                 ], className="filter-item"),
 
@@ -1211,16 +1986,336 @@ def create_layout():
 
             # Data Table
             html.Div([
-                html.H3("📋 Recent Findings"),
+                html.H3("📋 Recent Findings (click any row for full details)"),
+                
+                # False Positive Controls Panel
+                html.Div([
+                    # Left side - Toggle and count
+                    html.Div([
+                        html.Button(
+                            "👁️ View False Positives",
+                            id='btn-view-fps',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '15px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Span(id='fp-count-badge', style={
+                            'padding': '4px 10px', 
+                            'backgroundColor': '#6b7280', 'borderRadius': '12px',
+                            'fontSize': '12px', 'color': '#fff'
+                        }),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'flex': '1'}),
+                    
+                    # Right side - Bulk action buttons
+                    html.Div([
+                        html.Button(
+                            "🚫 Mark Selected as False Positive", 
+                            id='btn-mark-fp',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#dc2626', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "✅ Restore Selected", 
+                            id='btn-restore-fp',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#16a34a', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "🎫 Create Jira Ticket", 
+                            id='btn-create-jira',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#0052cc', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "⚙️ Jira Settings", 
+                            id='btn-jira-settings',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold'
+                            }
+                        ),
+                    ], style={'display': 'flex', 'alignItems': 'center'}),
+                ], style={
+                    'display': 'flex', 'justifyContent': 'space-between', 
+                    'alignItems': 'center', 'marginBottom': '15px',
+                    'padding': '10px 15px', 'backgroundColor': '#2d3748',
+                    'borderRadius': '8px', 'border': '1px solid #444'
+                }),
+                
+                # FP Action Result Message
+                html.Div(id='fp-action-result', style={
+                    'marginBottom': '10px', 'padding': '8px 12px',
+                    'borderRadius': '6px', 'display': 'none'
+                }),
+                
+                # FP Reason Input Modal
+                dcc.Store(id='selected-rows-for-fp', data=[]),
+                html.Div([
+                    html.Div([
+                        html.H4("Mark as False Positive", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
+                        html.Label("Reason (optional):", style={'color': '#b0b0b0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Textarea(
+                            id='fp-reason-input',
+                            placeholder='e.g., Test data, Sample key, Not a real secret...',
+                            style={
+                                'width': '100%', 'height': '80px',
+                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '4px',
+                                'padding': '10px', 'marginBottom': '15px'
+                            }
+                        ),
+                        html.Div([
+                            html.Button(
+                                "Confirm Mark as FP", 
+                                id='btn-confirm-fp',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#dc2626', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'marginRight': '10px', 'fontWeight': 'bold'
+                                }
+                            ),
+                            html.Button(
+                                "Cancel", 
+                                id='btn-cancel-fp',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#6b7280', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer'
+                                }
+                            ),
+                        ], style={'textAlign': 'right'})
+                    ], style={
+                        'backgroundColor': '#2d3748', 'padding': '20px',
+                        'borderRadius': '8px', 'maxWidth': '500px',
+                        'margin': '0 auto', 'border': '1px solid #555'
+                    })
+                ], id='fp-reason-modal', style={
+                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                    'zIndex': '1000', 'paddingTop': '100px'
+                }),
+                
+                # Jira Settings Modal
+                html.Div([
+                    html.Div([
+                        html.H4("⚙️ Jira Integration Settings", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
+                        
+                        html.Div([
+                            html.Label("Jira Server URL:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(
+                                id='jira-server-url',
+                                type='text',
+                                placeholder='https://your-company.atlassian.net',
+                                style={
+                                    'width': '100%', 'padding': '10px',
+                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px',
+                                    'marginBottom': '15px'
+                                }
+                            ),
+                        ]),
+                        
+                        html.Div([
+                            html.Label("Username (Email):", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(
+                                id='jira-username',
+                                type='text',
+                                placeholder='your.email@company.com',
+                                style={
+                                    'width': '100%', 'padding': '10px',
+                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px',
+                                    'marginBottom': '15px'
+                                }
+                            ),
+                        ]),
+                        
+                        html.Div([
+                            html.Label("API Token:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(
+                                id='jira-api-token',
+                                type='password',
+                                placeholder='Your Jira API token',
+                                style={
+                                    'width': '100%', 'padding': '10px',
+                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px',
+                                    'marginBottom': '15px'
+                                }
+                            ),
+                        ]),
+                        
+                        html.Div([
+                            html.Label("Project Key:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(
+                                id='jira-project-key',
+                                type='text',
+                                placeholder='SEC, SECOPS, etc.',
+                                style={
+                                    'width': '100%', 'padding': '10px',
+                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px',
+                                    'marginBottom': '15px'
+                                }
+                            ),
+                        ]),
+                        
+                        html.Div([
+                            html.Label("Issue Type:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Dropdown(
+                                id='jira-issue-type',
+                                options=[
+                                    {'label': 'Task', 'value': 'Task'},
+                                    {'label': 'Bug', 'value': 'Bug'},
+                                    {'label': 'Story', 'value': 'Story'},
+                                    {'label': 'Security', 'value': 'Security'},
+                                ],
+                                value='Task',
+                                style={'backgroundColor': '#1e1e1e', 'marginBottom': '15px'}
+                            ),
+                        ]),
+                        
+                        html.Div(id='jira-connection-status', style={
+                            'marginBottom': '10px', 'padding': '10px',
+                            'borderRadius': '4px', 'backgroundColor': '#374151'
+                        }),
+                        
+                        html.Div(id='jira-save-status', style={
+                            'marginBottom': '15px', 'padding': '10px',
+                            'borderRadius': '4px', 'backgroundColor': '#374151'
+                        }),
+                        
+                        html.Div([
+                            html.Button(
+                                "🔗 Test Connection", 
+                                id='btn-test-jira',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#0052cc', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'marginRight': '10px', 'fontWeight': 'bold'
+                                }
+                            ),
+                            html.Button(
+                                "💾 Save Settings", 
+                                id='btn-save-jira',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#16a34a', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'marginRight': '10px', 'fontWeight': 'bold'
+                                }
+                            ),
+                            html.Button(
+                                "Close", 
+                                id='btn-close-jira-settings',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#6b7280', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer'
+                                }
+                            ),
+                        ], style={'textAlign': 'right'})
+                    ], style={
+                        'backgroundColor': '#2d3748', 'padding': '25px',
+                        'borderRadius': '8px', 'maxWidth': '500px',
+                        'margin': '0 auto', 'border': '1px solid #555'
+                    })
+                ], id='jira-settings-modal', style={
+                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                    'zIndex': '1000', 'paddingTop': '50px'
+                }),
+                
+                # False Positives Viewer Modal
+                html.Div([
+                    html.Div([
+                        html.Div([
+                            html.H2("🚫 False Positives", style={'margin': '0', 'color': '#f59e0b'}),
+                            html.Button("✕", id='close-fp-viewer-btn', n_clicks=0, style={
+                                'background': 'none', 'border': 'none', 'color': '#aaa',
+                                'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                            })
+                        ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                        
+                        html.P("Items marked as false positives with their reasons:", style={'color': '#9ca3af', 'marginBottom': '15px'}),
+                        
+                        # FP Table
+                        html.Div(id='fp-viewer-table-container', style={
+                            'maxHeight': '500px', 'overflowY': 'auto'
+                        }),
+                        
+                        # Action buttons
+                        html.Div([
+                            html.Button(
+                                "✅ Restore Selected to Active",
+                                id='btn-restore-from-viewer',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#16a34a', 'color': 'white',
+                                    'border': 'none', 'padding': '10px 20px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'fontWeight': 'bold', 'marginRight': '10px'
+                                }
+                            ),
+                            html.Span(id='fp-viewer-action-result', style={'color': '#e0e0e0'})
+                        ], style={'marginTop': '15px', 'textAlign': 'left'})
+                    ], style={
+                        'backgroundColor': '#2d3748', 'padding': '25px',
+                        'borderRadius': '8px', 'maxWidth': '1200px', 'width': '90%',
+                        'margin': '0 auto', 'border': '1px solid #555'
+                    })
+                ], id='fp-viewer-modal', style={
+                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                    'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+                }),
+                
+                # Jira Action Result Message
+                html.Div(id='jira-action-result', style={
+                    'marginBottom': '10px', 'padding': '8px 12px',
+                    'borderRadius': '6px', 'display': 'none'
+                }),
+                
                 dash_table.DataTable(
                     id="findings-table",
                     columns=[
+                        {"name": "ID", "id": "id", "hideable": True},  # Hidden by default, used for FP actions
                         {"name": "File Path", "id": "file_path", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "Secret Type", "id": "secret_type", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "Secret Value", "id": "secret_value", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "Context", "id": "context", "deletable": True, "selectable": True, "hideable": True},
-                        {"name": "Severity", "id": "severity", "deletable": True, "selectable": True, "hideable": True},
-                        {"name": "Tool Source", "id": "tool_source", "deletable": True, "selectable": True, "hideable": True},
+                        {"name": "Severity", "id": "severity", "deletable": True, "selectable": True, "hideable": True, "presentation": "dropdown"},
+                        {"name": "Tool Source", "id": "tool_source", "deletable": True, "selectable": True, "hideable": True, "presentation": "dropdown"},
+                        {"name": "Status", "id": "resolution_status", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "Project", "id": "project_name", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "First Seen", "id": "first_seen", "deletable": True, "selectable": True, "hideable": True},
                         {"name": "Confidence", "id": "confidence_score", "deletable": True, "selectable": True, "hideable": True}
@@ -1231,9 +2326,36 @@ def create_layout():
                     sort_mode="multi",
                     column_selectable="multi",
                     row_selectable="multi",
+                    selected_rows=[],
                     page_action="native",
                     page_current=0,
-                    page_size=25,  # Increased from 20
+                    page_size=50,  # Show 50 rows per page
+                    hidden_columns=['id'],  # Hide ID column by default
+                    tooltip_duration=None,
+                    dropdown={
+                        'tool_source': {
+                            'options': [
+                                {'label': 'custom', 'value': 'custom'},
+                                {'label': 'trufflehog', 'value': 'trufflehog'},
+                                {'label': 'gitleaks', 'value': 'gitleaks'}
+                            ]
+                        },
+                        'severity': {
+                            'options': [
+                                {'label': 'Critical', 'value': 'Critical'},
+                                {'label': 'High', 'value': 'High'},
+                                {'label': 'Medium', 'value': 'Medium'},
+                                {'label': 'Low', 'value': 'Low'}
+                            ]
+                        },
+                        'resolution_status': {
+                            'options': [
+                                {'label': 'open', 'value': 'open'},
+                                {'label': 'false_positive', 'value': 'false_positive'},
+                                {'label': 'resolved', 'value': 'resolved'}
+                            ]
+                        }
+                    },
                     style_table={
                         'overflowX': 'auto',
                         'minWidth': '100%',
@@ -1345,6 +2467,26 @@ def create_layout():
                             'color': '#ffffff',
                             'fontWeight': 'bold'
                         },
+                        # False positive row styling - grayed out with strikethrough effect
+                        {
+                            'if': {'filter_query': '{resolution_status} = "false_positive"'},
+                            'backgroundColor': '#3a3a3a',
+                            'color': '#888888',
+                            'fontStyle': 'italic'
+                        },
+                        # Status column styling
+                        {
+                            'if': {'column_id': 'resolution_status', 'filter_query': '{resolution_status} = "open"'},
+                            'backgroundColor': '#16a34a',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
+                        {
+                            'if': {'column_id': 'resolution_status', 'filter_query': '{resolution_status} = "false_positive"'},
+                            'backgroundColor': '#6b7280',
+                            'color': '#ffffff',
+                            'fontWeight': 'bold'
+                        },
                         # Alternating row colors for better readability
                         {
                             'if': {'row_index': 'odd'},
@@ -1356,6 +2498,20 @@ def create_layout():
                     css=[{'selector': '.dash-cell div', 'rule': 'white-space: normal; height: auto;'}]
                 )
             ], className="data-table"),
+
+            # Finding Detail Modal (opens when clicking a table row)
+            html.Div([
+                html.Div(id="modal-backdrop", className="modal-backdrop"),
+                html.Div([
+                    html.Div([
+                        html.H2("🔍 Finding Details"),
+                    ], className="modal-header"),
+                    html.Div(id="finding-detail-content", className="finding-detail-body"),
+                    html.Div([
+                        html.Button("Close", id="close-detail-modal-btn-bottom", className="modal-close-btn-bottom")
+                    ], className="modal-footer")
+                ], className="modal-content detail-modal-content")
+            ], id="finding-detail-modal", className="modal-container"),
 
             # Custom Report Export Section
             html.Div([
@@ -1411,12 +2567,17 @@ def create_layout():
 # Set the layout from create_layout function
 app.layout = create_layout()
 
-# CSS Styles
+# CSS Styles with cache busting
+import time as _time
+_cache_version = str(int(_time.time()))
 app.index_string = '''
 <!DOCTYPE html>
 <html>
     <head>
         <title>SecretSnipe Dashboard</title>
+        <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+        <meta http-equiv="Pragma" content="no-cache">
+        <meta http-equiv="Expires" content="0">
         <style>
             /* Universal dark background - highest priority */
             html, body {
@@ -1553,10 +2714,27 @@ app.index_string = '''
                 color: #333;
             }
             .stats-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 15px;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 30px;
                 margin-top: 15px;
+                padding: 15px;
+                background-color: #1e1e1e;
+                border-radius: 8px;
+            }
+            .stats-grid h4 {
+                margin: 0 0 10px 0;
+                font-size: 14px;
+            }
+            .stat-item {
+                margin-bottom: 5px;
+                font-size: 14px;
+            }
+            .notification-area {
+                margin-bottom: 10px;
+            }
+            .notification-area:empty {
+                display: none;
             }
             @media (max-width: 1200px) {
                 .chart-container {
@@ -1708,7 +2886,7 @@ app.index_string = '''
             }
 
             .modal-content {
-                background: white;
+                background: #2d2d2d;
                 border-radius: 10px;
                 padding: 30px;
                 max-width: 500px;
@@ -1717,9 +2895,17 @@ app.index_string = '''
                 overflow-y: auto;
             }
 
+            /* Detail modal (finding details) - larger size */
+            .modal-content.detail-modal-content {
+                max-width: 1100px;
+                width: 95%;
+                max-height: 90vh;
+                padding: 25px 35px;
+            }
+
             .modal-content h2 {
                 margin-top: 0;
-                color: #333;
+                color: #e0e0e0;
                 border-bottom: 2px solid #667eea;
                 padding-bottom: 10px;
             }
@@ -1867,14 +3053,38 @@ app.index_string = '''
                 background: #4d4d2d;
             }
 
+            .main-container.dark-mode .status-item.status-running {
+                border-left-color: #17a2b8;
+                background: #2d3d4d;
+                animation: pulse 2s infinite;
+            }
+
+            .main-container.dark-mode .status-item.status-success {
+                border-left-color: #28a745;
+                background: #2d4d2d;
+            }
+
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.7; }
+                100% { opacity: 1; }
+            }
+
             /* Modal Styles */
             .main-container.dark-mode .modal-container {
-                background: rgba(0,0,0,0.7);
+                background: rgba(0,0,0,0.8);
             }
 
             .main-container.dark-mode .modal-content {
                 background: #1e1e1e;
                 color: #e0e0e0;
+            }
+
+            /* Detail modal - larger size for viewing findings */
+            .main-container.dark-mode .modal-content.detail-modal-content {
+                max-width: 1100px;
+                width: 95%;
+                max-height: 90vh;
             }
 
             .main-container.dark-mode .modal-content h2 {

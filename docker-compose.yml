@@ -21,12 +21,20 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+        reservations:
+          memory: 512M
+          cpus: '0.25'
 
   # Redis Cache
   redis:
     image: redis:7-alpine
     container_name: secretsnipe-redis
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    command: redis-server --appendonly yes --maxmemory 1gb --maxmemory-policy volatile-lru
     volumes:
       - redis_data:/data
     ports:
@@ -39,6 +47,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+        reservations:
+          memory: 256M
+          cpus: '0.125'
 
   # SecretSnipe Scanner
   scanner:
@@ -57,20 +73,71 @@ services:
       # Application
       LOG_LEVEL: INFO
       DEBUG: "false"
+      # Scanner Configuration
+      SCANNER_TIMEOUT_SECONDS: ${SCANNER_TIMEOUT_SECONDS:-300}
+      MAX_SCAN_DEPTH: ${MAX_SCAN_DEPTH:-25}
+      ENABLE_OCR: ${ENABLE_OCR:-true}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-en}
+      # Memory Optimization Settings
+      SCANNER_MEMORY_LIMIT_MB: ${SCANNER_MEMORY_LIMIT_MB:-512}
+      TRUFFLEHOG_CONCURRENCY: ${TRUFFLEHOG_CONCURRENCY:-2}
+      TRUFFLEHOG_MAX_DEPTH: ${TRUFFLEHOG_MAX_DEPTH:-5}
+      GITLEAKS_MAX_FILE_SIZE_MB: ${GITLEAKS_MAX_FILE_SIZE_MB:-10}
+      GITLEAKS_MAX_DEPTH: ${GITLEAKS_MAX_DEPTH:-10}
+      MAX_FINDINGS_PER_SCAN: ${MAX_FINDINGS_PER_SCAN:-10000}
+      WORKER_PROCESSES: ${WORKER_PROCESSES:-4}
+      # Run initial full scan (set to true to skip for very large directories)
+      SKIP_INITIAL_SCAN: ${SKIP_INITIAL_SCAN:-false}
+      EXCLUDED_DIRECTORIES: ${EXCLUDED_DIRECTORIES:-node_modules,.git,venv,__pycache__,~snapshot,Measurements}
+      EXCLUDED_EXTENSIONS: ${EXCLUDED_EXTENSIONS:-.prn,.bmp,.tiff,.tif,.mov,.mp4,.avi,.wmv,.flv,.mkv,.webm,.m4v,.pdf,.zip,.rar,.7z}
+      UNLIMITED_MODE: ${UNLIMITED_MODE:-false}
+      # OCR Engine: 'pytesseract' (low memory, uses external process) or 'easyocr' (high accuracy, more memory)
+      OCR_ENGINE: ${OCR_ENGINE:-pytesseract}
+      # Maximum image file size (in MB) to process with OCR
+      # pytesseract can handle larger files (5MB default), easyocr needs smaller (0.5MB)
+      MAX_OCR_FILE_SIZE_MB: ${MAX_OCR_FILE_SIZE_MB:-5.0}
+      # Reset OCR reader after this many images to free memory (only affects EasyOCR)
+      OCR_RESET_AFTER_IMAGES: ${OCR_RESET_AFTER_IMAGES:-50}
+      # Automatic cleanup: Delete findings older than X days (default 90)
+      CLEANUP_DAYS_OLD: ${CLEANUP_DAYS_OLD:-90}
+      # Suppress PyTorch warnings
+      PYTHONWARNINGS: ignore::UserWarning
+      OMP_NUM_THREADS: 1
     volumes:
       - ./signatures.json:/app/signatures.json:ro
       - ./config.json:/app/config.json:ro
-      - ${MONITOR_VOLUME:-./monitor_data:/scan:ro}
+      - ${SCAN_VOLUME:-./monitor_data:/scan:ro}
       - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          memory: 4G  # Increased for OCR processing of large images
+          cpus: '1.0'
+        reservations:
+          memory: 1G
+          cpus: '0.5'
+    ulimits:
+      nofile: 65536
     networks:
       - secretsnipe-network
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[c]ontinuous_monitor_pg.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 604800s  # 7 days for initial large scan
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    restart: "no"  # Don't restart after completing scan
-    command: ["python", "run_secret_scanner_pg.py", "/scan", "--project", "container-scan", "--scanners", "custom", "trufflehog", "gitleaks"]
+    restart: unless-stopped
+    command: ["python", "continuous_monitor_pg.py", "/scan", "--project", "container-scan"]
 
   # SecretSnipe Visualizer
   visualizer:
@@ -95,12 +162,13 @@ services:
       LOG_LEVEL: INFO
       DEBUG: "false"
     ports:
-      - "127.0.0.1:8050:8050"  # Bind to localhost for security
+      - "8050:8050"  # Allow network access to dashboard
     volumes:
       - ./signatures.json:/app/signatures.json:ro
       - ./config.json:/app/config.json:ro
       - ./logs:/app/logs
-      - ./dashboard_audit.log:/app/dashboard_audit.log  # Mount audit log
+      - ./dashboard_audit.log:/app/dashboard_audit.log
+      - ./jira_config:/app/jira_config  # Persist Jira settings (host directory)
     networks:
       - secretsnipe-network
     depends_on:
@@ -114,10 +182,10 @@ services:
       resources:
         limits:
           memory: 512M
-          cpus: '0.5'
+          cpus: '0.25'
         reservations:
           memory: 256M
-          cpus: '0.25'
+          cpus: '0.125'
     # Security: Add security options
     security_opt:
       - no-new-privileges:true
@@ -153,6 +221,14 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.25'
+        reservations:
+          memory: 128M
+          cpus: '0.125'
     command: ["python", "webhook_service.py"]
 
   # Continuous Monitoring Service (Optional)
@@ -176,12 +252,35 @@ services:
       # Application
       LOG_LEVEL: INFO
       DEBUG: "false"
+      # Scanner Configuration
+      SCANNER_TIMEOUT_SECONDS: ${SCANNER_TIMEOUT_SECONDS:-86400}
+      MAX_SCAN_DEPTH: ${MAX_SCAN_DEPTH:-25}
+      ENABLE_OCR: ${ENABLE_OCR:-true}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-en}
+      EXCLUDED_DIRECTORIES: ${EXCLUDED_DIRECTORIES:-node_modules,.git,venv,__pycache__,~snapshot,Measurements}
+      UNLIMITED_MODE: ${UNLIMITED_MODE:-false}
     volumes:
       - ./config.json:/app/config.json:ro
       - ${MONITOR_VOLUME:-./monitor_data:/monitor:rw}
       - ./logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: '2.0'
+        reservations:
+          memory: 2G
+          cpus: '1.0'
+    ulimits:
+      nofile: 65536
     networks:
       - secretsnipe-network
+    healthcheck:
+      test: ["CMD-SHELL", "ps aux | grep -q '[c]ontinuous_monitor_pg.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       postgres:
         condition: service_healthy
@@ -211,9 +310,24 @@ services:
       ENABLE_CONTINUOUS_MONITORING: "true"
       # Volume mount configuration
       HOST_MONITOR_VOLUME: ${HOST_MONITOR_VOLUME:-/app/host_monitor}
+      # Scanner Configuration
+      SCANNER_TIMEOUT_SECONDS: ${SCANNER_TIMEOUT_SECONDS:-86400}
+      MAX_SCAN_DEPTH: ${MAX_SCAN_DEPTH:-25}
+      ENABLE_OCR: ${ENABLE_OCR:-true}
+      OCR_LANGUAGES: ${OCR_LANGUAGES:-en}
+      EXCLUDED_DIRECTORIES: ${EXCLUDED_DIRECTORIES:-node_modules,.git,venv,__pycache__,~snapshot,Measurements}
+      UNLIMITED_MODE: ${UNLIMITED_MODE:-false}
     volumes:
       - ./config.json:/app/config.json:ro
       - ${HOST_MONITOR_VOLUME:-./monitor_data:/app/host_monitor:ro}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+        reservations:
+          memory: 256M
+          cpus: '0.125'
     networks:
       - secretsnipe-network
     depends_on:
@@ -231,7 +345,9 @@ volumes:
     driver: local
   scan_data:
     driver: local
+  jira_config:
+    driver: local
 
 networks:
   secretsnipe-network:
-    driver: bridge
+    external: true

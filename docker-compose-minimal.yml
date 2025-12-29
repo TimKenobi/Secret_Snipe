@@ -77,6 +77,14 @@ services:
       # Disable external services
       WEBHOOK_ENABLED: "false"
       TEAMS_WEBHOOK_URL: ""
+      # Memory Optimization Settings (Low Memory Mode)
+      SCANNER_MEMORY_LIMIT_MB: 256
+      TRUFFLEHOG_CONCURRENCY: 1
+      TRUFFLEHOG_MAX_DEPTH: 3
+      GITLEAKS_MAX_FILE_SIZE_MB: 5
+      GITLEAKS_MAX_DEPTH: 8
+      MAX_FINDINGS_PER_SCAN: 5000
+      WORKER_PROCESSES: 2
     volumes:
       - ./signatures.json:/app/signatures.json:ro
       - ./config.json:/app/config.json:ro
@@ -96,14 +104,14 @@ services:
     read_only: true
     tmpfs:
       - /tmp
-    # Security: Resource limits
+    # Security: Resource limits (Reduced for memory optimization)
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 768M  # Reduced from 1G
           cpus: '1.0'
         reservations:
-          memory: 512M
+          memory: 384M  # Reduced from 512M
           cpus: '0.5'
     command: ["python", "run_secret_scanner_pg.py", "/scan", "--project", "minimal-scan", "--scanners", "custom", "trufflehog", "gitleaks"]
 

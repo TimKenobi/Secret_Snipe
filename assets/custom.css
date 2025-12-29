@@ -901,3 +901,529 @@ textarea:focus {
         min-width: auto;
     }
 }
+/* ==========================================================================
+   Modern Dash Dropdown Dark Mode Fixes (2024+ versions)
+   ========================================================================== */
+
+/* Filter labels - ensure visibility in dark mode */
+.filter-item label,
+.dark-mode .filter-item label {
+    color: #e0e0e0 !important;
+    font-weight: 600 !important;
+    margin-bottom: 8px !important;
+    display: block !important;
+}
+
+/* Dash Dropdown Container */
+.dash-dropdown,
+.Select,
+.VirtualizedSelectFocusedOption {
+    background-color: #2d2d2d !important;
+}
+
+/* Dropdown control wrapper */
+.Select-control,
+.Select--single > .Select-control,
+.Select--multi > .Select-control {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+    color: #e0e0e0 !important;
+}
+
+/* Selected value text */
+.Select-value-label,
+.Select-value span,
+.Select--single > .Select-control .Select-value .Select-value-label {
+    color: #e0e0e0 !important;
+}
+
+/* Placeholder text */
+.Select-placeholder,
+.Select--single > .Select-control .Select-placeholder {
+    color: #aaa !important;
+}
+
+/* Dropdown menu */
+.Select-menu-outer,
+.Select-menu {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5) !important;
+}
+
+/* Dropdown options */
+.Select-option,
+.VirtualizedSelectOption {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+}
+
+.Select-option:hover,
+.Select-option.is-focused,
+.VirtualizedSelectFocusedOption {
+    background-color: #444 !important;
+    color: #fff !important;
+}
+
+.Select-option.is-selected {
+    background-color: #667eea !important;
+    color: #fff !important;
+}
+
+/* Arrow indicator */
+.Select-arrow {
+    border-color: #e0e0e0 transparent transparent !important;
+}
+
+.Select-arrow-zone:hover .Select-arrow {
+    border-color: #fff transparent transparent !important;
+}
+
+/* Clear button */
+.Select-clear-zone {
+    color: #e0e0e0 !important;
+}
+
+/* Input field in dropdown */
+.Select-input input {
+    color: #e0e0e0 !important;
+    background: transparent !important;
+}
+
+/* Dash-specific overrides for newer versions */
+div[class*="css-"][class*="-container"] {
+    background-color: #2d2d2d !important;
+}
+
+div[class*="css-"][class*="-control"] {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+}
+
+div[class*="css-"][class*="-menu"] {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+}
+
+div[class*="css-"][class*="-option"] {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+}
+
+div[class*="css-"][class*="-option"]:hover {
+    background-color: #444 !important;
+    color: #fff !important;
+}
+
+div[class*="css-"][class*="-singleValue"],
+div[class*="css-"][class*="-placeholder"] {
+    color: #e0e0e0 !important;
+}
+
+/* DataTable filter inputs */
+.dash-spreadsheet .dash-filter input,
+.dash-table-container .dash-filter input,
+input.dash-filter--case-sensitive,
+input.column-header-filter {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+    border: 1px solid #555 !important;
+    padding: 4px 8px !important;
+}
+
+.dash-spreadsheet .dash-filter input::placeholder,
+.dash-table-container .dash-filter input::placeholder {
+    color: #888 !important;
+}
+
+/* Table pagination controls */
+.previous-next-container button,
+.dash-table-container button.previous-page,
+.dash-table-container button.next-page,
+.dash-table-container button.first-page,
+.dash-table-container button.last-page {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+    border: 1px solid #555 !important;
+}
+
+.previous-next-container button:hover,
+.dash-table-container button:hover {
+    background-color: #444 !important;
+}
+
+.current-page-container input,
+.dash-table-container .current-page input {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+    border: 1px solid #555 !important;
+}
+
+/* Column header toggle/hide buttons */
+.column-header--hide,
+.column-header--delete {
+    color: #e0e0e0 !important;
+}
+
+.column-header--hide:hover,
+.column-header--delete:hover {
+    color: #ff6b6b !important;
+}
+
+/* ==========================================================================
+   DataTable Cell Dropdowns (for Tool Source, Severity columns)
+   ========================================================================== */
+
+/* DataTable dropdown cells */
+.dash-table-container .dash-dropdown-cell,
+.dash-spreadsheet .dash-dropdown-cell {
+    background-color: #2d2d2d !important;
+}
+
+.dash-table-container .dropdown,
+.dash-spreadsheet .dropdown,
+.dash-cell-value .dropdown {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+}
+
+/* Dropdown in table cells */
+.dash-table-container select,
+.dash-spreadsheet select,
+.dash-dropdown-cell select {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+    border: 1px solid #555 !important;
+    padding: 4px 8px !important;
+    border-radius: 4px !important;
+    cursor: pointer !important;
+}
+
+.dash-table-container select:focus,
+.dash-spreadsheet select:focus {
+    outline: none !important;
+    border-color: #667eea !important;
+}
+
+.dash-table-container select option,
+.dash-spreadsheet select option {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+    padding: 8px !important;
+}
+
+/* Dash DataTable internal dropdown styling */
+.cell-dropdown,
+.dash-table-dropdown {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+}
+
+.cell-dropdown .Select-control,
+.dash-table-dropdown .Select-control {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+}
+
+.cell-dropdown .Select-menu-outer,
+.dash-table-dropdown .Select-menu-outer {
+    background-color: #2d2d2d !important;
+    border-color: #555 !important;
+}
+
+.cell-dropdown .Select-option,
+.dash-table-dropdown .Select-option {
+    background-color: #2d2d2d !important;
+    color: #e0e0e0 !important;
+}
+
+.cell-dropdown .Select-option:hover,
+.dash-table-dropdown .Select-option:hover,
+.cell-dropdown .Select-option.is-focused,
+.dash-table-dropdown .Select-option.is-focused {
+    background-color: #444 !important;
+    color: #fff !important;
+}
+
+/* Editable cell styling */
+.dash-table-container .dash-cell.focused,
+.dash-spreadsheet .dash-cell.focused {
+    outline: 2px solid #667eea !important;
+}
+
+/* Make dropdown arrows visible */
+.dash-table-container .Select-arrow,
+.dash-spreadsheet .Select-arrow {
+    border-color: #e0e0e0 transparent transparent !important;
+}
+
+/* ==========================================================================
+   Finding Detail Modal Styles
+   ========================================================================== */
+
+/* Modal backdrop */
+.modal-backdrop {
+    display: none;
+}
+
+.modal-container.show .modal-backdrop {
+    display: block;
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 999;
+}
+
+.detail-modal-content {
+    max-width: 1000px !important;
+    width: 95% !important;
+    max-height: 90vh !important;
+    overflow-y: auto !important;
+    padding: 30px !important;
+    position: relative;
+    z-index: 1000;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 2px solid #444;
+    padding-bottom: 15px;
+    margin-bottom: 25px;
+    position: sticky;
+    top: -30px;
+    background: #2d2d2d;
+    padding-top: 10px;
+    margin-top: -10px;
+    z-index: 10;
+}
+
+.modal-header h2 {
+    margin: 0;
+    color: #e0e0e0;
+    font-size: 24px;
+}
+
+.modal-close-btn {
+    background: #ff4444;
+    border: none;
+    color: #fff;
+    font-size: 20px;
+    font-weight: bold;
+    cursor: pointer;
+    padding: 8px 14px;
+    border-radius: 6px;
+    transition: all 0.2s;
+    min-width: 40px;
+}
+
+.modal-close-btn:hover {
+    background: #ff0000;
+    transform: scale(1.1);
+}
+
+.modal-footer {
+    display: flex;
+    justify-content: center;
+    padding-top: 25px;
+    margin-top: 25px;
+    border-top: 2px solid #444;
+}
+
+.modal-close-btn-bottom {
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    border: none;
+    color: #fff;
+    font-size: 16px;
+    font-weight: bold;
+    cursor: pointer;
+    padding: 12px 40px;
+    border-radius: 8px;
+    transition: all 0.2s;
+}
+
+.modal-close-btn-bottom:hover {
+    background: linear-gradient(135deg, #764ba2, #667eea);
+    transform: scale(1.05);
+    box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+}
+
+.finding-detail-body {
+    padding: 10px 0;
+}
+
+.finding-detail-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.detail-badges {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.severity-badge {
+    padding: 6px 14px;
+    border-radius: 20px;
+    font-weight: bold;
+    font-size: 14px;
+    text-transform: uppercase;
+}
+
+.severity-critical {
+    background: linear-gradient(135deg, #ff0000, #cc0000);
+    color: #fff;
+}
+
+.severity-high {
+    background: linear-gradient(135deg, #ff6b6b, #d9534f);
+    color: #fff;
+}
+
+.severity-medium {
+    background: linear-gradient(135deg, #f0ad4e, #ec971f);
+    color: #000;
+}
+
+.severity-low {
+    background: linear-gradient(135deg, #5cb85c, #449d44);
+    color: #fff;
+}
+
+.tool-badge {
+    color: #aaa;
+    font-size: 14px;
+}
+
+.detail-field {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.detail-field label {
+    color: #888;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.detail-value {
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 12px 15px;
+    color: #e0e0e0;
+    font-family: 'Monaco', 'Consolas', monospace;
+    font-size: 13px;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.file-path-value {
+    color: #64b5f6;
+}
+
+.secret-value-full {
+    background: #2a1a1a;
+    border-color: #553333;
+    color: #ff9999;
+    max-height: 150px;
+    overflow-y: auto;
+}
+
+.context-value-full {
+    max-height: 300px;
+    overflow-y: auto;
+    line-height: 1.5;
+}
+
+.detail-metadata-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 15px;
+    padding-top: 15px;
+    border-top: 1px solid #333;
+}
+
+.detail-field-small {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.detail-field-small label {
+    color: #888;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+
+.detail-field-small .detail-value {
+    padding: 8px 12px;
+    font-size: 12px;
+}
+
+/* Make table rows look clickable */
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner tr:hover {
+    cursor: pointer;
+    background-color: #3a3a3a !important;
+}
+
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner td:hover {
+    cursor: pointer;
+}
+
+/* ==========================================================================
+   Column Resize Handle Styling
+   ========================================================================== */
+
+/* Make resize handles visible */
+.dash-table-container .column-header--resize {
+    border-right: 2px solid #555 !important;
+    cursor: col-resize !important;
+}
+
+.dash-table-container .column-header--resize:hover {
+    border-right: 3px solid #667eea !important;
+}
+
+.dash-table-container th .column-header-name {
+    cursor: pointer;
+}
+
+/* Resize indicator line */
+.dash-table-container .resizer {
+    width: 5px !important;
+    background: transparent;
+    cursor: col-resize !important;
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+}
+
+.dash-table-container .resizer:hover,
+.dash-table-container .resizer.isResizing {
+    background: #667eea !important;
+}
+
+@media (max-width: 600px) {
+    .detail-metadata-row {
+        grid-template-columns: 1fr;
+    }
+    
+    .detail-modal-content {
+        width: 95% !important;
+        max-height: 90vh !important;
+    }
+}

@@ -28,6 +28,12 @@
     "threads": 4,
     "timeout_seconds": 300,
     "max_file_size_mb": 100,
+    "memory_limit_mb": 512,
+    "trufflehog_concurrency": 2,
+    "trufflehog_max_depth": 5,
+    "gitleaks_max_file_size_mb": 10,
+    "gitleaks_max_depth": 10,
+    "max_findings_per_scan": 10000,
     "supported_extensions": [
       ".py", ".js", ".ts", ".java", ".cpp", ".c", ".h", ".php", ".rb", ".go",
       ".rs", ".swift", ".kt", ".scala", ".clj", ".hs", ".ml", ".txt", ".md",

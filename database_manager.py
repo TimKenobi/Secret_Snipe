@@ -195,6 +195,18 @@ class FindingsManager:
             file_path, secret_type, secret_value, line_number
         )
 
+        # Extract file metadata from metadata dict if present
+        file_modified_at = None
+        file_size = None
+        if metadata:
+            file_modified_at_str = metadata.pop('file_modified_at', None)
+            if file_modified_at_str and file_modified_at_str != 'None':
+                try:
+                    file_modified_at = datetime.fromisoformat(file_modified_at_str.replace(' ', 'T'))
+                except Exception:
+                    pass
+            file_size = metadata.pop('file_size', None)
+
         # Check for existing finding
         existing = self._find_existing_finding(fingerprint)
         if existing:
@@ -203,13 +215,14 @@ class FindingsManager:
             result = self.db.execute_query(query, (existing['id'],))
             return str(result[0]['id']) if result else None
 
-        # Insert new finding
+        # Insert new finding with file metadata
         query = """
             INSERT INTO findings (
                 scan_session_id, project_id, file_path, line_number,
                 secret_type, secret_value, context, severity,
-                confidence_score, tool_source, fingerprint, metadata
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                confidence_score, tool_source, fingerprint, metadata,
+                file_modified_at, file_size
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """
 
@@ -217,7 +230,8 @@ class FindingsManager:
             scan_session_id, project_id, file_path, line_number,
             secret_type, secret_value, context, severity,
             confidence_score, tool_source, fingerprint,
-            json.dumps(metadata or {})
+            json.dumps(metadata or {}),
+            file_modified_at, file_size
         )
 
         result = self.db.execute_query(query, params)
@@ -266,6 +280,155 @@ class FindingsManager:
         else:
             query = "UPDATE findings SET resolution_status = %s WHERE id = %s"
             self.db.execute_update(query, (status, finding_id))
+
+    def mark_as_false_positive(self, finding_ids: List[str], reason: str = None, 
+                               marked_by: str = "user") -> Dict[str, Any]:
+        """Mark one or more findings as false positive
+        
+        Args:
+            finding_ids: List of finding IDs to mark
+            reason: Reason for marking as false positive
+            marked_by: User or system marking the finding
+            
+        Returns:
+            Dict with success count, failed count, and affected file paths
+        """
+        if not finding_ids:
+            return {'success': 0, 'failed': 0, 'affected_files': []}
+        
+        results = {'success': 0, 'failed': 0, 'affected_files': set()}
+        
+        query = """
+            UPDATE findings 
+            SET resolution_status = 'false_positive',
+                fp_reason = %s,
+                fp_marked_by = %s,
+                fp_marked_at = NOW(),
+                resolved_at = NOW(),
+                updated_at = NOW()
+            WHERE id = %s
+            RETURNING file_path
+        """
+        
+        for finding_id in finding_ids:
+            try:
+                result = self.db.execute_query(query, (reason, marked_by, finding_id))
+                if result:
+                    results['success'] += 1
+                    results['affected_files'].add(result[0]['file_path'])
+                else:
+                    results['failed'] += 1
+            except Exception as e:
+                logger.error(f"Error marking finding {finding_id} as FP: {e}")
+                results['failed'] += 1
+        
+        results['affected_files'] = list(results['affected_files'])
+        logger.info(f"Marked {results['success']} findings as false positive")
+        return results
+
+    def restore_from_false_positive(self, finding_ids: List[str]) -> Dict[str, Any]:
+        """Restore findings from false positive back to open
+        
+        Args:
+            finding_ids: List of finding IDs to restore
+            
+        Returns:
+            Dict with success and failed counts
+        """
+        if not finding_ids:
+            return {'success': 0, 'failed': 0}
+        
+        results = {'success': 0, 'failed': 0}
+        
+        query = """
+            UPDATE findings 
+            SET resolution_status = 'open',
+                fp_reason = NULL,
+                fp_marked_by = NULL,
+                fp_marked_at = NULL,
+                resolved_at = NULL,
+                updated_at = NOW()
+            WHERE id = %s AND resolution_status = 'false_positive'
+        """
+        
+        for finding_id in finding_ids:
+            try:
+                affected = self.db.execute_update(query, (finding_id,))
+                if affected > 0:
+                    results['success'] += 1
+                else:
+                    results['failed'] += 1
+            except Exception as e:
+                logger.error(f"Error restoring finding {finding_id}: {e}")
+                results['failed'] += 1
+        
+        logger.info(f"Restored {results['success']} findings from false positive")
+        return results
+
+    def get_false_positive_count(self) -> int:
+        """Get count of false positive findings"""
+        query = "SELECT COUNT(*) as count FROM findings WHERE resolution_status = 'false_positive'"
+        result = self.db.execute_query(query, ())
+        return result[0]['count'] if result else 0
+
+    def get_false_positives(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """Get all false positive findings for review"""
+        query = """
+            SELECT id, file_path, secret_type, secret_value, severity, tool_source,
+                   fp_reason, fp_marked_by, fp_marked_at, first_seen, file_modified_at
+            FROM findings 
+            WHERE resolution_status = 'false_positive'
+            ORDER BY fp_marked_at DESC
+            LIMIT %s
+        """
+        return self.db.execute_query(query, (limit,))
+
+    def check_file_changes_for_fps(self) -> List[Dict[str, Any]]:
+        """Check if files with false positive findings have been modified
+        
+        Returns files that have changed since the false positive was marked,
+        indicating they should be rescanned.
+        """
+        query = """
+            SELECT DISTINCT f.file_path, f.fp_marked_at, f.file_modified_at,
+                   COUNT(*) as fp_count
+            FROM findings f
+            WHERE f.resolution_status = 'false_positive'
+              AND f.file_modified_at IS NOT NULL
+              AND f.fp_marked_at IS NOT NULL
+            GROUP BY f.file_path, f.fp_marked_at, f.file_modified_at
+        """
+        return self.db.execute_query(query, ())
+
+    def reset_fps_for_changed_files(self, file_paths: List[str]) -> int:
+        """Reset false positives for files that have been modified
+        
+        When a file is modified, its previous false positive markings become
+        invalid and should be re-evaluated.
+        """
+        if not file_paths:
+            return 0
+        
+        placeholders = ','.join(['%s'] * len(file_paths))
+        query = f"""
+            UPDATE findings 
+            SET resolution_status = 'open',
+                fp_reason = CONCAT('Auto-reset: file modified since FP marked at ', fp_marked_at::text),
+                updated_at = NOW()
+            WHERE file_path IN ({placeholders})
+              AND resolution_status = 'false_positive'
+        """
+        return self.db.execute_update(query, tuple(file_paths))
+
+    def update_file_metadata(self, finding_id: str, file_modified_at: datetime, 
+                           file_size: int) -> bool:
+        """Update file metadata for a finding (used for change detection)"""
+        query = """
+            UPDATE findings 
+            SET file_modified_at = %s, file_size = %s, updated_at = NOW()
+            WHERE id = %s
+        """
+        return self.db.execute_update(query, (file_modified_at, file_size, finding_id)) > 0
 
     def cleanup_old_findings(self, days_old: int = 30) -> Dict[str, int]:
         """Clean up old findings and related data"""

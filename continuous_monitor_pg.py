@@ -10,6 +10,8 @@ import logging
 import json
 import os
 import threading
+import subprocess
+import signal
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Set
 from datetime import datetime, timedelta
@@ -177,6 +179,14 @@ class ContinuousMonitor:
         # Reporting
         self.last_report_time = datetime.now()
 
+    def _signal_handler(self, signum, frame):
+        logger.info("SIGTERM received; draining queue and stopping observer")
+        self.running = False
+        with self.queue_lock:
+            self.scan_queue.clear()  # Or process remaining
+        if self.observer:
+            self.observer.stop()
+
     def start(self):
         """Start the continuous monitoring service"""
         logger.info(f"Starting continuous monitoring for {self.watch_directory}")
@@ -204,6 +214,28 @@ class ContinuousMonitor:
             logger.error("Failed to initialize monitoring project")
             return False
 
+        # Run initial full scan on startup (optional for large directories)
+        skip_initial_scan = os.getenv('SKIP_INITIAL_SCAN', 'false').lower() == 'true'
+        
+        if skip_initial_scan:
+            logger.info("=== Skipping initial full scan (SKIP_INITIAL_SCAN=true) ===")
+            logger.info("=== Starting real-time file monitoring only ===")
+        else:
+            logger.info("=== Running initial full scan on startup ===")
+            logger.info("=== This may take a while for large directories ===")
+            initial_result = self.orchestrator.run_multi_scan(
+                directory=self.watch_directory,
+                project_name=self.project_name,
+                scanners=['custom', 'gitleaks', 'trufflehog']
+            )
+            if initial_result['success']:
+                logger.info(f"=== Initial scan completed: {initial_result['total_findings']} findings ===")
+                for scanner, result in initial_result['results'].items():
+                    logger.info(f"  {scanner}: {result.get('findings', 0)} findings")
+            else:
+                logger.warning(f"Initial scan had issues: {initial_result.get('error', 'Unknown error')}")
+            logger.info("=== Starting real-time file monitoring ===")
+
         # Start file system monitoring
         self.event_handler = FileChangeHandler(self)
         self.observer = Observer()
@@ -212,6 +244,9 @@ class ContinuousMonitor:
 
         # Schedule weekly reports
         schedule.every().monday.at("09:00").do(self._generate_weekly_report)
+        
+        # Schedule daily cleanup of old data (runs at 2 AM)
+        schedule.every().day.at("02:00").do(self._cleanup_old_data)
 
         self.running = True
         logger.info("Continuous monitoring started successfully")
@@ -264,12 +299,41 @@ class ContinuousMonitor:
     def _scan_changed_files(self, file_paths: List[Path]):
         """Scan changed files using all configured scanners"""
         try:
+            # Reset false positives for changed files
+            # This ensures that if a file marked as FP is modified, it gets re-evaluated
+            try:
+                changed_file_strs = [str(fp) for fp in file_paths if fp.exists()]
+                if changed_file_strs:
+                    reset_count = findings_manager.reset_fps_for_changed_files(changed_file_strs)
+                    if reset_count > 0:
+                        logger.info(f"Reset {reset_count} false positive findings for modified files")
+            except Exception as e:
+                logger.warning(f"Could not reset FPs for changed files: {e}")
+
             # Create a temporary directory with just the changed files
             temp_dir = Path("/tmp/continuous_scan")
             temp_dir.mkdir(exist_ok=True)
 
-            # Copy changed files to temp directory
-            for file_path in file_paths:
+            # Use Git diff for incremental (assume repo; fallback to full if not)
+            changed_files = file_paths[:]  # Default to all
+            try:
+                diff_result = subprocess.run(['git', 'diff', '--name-only', 'HEAD~1'], cwd=str(self.watch_directory), capture_output=True, text=True, timeout=30)
+                git_changed = [f.strip() for f in diff_result.stdout.splitlines() if f.strip()]
+                changed_paths = [self.watch_directory / f for f in git_changed if (self.watch_directory / f).exists()]
+                # Filter to intersection of event changes and git changes
+                changed_files = [f for f in file_paths if f in changed_paths]
+                if not changed_files:
+                    logger.info("No incremental changes detected via Git diff")
+                    return  # No changes
+            except Exception as e:
+                logger.warning(f"Git diff failed, falling back to full event changes: {e}")
+
+            # Scan in-place without temp copy for efficiency (but for specific files, use temp with only changed)
+            temp_dir = Path("/tmp/continuous_scan")
+            temp_dir.mkdir(exist_ok=True)
+
+            copied_count = 0
+            for file_path in changed_files:
                 if file_path.exists():
                     relative_path = file_path.relative_to(self.watch_directory)
                     temp_file = temp_dir / relative_path
@@ -279,11 +343,12 @@ class ContinuousMonitor:
                         # Copy file content
                         with open(file_path, 'rb') as src, open(temp_file, 'wb') as dst:
                             dst.write(src.read())
+                        copied_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to copy {file_path}: {e}")
                         continue
 
-            if any(temp_dir.rglob("*")):  # Check if any files were copied
+            if copied_count > 0:  # Check if any files were copied
                 # Run multi-scanner on temp directory
                 result = self.orchestrator.run_multi_scan(
                     directory=temp_dir,
@@ -292,7 +357,8 @@ class ContinuousMonitor:
                 )
 
                 if result['success']:
-                    logger.info(f"Scanned {len(file_paths)} changed files, found {result['total_findings']} findings")
+                    logger.info(f"Incremental scan progress: {copied_count}/{len(file_paths)} files; {result['total_findings']} findings")
+                    scan_session_manager.update_session_status(self.session_id, 'in_progress', total_findings=result['total_findings'])
 
                     # Check for critical findings and send notifications
                     self._check_critical_findings(result['session_id'])
@@ -466,6 +532,53 @@ class ContinuousMonitor:
 
         except Exception as e:
             logger.error(f"Error sending Teams report: {e}")
+
+    def _cleanup_old_data(self):
+        """Automatically cleanup old data to prevent database bloat
+        
+        This runs daily at 2 AM and removes:
+        - Findings older than 90 days (configurable via CLEANUP_DAYS_OLD env var)
+        - Old scan sessions that are completed/failed
+        - Orphaned records
+        """
+        try:
+            days_old = int(os.getenv('CLEANUP_DAYS_OLD', '90'))
+            cutoff_date = datetime.now() - timedelta(days=days_old)
+            
+            logger.info(f"Starting automatic cleanup of data older than {days_old} days...")
+            
+            # Count before cleanup
+            count_query = "SELECT COUNT(*) as count FROM findings"
+            before_result = db_manager.execute_query(count_query)
+            before_count = before_result[0]['count'] if before_result else 0
+            
+            # Delete old findings (but preserve false positives - they're intentional)
+            delete_findings_query = """
+                DELETE FROM findings
+                WHERE first_seen < %s
+                AND resolution_status != 'false_positive'
+            """
+            db_manager.execute_update(delete_findings_query, (cutoff_date,))
+            
+            # Delete old completed/failed scan sessions
+            delete_sessions_query = """
+                DELETE FROM scan_sessions
+                WHERE created_at < %s
+                AND status IN ('completed', 'failed')
+            """
+            db_manager.execute_update(delete_sessions_query, (cutoff_date,))
+            
+            # Count after cleanup
+            after_result = db_manager.execute_query(count_query)
+            after_count = after_result[0]['count'] if after_result else 0
+            deleted_count = before_count - after_count
+            
+            logger.info(f"Automatic cleanup completed: Removed {deleted_count:,} old findings")
+            logger.info(f"Database now contains {after_count:,} findings")
+            
+        except Exception as e:
+            logger.error(f"Error during automatic cleanup: {e}")
+
 
 def main():
     """Main entry point for continuous monitoring"""

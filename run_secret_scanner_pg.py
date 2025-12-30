@@ -228,20 +228,62 @@ class MultiScannerOrchestrator:
                     finding_data = json.loads(line)
                     
                     # Map detector type to severity
-                    detector_name = finding_data.get('detector_name', 'unknown')
-                    severity = self._get_trufflehog_severity(detector_name, finding_data.get('verified', False))
+                    detector_name = finding_data.get('detector_name', finding_data.get('DetectorName', 'unknown'))
+                    raw_secret = finding_data.get('raw', finding_data.get('Raw', ''))
+                    verified = finding_data.get('verified', finding_data.get('Verified', False))
+                    file_path = finding_data.get('path', finding_data.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', ''))
+                    
+                    severity = self._get_trufflehog_severity(detector_name, verified)
+                    
+                    # Build informative context string
+                    context_parts = []
+                    
+                    # Add verification status
+                    if verified:
+                        context_parts.append("✅ VERIFIED - This secret was confirmed active!")
+                    else:
+                        context_parts.append("⚠️ Unverified - Requires manual review")
+                    
+                    # Add detector info
+                    context_parts.append(f"Detector: {detector_name}")
+                    
+                    # Add redacted preview of the secret
+                    if raw_secret:
+                        preview = raw_secret[:20] + "..." if len(raw_secret) > 20 else raw_secret
+                        # Mask middle portion
+                        if len(preview) > 8:
+                            masked = preview[:4] + "*" * (len(preview) - 8) + preview[-4:]
+                            context_parts.append(f"Secret preview: {masked}")
+                    
+                    # Add extra data if available
+                    extra_data = finding_data.get('ExtraData', finding_data.get('extra_data', {}))
+                    if extra_data and isinstance(extra_data, dict):
+                        for key, value in list(extra_data.items())[:5]:
+                            if value and str(value).strip():
+                                context_parts.append(f"{key}: {str(value)[:100]}")
+                    
+                    context_str = " | ".join(context_parts) if context_parts else finding_data.get('context', f"TruffleHog finding: {detector_name}")
+                    
+                    # Build comprehensive metadata
+                    metadata = {
+                        'verified': verified,
+                        'detector_name': detector_name,
+                        'detector_type': finding_data.get('DetectorType', finding_data.get('detector_type', '')),
+                        'decoder_name': finding_data.get('DecoderName', ''),
+                        'original_data': {k: v for k, v in finding_data.items() if k not in ['Raw', 'raw', 'SourceMetadata']}
+                    }
                     
                     finding_id = findings_manager.insert_finding(
                         scan_session_id=session_id,
                         project_id=project_id,
-                        file_path=finding_data.get('path', ''),
+                        file_path=file_path,
                         secret_type=detector_name,
-                        secret_value=finding_data.get('raw', ''),
-                        context=finding_data.get('context', ''),
+                        secret_value=raw_secret[:500],
+                        context=context_str[:1000],
                         severity=severity,
                         line_number=finding_data.get('line_number'),
                         tool_source='trufflehog',
-                        metadata=finding_data
+                        metadata=metadata
                     )
                     if finding_id:
                         findings_ids.append(finding_id)
@@ -364,6 +406,52 @@ class MultiScannerOrchestrator:
                     # Map severity based on detector type and verification status
                     severity = self._get_trufflehog_severity(detector_name, verified)
                     
+                    # Build informative context string
+                    context_parts = []
+                    
+                    # Add verification status
+                    if verified:
+                        context_parts.append("✅ VERIFIED - This secret was confirmed active!")
+                    else:
+                        context_parts.append("⚠️ Unverified - Requires manual review")
+                    
+                    # Add detector info
+                    context_parts.append(f"Detector: {detector_name}")
+                    
+                    # Add redacted preview of the secret
+                    if raw_secret:
+                        preview = raw_secret[:20] + "..." if len(raw_secret) > 20 else raw_secret
+                        # Mask middle portion
+                        if len(preview) > 8:
+                            masked = preview[:4] + "*" * (len(preview) - 8) + preview[-4:]
+                            context_parts.append(f"Secret preview: {masked}")
+                    
+                    # Add extra data if available
+                    extra_data = finding_data.get('ExtraData', {})
+                    if extra_data and isinstance(extra_data, dict):
+                        for key, value in list(extra_data.items())[:5]:  # Limit to 5 fields
+                            if value and str(value).strip():
+                                context_parts.append(f"{key}: {str(value)[:100]}")
+                    
+                    # Add structured info (like regex name, decoder steps, etc.)
+                    if 'StructuredData' in finding_data:
+                        struct_data = finding_data['StructuredData']
+                        if isinstance(struct_data, dict):
+                            for key, value in list(struct_data.items())[:3]:
+                                context_parts.append(f"{key}: {str(value)[:100]}")
+                    
+                    context_str = " | ".join(context_parts) if context_parts else f"TruffleHog finding: {detector_name}"
+                    
+                    # Build comprehensive metadata
+                    metadata = {
+                        'verified': verified,
+                        'detector_name': detector_name,
+                        'detector_type': finding_data.get('DetectorType', ''),
+                        'decoder_name': finding_data.get('DecoderName', ''),
+                        'source_type': list(data.keys())[0] if data else '',
+                        'extra_data': extra_data if isinstance(extra_data, dict) else {}
+                    }
+                    
                     # Insert finding
                     finding_id = findings_manager.insert_finding(
                         scan_session_id=session_id,
@@ -371,11 +459,11 @@ class MultiScannerOrchestrator:
                         file_path=file_path,
                         secret_type=detector_name,
                         secret_value=raw_secret[:500],  # Truncate large secrets
-                        context=str(finding_data.get('ExtraData', ''))[:1000],
+                        context=context_str[:1000],
                         severity=severity,
                         line_number=None,  # TruffleHog doesn't always provide line numbers
                         tool_source='trufflehog',
-                        metadata={'verified': verified}
+                        metadata=metadata
                     )
                     if finding_id:
                         findings_ids.append(finding_id)

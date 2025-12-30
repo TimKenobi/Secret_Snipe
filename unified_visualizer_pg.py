@@ -403,7 +403,7 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
 
 
 def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all', 
-                          project_filter: str = 'all') -> pd.DataFrame:
+                          project_filter: str = 'all', secret_type_filter: str = 'all') -> pd.DataFrame:
     """Get findings grouped by file path for display efficiency.
     
     Returns a DataFrame with one row per file, containing aggregated finding info.
@@ -422,6 +422,9 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
         if project_filter != 'all':
             conditions.append("p.name = %s")
             params.append(project_filter)
+        if secret_type_filter != 'all':
+            conditions.append("f.secret_type = %s")
+            params.append(secret_type_filter)
         
         where_clause = " AND ".join(conditions)
         
@@ -759,7 +762,7 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Prepare table data - limited to 5000 for performance
+    # Prepare table data - all filtered findings (pagination handled by DataTable)
     table_data = filtered_df.to_dict('records')
 
     # Sanitize table data (truncate long strings for display)
@@ -816,14 +819,14 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         gitleaks_count = len(filtered_df[filtered_df['tool_source'] == 'gitleaks'])
         trufflehog_count = len(filtered_df[filtered_df['tool_source'] == 'trufflehog'])
     
-    total_filtered = len(filtered_df)  # What's shown in table (up to 5000)
+    total_filtered = len(filtered_df)  # What's shown in table after filters
     open_count = len(filtered_df[filtered_df['resolution_status'] == 'open'])
 
     summary_stats = [
         html.Div([
             html.H4("📊 Overview", style={'marginBottom': '10px', 'color': '#60a5fa'}),
             html.Div([html.Strong("Total in Database:"), f" {total_in_db:,}"], className="stat-item"),
-            html.Div([html.Strong("Showing in Table:"), f" {total_filtered:,} (max 5,000)"], className="stat-item"),
+            html.Div([html.Strong("Filtered Results:"), f" {total_filtered:,}"], className="stat-item"),
             html.Div([html.Strong("Open Issues:"), f" {open_count:,}"], className="stat-item"),
         ], style={'marginRight': '30px'}),
         html.Div([
@@ -1397,6 +1400,92 @@ def handle_file_fp_action(mark_clicks, selected_rows, table_data):
     
     except Exception as e:
         logger.error(f"Error marking files as FP: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# File-based Jira Ticket Creation Callback
+@app.callback(
+    Output("file-jira-result", "children"),
+    [Input("btn-create-file-jira", "n_clicks")],
+    [State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
+)
+def create_jira_tickets_for_files(n_clicks, selected_rows, table_data):
+    """Create ONE Jira ticket per selected file, consolidating all findings"""
+    if not n_clicks or not selected_rows or not table_data:
+        return ""
+    
+    # Check if Jira is configured
+    if not jira_manager.is_configured:
+        return html.Span(
+            "⚠️ Jira is not configured. Click 'Jira Settings' to set up the connection.",
+            style={'color': '#f59e0b'}
+        )
+    
+    try:
+        # Get file paths from selected rows
+        selected_files = []
+        for i in selected_rows:
+            if i < len(table_data):
+                file_path = table_data[i].get('file_path')
+                if file_path:
+                    selected_files.append(file_path)
+        
+        if not selected_files:
+            return html.Span("⚠️ No files selected", style={'color': '#f59e0b'})
+        
+        # Get all findings for these files (excluding false positives)
+        all_findings = []
+        for file_path in selected_files:
+            query = """
+                SELECT id, file_path, secret_type, secret_value, severity, 
+                       line_number, tool_source, context, created_at as first_seen
+                FROM findings 
+                WHERE file_path = %s 
+                AND resolution_status != 'false_positive'
+            """
+            results = db_manager.execute_query(query, (file_path,))
+            all_findings.extend([dict(row) for row in results])
+        
+        if not all_findings:
+            return html.Span("⚠️ No valid findings in selected files", style={'color': '#f59e0b'})
+        
+        # Create tickets grouped by file
+        results = jira_manager.create_tickets_by_file(all_findings)
+        
+        success_count = results.get('success_count', 0)
+        failed_count = results.get('failed_count', 0)
+        tickets = results.get('created_tickets', [])
+        
+        if success_count > 0:
+            ticket_links = []
+            for t in tickets[:5]:
+                finding_count = t.get('finding_count', 0)
+                ticket_links.append(
+                    html.A(
+                        f"{t['key']} ({finding_count} findings)", 
+                        href=t['url'], 
+                        target='_blank',
+                        style={'color': '#60a5fa', 'marginRight': '10px'}
+                    )
+                )
+            
+            if len(tickets) > 5:
+                ticket_links.append(html.Span(f"... and {len(tickets) - 5} more"))
+            
+            return html.Div([
+                html.Span(f"✅ Created {success_count} Jira ticket(s): ", style={'color': '#22c55e'}),
+                *ticket_links,
+                html.Span(f" ({failed_count} failed)", style={'color': '#ef4444'}) if failed_count > 0 else ""
+            ])
+        else:
+            errors = results.get('errors', [])
+            error_msg = errors[0].get('error', 'Unknown error') if errors else 'Unknown error'
+            return html.Span(f"❌ Failed: {error_msg}", style={'color': '#ef4444'})
+            
+    except Exception as e:
+        logger.error(f"Error creating file-based Jira tickets: {e}")
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
 
 
@@ -2076,7 +2165,8 @@ def toggle_view_mode(view_mode):
 
 
 @app.callback(
-    Output('file-grouped-table', 'data'),
+    [Output('file-grouped-table', 'data'),
+     Output('file-secret-type-filter', 'options')],
     [Input('tool-tabs', 'value'),
      Input('severity-filter', 'value'),
      Input('project-filter', 'value'),
@@ -2084,26 +2174,49 @@ def toggle_view_mode(view_mode):
      Input('interval-component', 'n_intervals'),
      Input('file-search-input', 'value'),
      Input('file-tool-filter', 'value'),
-     Input('file-severity-filter', 'value')]
+     Input('file-severity-filter', 'value'),
+     Input('file-secret-type-filter', 'value')]
 )
 @secure_callback
 def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh_clicks, n_intervals, 
-                               file_search, file_tool_filter, file_severity_filter):
+                               file_search, file_tool_filter, file_severity_filter, file_secret_type_filter):
     """Update the file-grouped table based on filters"""
     # Use local file filters if set, otherwise use global filters
     tool_filter = file_tool_filter if file_tool_filter and file_tool_filter != 'all' else (
         'all' if tool_tab == 'all-tools' else tool_tab
     )
     sev_filter = file_severity_filter if file_severity_filter and file_severity_filter != 'all' else severity_filter
+    secret_type_filter = file_secret_type_filter if file_secret_type_filter and file_secret_type_filter != 'all' else 'all'
     
     df = get_file_grouped_data(
         tool_filter=sanitize_input(tool_filter or 'all', 50),
         severity_filter=sanitize_input(sev_filter or 'all', 50),
-        project_filter=sanitize_input(project_filter or 'all', 200)
+        project_filter=sanitize_input(project_filter or 'all', 200),
+        secret_type_filter=sanitize_input(secret_type_filter or 'all', 100)
     )
     
     if df.empty:
-        return []
+        # Return empty table and default options
+        secret_type_options = [{"label": "All Secret Types", "value": "all"}]
+        return [], secret_type_options
+    
+    # Get unique secret types from database for dropdown options
+    try:
+        type_query = """
+            SELECT DISTINCT secret_type FROM findings 
+            WHERE resolution_status != 'false_positive' AND secret_type IS NOT NULL
+            ORDER BY secret_type
+        """
+        type_results = db_manager.execute_query(type_query)
+        secret_type_options = [{"label": "All Secret Types", "value": "all"}]
+        if type_results:
+            secret_type_options.extend([
+                {"label": row['secret_type'], "value": row['secret_type']} 
+                for row in type_results
+            ])
+    except Exception as e:
+        logger.warning(f"Error getting secret types: {e}")
+        secret_type_options = [{"label": "All Secret Types", "value": "all"}]
     
     # Apply file search filter
     if file_search and len(file_search) >= 2:
@@ -2146,7 +2259,7 @@ def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh
             'latest_finding': latest_str
         })
     
-    return table_data
+    return table_data, secret_type_options
 
 
 @app.callback(
@@ -2790,6 +2903,16 @@ def create_layout():
                             style={'width': '150px', 'display': 'inline-block', 'marginLeft': '10px'},
                             className="dark-dropdown"
                         ),
+                        dcc.Dropdown(
+                            id='file-secret-type-filter',
+                            options=[{"label": "All Secret Types", "value": "all"}],
+                            value="all",
+                            clearable=False,
+                            searchable=True,
+                            placeholder="Search secret types...",
+                            style={'width': '200px', 'display': 'inline-block', 'marginLeft': '10px'},
+                            className="dark-dropdown"
+                        ),
                     ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px', 'marginBottom': '15px'}),
                 ]),
                 dcc.Loading(
@@ -2889,7 +3012,8 @@ def create_layout():
                             }
                         ),
                     ], style={'display': 'flex', 'justifyContent': 'flex-end', 'marginTop': '15px'}),
-                    html.Div(id='file-action-result', style={'marginTop': '10px', 'textAlign': 'right'})
+                    html.Div(id='file-action-result', style={'marginTop': '10px', 'textAlign': 'right'}),
+                    html.Div(id='file-jira-result', style={'marginTop': '5px', 'textAlign': 'right'})
                 ], style={'padding': '10px 0'})
             ], id='file-grouped-container', style={'display': 'block'}),
             

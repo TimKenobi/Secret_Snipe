@@ -1645,6 +1645,184 @@ def restore_from_fp_viewer(n_clicks, selected_rows, table_data):
         return f"❌ Error: {str(e)}"
 
 
+# =========================================================================
+# Project Management Callbacks
+# =========================================================================
+
+# Import project manager (lazy import to avoid circular deps)
+try:
+    from project_manager import project_manager
+    PROJECT_MANAGER_AVAILABLE = True
+except ImportError:
+    PROJECT_MANAGER_AVAILABLE = False
+    logger.warning("Project manager not available - multi-directory features disabled")
+
+
+@app.callback(
+    [Output("project-manager-modal", "style"),
+     Output("project-directory-list", "children"),
+     Output("scan-dir-selector", "options"),
+     Output("pending-scans-list", "children")],
+    [Input("btn-project-manager", "n_clicks"),
+     Input("close-project-modal-btn", "n_clicks"),
+     Input("btn-add-directory", "n_clicks"),
+     Input("btn-trigger-scan", "n_clicks")],
+    [State("project-manager-modal", "style")],
+    prevent_initial_call=True
+)
+def toggle_project_modal(open_clicks, close_clicks, add_clicks, scan_clicks, current_style):
+    """Toggle project management modal and refresh data"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        raise PreventUpdate
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Default hidden state
+    hidden_style = {
+        'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '30px'
+    }
+    visible_style = {**hidden_style, 'display': 'block'}
+    
+    empty_list = html.P("No directories configured yet.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
+    empty_options = [{"label": "No directories available", "value": ""}]
+    no_pending = html.P("No pending scans.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
+    
+    if trigger_id == "close-project-modal-btn":
+        return hidden_style, empty_list, empty_options, no_pending
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        error_msg = html.P("⚠️ Project manager not initialized. Run the database migration first.", 
+                          style={'color': '#f59e0b'})
+        return visible_style if trigger_id == "btn-project-manager" else hidden_style, error_msg, empty_options, no_pending
+    
+    try:
+        # Get directories
+        directories = project_manager.get_all_directories(active_only=False)
+        
+        # Build directory list UI
+        if directories:
+            dir_items = []
+            for d in directories:
+                status_icon = "✅" if d.is_active else "⏸️"
+                last_scan = d.last_scan_at.strftime('%Y-%m-%d %H:%M') if d.last_scan_at else "Never"
+                dir_items.append(
+                    html.Div([
+                        html.Div([
+                            html.Strong(f"{status_icon} {d.display_name}", style={'color': '#e0e0e0'}),
+                            html.Span(f" ({d.scan_schedule})", style={'color': '#6b7280', 'fontSize': '12px'}),
+                        ]),
+                        html.Div([
+                            html.Span(d.directory_path, style={'color': '#9ca3af', 'fontSize': '12px'}),
+                            html.Span(f" | Last: {last_scan} | Files: {d.total_files:,} | Findings: {d.total_findings:,}",
+                                     style={'color': '#6b7280', 'fontSize': '11px'})
+                        ])
+                    ], style={'padding': '8px', 'borderBottom': '1px solid #444', 'marginBottom': '5px'})
+                )
+            directory_list = html.Div(dir_items)
+            
+            # Build dropdown options
+            dropdown_options = [
+                {"label": f"{d.display_name} ({d.directory_path})", "value": d.id}
+                for d in directories if d.is_active
+            ]
+        else:
+            directory_list = empty_list
+            dropdown_options = empty_options
+        
+        # Get pending scans
+        pending = project_manager.get_pending_scans()
+        if pending:
+            pending_items = []
+            for p in pending:
+                status_color = {'pending': '#f59e0b', 'queued': '#3b82f6', 'running': '#22c55e'}.get(p.status, '#6b7280')
+                pending_items.append(
+                    html.Div([
+                        html.Span(f"⏳ {p.scan_type}", style={'color': status_color, 'fontWeight': 'bold'}),
+                        html.Span(f" - {p.status}", style={'color': '#9ca3af'}),
+                        html.Span(f" (requested {p.requested_at.strftime('%H:%M')})", style={'color': '#6b7280', 'fontSize': '11px'})
+                    ], style={'padding': '5px', 'borderBottom': '1px solid #333'})
+                )
+            pending_list = html.Div(pending_items)
+        else:
+            pending_list = no_pending
+        
+        # Show modal if opened
+        if trigger_id == "btn-project-manager":
+            return visible_style, directory_list, dropdown_options, pending_list
+        else:
+            # Refresh data after add/scan actions
+            return current_style, directory_list, dropdown_options, pending_list
+            
+    except Exception as e:
+        logger.error(f"Error in project modal: {e}")
+        error_msg = html.P(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+        return visible_style if trigger_id == "btn-project-manager" else current_style, error_msg, empty_options, no_pending
+
+
+@app.callback(
+    Output("add-dir-result", "children"),
+    [Input("btn-add-directory", "n_clicks")],
+    [State("new-dir-path", "value"),
+     State("new-dir-name", "value"),
+     State("new-dir-schedule", "value"),
+     State("new-dir-priority", "value")],
+    prevent_initial_call=True
+)
+def add_directory(n_clicks, path, name, schedule, priority):
+    """Add a new scan directory"""
+    if not n_clicks or not path or not name:
+        return html.Span("⚠️ Path and name are required", style={'color': '#f59e0b'})
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        return html.Span("⚠️ Run database migration first", style={'color': '#f59e0b'})
+    
+    try:
+        dir_id = project_manager.add_directory(
+            directory_path=path,
+            display_name=name,
+            scan_schedule=schedule,
+            scan_priority=priority
+        )
+        if dir_id:
+            return html.Span(f"✅ Added directory: {name}", style={'color': '#22c55e'})
+        else:
+            return html.Span("❌ Failed to add directory", style={'color': '#ef4444'})
+    except Exception as e:
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+@app.callback(
+    Output("trigger-scan-result", "children"),
+    [Input("btn-trigger-scan", "n_clicks")],
+    [State("scan-dir-selector", "value"),
+     State("scan-type-selector", "value")],
+    prevent_initial_call=True
+)
+def trigger_manual_scan(n_clicks, directory_id, scan_type):
+    """Trigger a manual scan for selected directory"""
+    if not n_clicks or not directory_id:
+        return html.Span("⚠️ Select a directory first", style={'color': '#f59e0b'})
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        return html.Span("⚠️ Run database migration first", style={'color': '#f59e0b'})
+    
+    try:
+        request_id = project_manager.request_scan(
+            directory_id=directory_id,
+            scan_type=scan_type,
+            requested_by="dashboard_user"
+        )
+        if request_id:
+            return html.Span(f"✅ Scan queued! Request ID: {request_id[:8]}...", style={'color': '#22c55e'})
+        else:
+            return html.Span("❌ Failed to queue scan", style={'color': '#ef4444'})
+    except Exception as e:
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
 # Jira Integration Callbacks
 @app.callback(
     [Output("jira-settings-modal", "style"),
@@ -2573,12 +2751,14 @@ def create_layout():
                 html.Div([
                     # Scan controls - Dark mode is now permanently enabled
                     html.Div([
-                        html.Button("� Refresh Data", id="refresh-btn", className="refresh-btn",
+                        html.Button("🔄 Refresh Data", id="refresh-btn", className="refresh-btn",
                             title="Refresh findings data from database"),
                         html.Button("🔍 Quick Scan", id="quick-scan-btn", className="scan-btn",
                             title="Run all scanners on /scan directory (custom + gitleaks + trufflehog)"),
                         html.Button("📁 Custom Scan", id="custom-scan-btn", className="scan-btn",
                             title="Configure and run a custom scan with specific settings"),
+                        html.Button("📂 Projects", id="btn-project-manager", className="scan-btn",
+                            title="Manage scan directories and projects"),
                         html.Button("🧹 Cleanup Old Data", id="cleanup-btn", className="cleanup-btn",
                             title="Remove findings older than 30 days to free up database space")
                     ], className="control-item")
@@ -3314,6 +3494,181 @@ def create_layout():
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
                     'zIndex': '1000', 'paddingTop': '50px'
+                }),
+                
+                # Project Management Modal
+                html.Div([
+                    html.Div([
+                        html.Div([
+                            html.H2("📂 Project & Directory Management", style={'margin': '0', 'color': '#60a5fa'}),
+                            html.Button("✕", id='close-project-modal-btn', n_clicks=0, style={
+                                'background': 'none', 'border': 'none', 'color': '#aaa',
+                                'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                            })
+                        ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                        
+                        html.P("Manage multiple scan directories and trigger custom scans.", 
+                               style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                        
+                        # Directory List Section
+                        html.Div([
+                            html.H4("📁 Scan Directories", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                            html.Div(id='project-directory-list', style={
+                                'maxHeight': '200px', 'overflowY': 'auto', 'marginBottom': '15px',
+                                'border': '1px solid #444', 'borderRadius': '6px', 'padding': '10px'
+                            }),
+                        ]),
+                        
+                        # Add New Directory Section
+                        html.Div([
+                            html.H4("➕ Add New Directory", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                            html.Div([
+                                html.Label("Directory Path:", style={'color': '#e0e0e0'}),
+                                dcc.Input(
+                                    id='new-dir-path',
+                                    type='text',
+                                    placeholder='/path/to/scan (e.g., /scan/newproject)',
+                                    style={
+                                        'width': '100%', 'padding': '8px', 'marginBottom': '10px',
+                                        'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
+                                        'border': '1px solid #555', 'borderRadius': '4px'
+                                    }
+                                ),
+                            ]),
+                            html.Div([
+                                html.Label("Display Name:", style={'color': '#e0e0e0'}),
+                                dcc.Input(
+                                    id='new-dir-name',
+                                    type='text',
+                                    placeholder='My Project Name',
+                                    style={
+                                        'width': '100%', 'padding': '8px', 'marginBottom': '10px',
+                                        'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
+                                        'border': '1px solid #555', 'borderRadius': '4px'
+                                    }
+                                ),
+                            ]),
+                            html.Div([
+                                html.Div([
+                                    html.Label("Scan Schedule:", style={'color': '#e0e0e0'}),
+                                    dcc.Dropdown(
+                                        id='new-dir-schedule',
+                                        options=[
+                                            {'label': 'Manual Only', 'value': 'manual'},
+                                            {'label': 'Hourly', 'value': 'hourly'},
+                                            {'label': 'Daily', 'value': 'daily'},
+                                            {'label': 'Weekly', 'value': 'weekly'}
+                                        ],
+                                        value='daily',
+                                        clearable=False,
+                                        style={'width': '150px'},
+                                        className="dark-dropdown"
+                                    ),
+                                ], style={'display': 'inline-block', 'marginRight': '20px'}),
+                                html.Div([
+                                    html.Label("Priority:", style={'color': '#e0e0e0'}),
+                                    dcc.Dropdown(
+                                        id='new-dir-priority',
+                                        options=[
+                                            {'label': '1 (Highest)', 'value': 1},
+                                            {'label': '2', 'value': 2},
+                                            {'label': '3', 'value': 3},
+                                            {'label': '4', 'value': 4},
+                                            {'label': '5 (Normal)', 'value': 5},
+                                            {'label': '6', 'value': 6},
+                                            {'label': '7', 'value': 7},
+                                            {'label': '8', 'value': 8},
+                                            {'label': '9', 'value': 9},
+                                            {'label': '10 (Lowest)', 'value': 10}
+                                        ],
+                                        value=5,
+                                        clearable=False,
+                                        style={'width': '130px'},
+                                        className="dark-dropdown"
+                                    ),
+                                ], style={'display': 'inline-block'}),
+                            ], style={'marginBottom': '15px'}),
+                            html.Button(
+                                "➕ Add Directory",
+                                id='btn-add-directory',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#22c55e', 'color': 'white',
+                                    'border': 'none', 'padding': '8px 16px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'fontWeight': 'bold'
+                                }
+                            ),
+                            html.Div(id='add-dir-result', style={'marginTop': '10px'})
+                        ], style={
+                            'backgroundColor': '#1f2937', 'padding': '15px',
+                            'borderRadius': '8px', 'marginBottom': '20px'
+                        }),
+                        
+                        # Scan Controls Section
+                        html.Div([
+                            html.H4("🔍 Trigger Manual Scan", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                            html.Div([
+                                dcc.Dropdown(
+                                    id='scan-dir-selector',
+                                    options=[],
+                                    placeholder='Select directory to scan...',
+                                    style={'width': '250px', 'display': 'inline-block', 'marginRight': '10px'},
+                                    className="dark-dropdown"
+                                ),
+                                dcc.Dropdown(
+                                    id='scan-type-selector',
+                                    options=[
+                                        {'label': '🔄 Full Scan (All Tools)', 'value': 'full'},
+                                        {'label': '📝 Incremental', 'value': 'incremental'},
+                                        {'label': '🔍 Custom Scanner Only', 'value': 'custom_only'},
+                                        {'label': '🐷 TruffleHog Only', 'value': 'trufflehog_only'},
+                                        {'label': '🔐 Gitleaks Only', 'value': 'gitleaks_only'}
+                                    ],
+                                    value='full',
+                                    clearable=False,
+                                    style={'width': '180px', 'display': 'inline-block', 'marginRight': '10px'},
+                                    className="dark-dropdown"
+                                ),
+                                html.Button(
+                                    "▶️ Start Scan",
+                                    id='btn-trigger-scan',
+                                    n_clicks=0,
+                                    style={
+                                        'backgroundColor': '#3b82f6', 'color': 'white',
+                                        'border': 'none', 'padding': '8px 16px',
+                                        'borderRadius': '6px', 'cursor': 'pointer',
+                                        'fontWeight': 'bold'
+                                    }
+                                ),
+                            ], style={'marginBottom': '10px'}),
+                            html.Div(id='trigger-scan-result', style={'marginTop': '10px'})
+                        ], style={
+                            'backgroundColor': '#1f2937', 'padding': '15px',
+                            'borderRadius': '8px', 'marginBottom': '20px'
+                        }),
+                        
+                        # Pending Scans Section
+                        html.Div([
+                            html.H4("⏳ Pending/Running Scans", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                            html.Div(id='pending-scans-list', style={
+                                'maxHeight': '150px', 'overflowY': 'auto'
+                            })
+                        ], style={
+                            'backgroundColor': '#1f2937', 'padding': '15px',
+                            'borderRadius': '8px'
+                        }),
+                        
+                    ], style={
+                        'backgroundColor': '#2d3748', 'padding': '25px',
+                        'borderRadius': '8px', 'maxWidth': '700px',
+                        'margin': '0 auto', 'border': '1px solid #555',
+                        'maxHeight': '85vh', 'overflowY': 'auto'
+                    })
+                ], id='project-manager-modal', style={
+                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                    'zIndex': '1000', 'paddingTop': '30px'
                 }),
                 
                 # False Positives Viewer Modal

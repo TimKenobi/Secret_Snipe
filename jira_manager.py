@@ -260,6 +260,181 @@ class JiraManager:
         
         return results
     
+    def create_tickets_by_file(self, findings: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create ONE Jira ticket per file, consolidating all findings in that file.
+        
+        This is useful when you want to create fewer tickets, with each ticket
+        containing all secrets found in a single file.
+        """
+        from collections import defaultdict
+        
+        results = {
+            "success_count": 0,
+            "failed_count": 0,
+            "created_tickets": [],
+            "errors": [],
+            "files_processed": 0
+        }
+        
+        # Group findings by file path
+        findings_by_file = defaultdict(list)
+        for finding in findings:
+            file_path = finding.get('file_path', 'Unknown')
+            findings_by_file[file_path].append(finding)
+        
+        results["files_processed"] = len(findings_by_file)
+        
+        for file_path, file_findings in findings_by_file.items():
+            try:
+                # Determine highest severity among findings in this file
+                severity_order = {'Critical': 4, 'High': 3, 'Medium': 2, 'Low': 1, 'Info': 0}
+                max_severity = max(file_findings, key=lambda f: severity_order.get(f.get('severity', 'Medium'), 2))
+                highest_severity = max_severity.get('severity', 'Medium')
+                
+                # Get unique secret types
+                secret_types = list(set(f.get('secret_type', 'Unknown') for f in file_findings))
+                secret_types_str = ', '.join(secret_types[:3])
+                if len(secret_types) > 3:
+                    secret_types_str += f" (+{len(secret_types) - 3} more)"
+                
+                # Build summary
+                file_display = file_path[-57:] if len(file_path) > 60 else file_path
+                if len(file_path) > 60:
+                    file_display = "..." + file_display
+                
+                summary = f"[{highest_severity}] {len(file_findings)} Secret(s) in {file_display}"
+                if len(summary) > 250:
+                    summary = summary[:247] + "..."
+                
+                # Build consolidated description
+                description = self._build_file_ticket_description(file_path, file_findings, highest_severity)
+                
+                # Create ticket
+                priority = self._severity_to_priority(highest_severity)
+                ticket = JiraTicket(
+                    summary=summary,
+                    description=description,
+                    project_key=self.config.project_key,
+                    issue_type=self.config.issue_type,
+                    priority=priority,
+                    labels=self.config.labels.copy(),
+                    custom_fields=self.config.custom_fields
+                )
+                ticket.labels.append(f"severity-{highest_severity.lower()}")
+                ticket.labels.append("multi-secret-file")
+                
+                result = self._create_ticket(ticket)
+                
+                if result.get("success"):
+                    results["success_count"] += 1
+                    results["created_tickets"].append({
+                        "key": result.get("key"),
+                        "url": result.get("url"),
+                        "file_path": file_path,
+                        "finding_count": len(file_findings),
+                        "finding_ids": [f.get('id') for f in file_findings]
+                    })
+                    
+                    # Link ticket to all findings in this file
+                    for finding in file_findings:
+                        if finding.get('id'):
+                            self.link_ticket_to_finding(finding['id'], result.get("key"), result.get("url"))
+                else:
+                    results["failed_count"] += 1
+                    results["errors"].append({
+                        "file_path": file_path,
+                        "error": result.get("error")
+                    })
+                    
+            except Exception as e:
+                logger.error(f"Error creating ticket for file {file_path}: {e}")
+                results["failed_count"] += 1
+                results["errors"].append({
+                    "file_path": file_path,
+                    "error": str(e)
+                })
+        
+        return results
+    
+    def _build_file_ticket_description(self, file_path: str, findings: List[Dict[str, Any]], highest_severity: str) -> str:
+        """Build a Jira ticket description for multiple findings in a single file"""
+        from datetime import datetime
+        
+        lines = [
+            "h2. Security Findings Summary",
+            "",
+            f"*File:* {{noformat}}{file_path}{{noformat}}",
+            f"*Total Secrets Found:* {len(findings)}",
+            f"*Highest Severity:* {highest_severity}",
+            "",
+            "h2. Detected Secrets",
+            ""
+        ]
+        
+        # Group findings by secret type for cleaner display
+        from collections import Counter
+        severity_counts = Counter(f.get('severity', 'Unknown') for f in findings)
+        type_counts = Counter(f.get('secret_type', 'Unknown') for f in findings)
+        
+        lines.append("h3. Severity Breakdown")
+        lines.append("||Severity||Count||")
+        for sev in ['Critical', 'High', 'Medium', 'Low', 'Info']:
+            if severity_counts.get(sev, 0) > 0:
+                lines.append(f"|{sev}|{severity_counts[sev]}|")
+        
+        lines.append("")
+        lines.append("h3. Secret Types Found")
+        lines.append("||Type||Count||")
+        for secret_type, count in type_counts.most_common(10):
+            lines.append(f"|{secret_type}|{count}|")
+        
+        lines.append("")
+        lines.append("h2. Finding Details")
+        lines.append("")
+        
+        # List each finding (limit to first 20 to avoid huge tickets)
+        for i, finding in enumerate(findings[:20], 1):
+            secret_type = finding.get('secret_type', 'Unknown')
+            severity = finding.get('severity', 'Unknown')
+            line_num = finding.get('line_number', 'N/A')
+            tool = finding.get('tool_source', 'unknown')
+            context = finding.get('context', '')[:200]
+            
+            # Mask secret value
+            secret_value = finding.get('secret_value', '')
+            if len(secret_value) > 8:
+                masked = secret_value[:4] + "*" * min(len(secret_value) - 8, 16) + secret_value[-4:]
+            else:
+                masked = "*" * len(secret_value) if secret_value else "N/A"
+            
+            lines.append(f"h4. Finding #{i}: {secret_type}")
+            lines.append(f"* *Severity:* {severity}")
+            lines.append(f"* *Line:* {line_num}")
+            lines.append(f"* *Tool:* {tool}")
+            lines.append(f"* *Secret (masked):* {{noformat}}{masked[:50]}{{noformat}}")
+            if context:
+                lines.append(f"* *Context:* {context}")
+            lines.append("")
+        
+        if len(findings) > 20:
+            lines.append(f"_... and {len(findings) - 20} more findings. See dashboard for full details._")
+            lines.append("")
+        
+        # Remediation guidance
+        lines.extend([
+            "h2. Recommended Actions",
+            "# Rotate ALL exposed credentials immediately",
+            "# Remove secrets from the file",
+            "# Use environment variables or a secrets manager",
+            "# Review git history for these secrets",
+            "# Audit access logs for unauthorized usage",
+            "",
+            "----",
+            f"_Generated by SecretSnipe on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
+        ])
+        
+        return "\n".join(lines)
+
     def _build_ticket_description(self, finding: Dict[str, Any]) -> str:
         """Build a detailed Jira ticket description from a finding"""
         # Use Jira markup format

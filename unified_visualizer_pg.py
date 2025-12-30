@@ -236,7 +236,7 @@ def handle_logout():
 data_cache = {
     'findings_df': None,
     'last_update': None,
-    'cache_duration': timedelta(minutes=5),
+    'cache_duration': timedelta(minutes=5),  # 5 minute cache for better performance
     'access_log': [],
     'rate_limits': {}
 }
@@ -363,8 +363,8 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
         return data_cache['findings_df']
 
     try:
-        # Secure parameterized query to prevent SQL injection
-        # Limit to 5000 most recent for performance - stats come from separate count queries
+        # Get ALL findings without limit - use efficient query
+        # Pagination is handled at display level, not query level
         query = """
             SELECT
                 f.id, f.file_path, f.secret_type, f.secret_value, f.context, f.severity, f.tool_source,
@@ -375,7 +375,6 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
             JOIN projects p ON f.project_id = p.id
             JOIN scan_sessions ss ON f.scan_session_id = ss.id
             ORDER BY f.first_seen DESC
-            LIMIT 5000
         """
 
         findings = db_manager.execute_query(query)
@@ -402,6 +401,150 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
         audit_log('data_fetch_error', 'system', {'error': str(e)})
         return pd.DataFrame()
 
+
+def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all', 
+                          project_filter: str = 'all') -> pd.DataFrame:
+    """Get findings grouped by file path for display efficiency.
+    
+    Returns a DataFrame with one row per file, containing aggregated finding info.
+    """
+    try:
+        # Build dynamic WHERE clause
+        conditions = ["f.resolution_status != 'false_positive'"]
+        params = []
+        
+        if tool_filter != 'all':
+            conditions.append("f.tool_source = %s")
+            params.append(tool_filter)
+        if severity_filter != 'all':
+            conditions.append("f.severity = %s")
+            params.append(severity_filter)
+        if project_filter != 'all':
+            conditions.append("p.name = %s")
+            params.append(project_filter)
+        
+        where_clause = " AND ".join(conditions)
+        
+        query = f"""
+            SELECT 
+                f.file_path,
+                COUNT(*) as finding_count,
+                array_agg(DISTINCT f.tool_source) as tools,
+                array_agg(DISTINCT f.severity) as severities,
+                array_agg(DISTINCT f.secret_type) as secret_types,
+                MAX(f.severity) as max_severity,
+                MAX(f.first_seen) as latest_finding,
+                MIN(f.first_seen) as earliest_finding,
+                p.name as project_name
+            FROM findings f
+            JOIN projects p ON f.project_id = p.id
+            WHERE {where_clause}
+            GROUP BY f.file_path, p.name
+            ORDER BY 
+                CASE MAX(f.severity)
+                    WHEN 'Critical' THEN 1
+                    WHEN 'High' THEN 2
+                    WHEN 'Medium' THEN 3
+                    WHEN 'Low' THEN 4
+                    ELSE 5
+                END,
+                COUNT(*) DESC
+        """
+        
+        results = db_manager.execute_query(query, tuple(params) if params else None)
+        
+        if results:
+            df = pd.DataFrame(results)
+            # Convert PostgreSQL arrays to Python lists for display
+            for col in ['tools', 'severities', 'secret_types']:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: list(x) if x else [])
+            return df
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error getting file-grouped data: {e}")
+        return pd.DataFrame()
+
+
+def get_findings_for_file(file_path: str) -> List[Dict[str, Any]]:
+    """Get all findings for a specific file path."""
+    try:
+        query = """
+            SELECT 
+                f.id, f.secret_type, f.secret_value, f.context, f.severity, 
+                f.tool_source, f.first_seen, f.confidence_score, f.resolution_status,
+                f.line_number
+            FROM findings f
+            WHERE f.file_path = %s AND f.resolution_status != 'false_positive'
+            ORDER BY 
+                CASE f.severity
+                    WHEN 'Critical' THEN 1
+                    WHEN 'High' THEN 2
+                    WHEN 'Medium' THEN 3
+                    WHEN 'Low' THEN 4
+                    ELSE 5
+                END,
+                f.first_seen DESC
+        """
+        return db_manager.execute_query(query, (file_path,))
+    except Exception as e:
+        logger.error(f"Error getting findings for file {file_path}: {e}")
+        return []
+
+
+def get_tool_summary_stats() -> Dict[str, Dict[str, Any]]:
+    """Get summary statistics per tool for the separate tool sections."""
+    try:
+        query = """
+            SELECT 
+                f.tool_source,
+                COUNT(*) as total_findings,
+                COUNT(DISTINCT f.file_path) as unique_files,
+                SUM(CASE WHEN f.severity = 'Critical' THEN 1 ELSE 0 END) as critical_count,
+                SUM(CASE WHEN f.severity = 'High' THEN 1 ELSE 0 END) as high_count,
+                SUM(CASE WHEN f.severity = 'Medium' THEN 1 ELSE 0 END) as medium_count,
+                SUM(CASE WHEN f.severity = 'Low' THEN 1 ELSE 0 END) as low_count,
+                MAX(f.first_seen) as last_finding_date
+            FROM findings f
+            WHERE f.resolution_status != 'false_positive'
+            GROUP BY f.tool_source
+        """
+        results = db_manager.execute_query(query)
+        
+        stats = {}
+        for row in results:
+            stats[row['tool_source']] = {
+                'total_findings': row['total_findings'],
+                'unique_files': row['unique_files'],
+                'critical': row['critical_count'],
+                'high': row['high_count'],
+                'medium': row['medium_count'],
+                'low': row['low_count'],
+                'last_finding': row['last_finding_date']
+            }
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting tool summary stats: {e}")
+        return {}
+
+
+def get_distinct_secret_types() -> list:
+    """Get distinct secret types from the database for dropdown filter."""
+    try:
+        query = """
+            SELECT DISTINCT secret_type 
+            FROM findings 
+            WHERE secret_type IS NOT NULL AND secret_type != ''
+            ORDER BY secret_type
+        """
+        results = db_manager.execute_query(query)
+        return [row['secret_type'] for row in results if row['secret_type']]
+    except Exception as e:
+        logger.error(f"Error getting distinct secret types: {e}")
+        return []
+
+
 # Layout definition moved to the complete create_layout function below
 
 # Callbacks
@@ -414,21 +557,26 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
      Output("summary-stats", "children"),
      Output("last-update", "children"),
      Output("project-filter", "options"),
-     Output("fp-count-badge", "children")],
+     Output("fp-count-badge", "children"),
+     Output("secret-type-filter", "options")],
     [Input("severity-filter", "value"),
      Input("tool-filter", "value"),
      Input("project-filter", "value"),
+     Input("secret-type-filter", "value"),
+     Input("chart-tool-tabs", "value"),
      Input("refresh-btn", "n_clicks"),
      Input("interval-component", "n_intervals")]
 )
 @secure_callback
-def update_dashboard(severity_filter, tool_filter, project_filter, refresh_clicks, n_intervals):
+def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_filter, chart_tool_filter, refresh_clicks, n_intervals):
     """Update all dashboard components with permanent dark mode and security validation"""
 
     # Sanitize all input parameters
     severity_filter = sanitize_input(severity_filter or "all", 100)
     tool_filter = sanitize_input(tool_filter or "all", 100)
     project_filter = sanitize_input(project_filter or "all", 100)
+    secret_type_filter = sanitize_input(secret_type_filter or "all", 200)
+    chart_tool_filter = sanitize_input(chart_tool_filter or "all", 100)
 
     # Validate filter values
     valid_severities = ['all', 'Critical', 'High', 'Medium', 'Low']
@@ -489,7 +637,7 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
             paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
             plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
         )
-        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge
+        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge, [{"label": "All Secret Types", "value": "all"}]
 
     # Apply filters with validation
     filtered_df = df.copy()
@@ -510,12 +658,23 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
         if project_filter in available_projects:
             filtered_df = filtered_df[filtered_df['project_name'] == project_filter]
 
-    # Create severity chart
-    severity_counts = filtered_df['severity'].value_counts()
+    if secret_type_filter != "all":
+        filtered_df = filtered_df[filtered_df['secret_type'] == secret_type_filter]
+
+    # Apply chart-specific tool filter (for the chart tabs)
+    chart_df = filtered_df.copy()
+    if chart_tool_filter != "all":
+        chart_df = chart_df[chart_df['tool_source'] == chart_tool_filter]
+
+    # Create severity chart (uses chart_df which includes chart tool filter)
+    severity_counts = chart_df['severity'].value_counts()
+    tool_label = {'all': 'All Tools', 'custom': 'Custom Scanner', 'trufflehog': 'TruffleHog', 'gitleaks': 'Gitleaks'}
+    chart_title_suffix = f" - {tool_label.get(chart_tool_filter, 'All Tools')}" if chart_tool_filter != 'all' else ''
+    
     severity_chart = px.bar(
         x=severity_counts.index,
         y=severity_counts.values,
-        title="Findings by Severity",
+        title=f"Findings by Severity{chart_title_suffix}",
         labels={'x': 'Severity', 'y': 'Count'},
         color=severity_counts.index,
         color_discrete_map=severity_colors,
@@ -528,16 +687,26 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create tool distribution chart
-    tool_counts = filtered_df['tool_source'].value_counts()
-    
-    tool_chart = px.pie(
-        values=tool_counts.values,
-        names=tool_counts.index,
-        title="Findings by Tool Source",
-        color_discrete_sequence=tool_colors,
-        template=template
-    )
+    # Create tool distribution chart (uses chart_df if filtered, otherwise show tool breakdown)
+    if chart_tool_filter != 'all':
+        # When filtered to a single tool, show secret types instead
+        secret_type_counts = chart_df['secret_type'].value_counts().head(10)  # Top 10 secret types
+        tool_chart = px.pie(
+            values=secret_type_counts.values,
+            names=secret_type_counts.index,
+            title=f"Secret Types - {tool_label.get(chart_tool_filter, 'Selected Tool')}",
+            color_discrete_sequence=tool_colors,
+            template=template
+        )
+    else:
+        tool_counts = chart_df['tool_source'].value_counts()
+        tool_chart = px.pie(
+            values=tool_counts.values,
+            names=tool_counts.index,
+            title="Findings by Tool Source",
+            color_discrete_sequence=tool_colors,
+            template=template
+        )
     tool_chart.update_layout(
         showlegend=True,
         margin=dict(l=50, r=50, t=50, b=50),
@@ -684,8 +853,13 @@ def update_dashboard(severity_filter, tool_filter, project_filter, refresh_click
             for project in sorted(projects)
         ])
 
+    # Get distinct secret types for the dropdown filter
+    secret_types = get_distinct_secret_types()
+    secret_type_options = [{"label": "All Secret Types", "value": "all"}]
+    secret_type_options.extend([{"label": st, "value": st} for st in secret_types])
+
     return (severity_chart, tool_chart, timeline_chart, file_types_chart,
-            table_data, summary_stats, last_update, project_options, fp_badge)
+            table_data, summary_stats, last_update, project_options, fp_badge, secret_type_options)
 
 # New Callbacks for Enhanced Features
 
@@ -826,6 +1000,34 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
     return current_class or "modal-container", []
 
 
+# Quick date range buttons callback
+@app.callback(
+    [Output("report-date-range", "start_date"),
+     Output("report-date-range", "end_date")],
+    [Input("btn-last-7-days", "n_clicks"),
+     Input("btn-last-30-days", "n_clicks"),
+     Input("btn-all-time", "n_clicks")],
+    prevent_initial_call=True
+)
+def update_date_range(last_7, last_30, all_time):
+    """Update date range based on quick select buttons"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return no_update, no_update
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    today = datetime.now()
+    
+    if trigger_id == "btn-last-7-days":
+        return today - timedelta(days=7), today
+    elif trigger_id == "btn-last-30-days":
+        return today - timedelta(days=30), today
+    elif trigger_id == "btn-all-time":
+        return today - timedelta(days=365), today
+    
+    return no_update, no_update
+
+
 @app.callback(
     Output("report-download", "data"),
     [Input("export-csv-btn", "n_clicks"),
@@ -834,11 +1036,12 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
     [State("report-severity-filter", "value"),
      State("report-date-range", "start_date"),
      State("report-date-range", "end_date"),
+     State("report-tool-filter", "value"),
      State("severity-filter", "value"),
      State("tool-filter", "value")]
 )
 @secure_callback
-def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_date, end_date, severity_filter, tool_filter):
+def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_date, end_date, report_tool, severity_filter, tool_filter):
     """Export customized reports with enhanced filtering and formatting"""
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -858,8 +1061,11 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
             df = df[df['severity'].isin(report_severities)]
         elif severity_filter and severity_filter != "all":
             df = df[df['severity'] == severity_filter]
-            
-        if tool_filter and tool_filter != "all":
+        
+        # Apply report tool filter (takes priority over global filter)
+        if report_tool and report_tool != "all":
+            df = df[df['tool_source'] == report_tool]
+        elif tool_filter and tool_filter != "all":
             df = df[df['tool_source'] == tool_filter]
             
         if start_date:
@@ -1133,17 +1339,79 @@ def handle_fp_actions(confirm_clicks, restore_clicks, selected_ids_for_fp, fp_re
     return "", {'display': 'none'}, selected_rows
 
 
+# File-based False Positive Management Callbacks
+@app.callback(
+    Output("file-action-result", "children"),
+    [Input("btn-mark-file-fp", "n_clicks")],
+    [State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
+)
+def handle_file_fp_action(mark_clicks, selected_rows, table_data):
+    """Handle marking all findings in selected files as false positives"""
+    if not mark_clicks or not selected_rows or not table_data:
+        return ""
+    
+    try:
+        # Get file paths from selected rows
+        selected_files = []
+        for i in selected_rows:
+            if i < len(table_data):
+                file_path = table_data[i].get('file_path')
+                if file_path:
+                    selected_files.append(file_path)
+        
+        if not selected_files:
+            return html.Span("⚠️ No files selected", style={'color': '#f59e0b'})
+        
+        # Get all finding IDs for these files
+        total_marked = 0
+        for file_path in selected_files:
+            query = """
+                SELECT id FROM findings 
+                WHERE file_path = %s 
+                AND resolution_status != 'false_positive'
+            """
+            results = db_manager.execute_query(query, (file_path,))
+            finding_ids = [row['id'] for row in results]
+            
+            if finding_ids:
+                result = findings_manager.mark_as_false_positive(
+                    finding_ids=finding_ids,
+                    reason=f"Bulk marked via file view: {file_path}",
+                    marked_by="dashboard_user"
+                )
+                total_marked += result.get('success', 0)
+        
+        # Force cache refresh
+        data_cache['findings_df'] = None
+        data_cache['last_update'] = None
+        
+        if total_marked > 0:
+            return html.Span(
+                f"✅ Marked {total_marked} findings in {len(selected_files)} file(s) as false positive",
+                style={'color': '#22c55e', 'fontWeight': 'bold'}
+            )
+        else:
+            return html.Span("⚠️ No findings to mark", style={'color': '#f59e0b'})
+    
+    except Exception as e:
+        logger.error(f"Error marking files as FP: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
 # False Positives Viewer Modal Callbacks
 @app.callback(
     [Output("fp-viewer-modal", "style"),
      Output("fp-viewer-table-container", "children")],
     [Input("btn-view-fps", "n_clicks"),
+     Input("btn-view-fps-file", "n_clicks"),
      Input("close-fp-viewer-btn", "n_clicks")],
     [State("fp-viewer-modal", "style")],
     prevent_initial_call=True
 )
 @secure_callback
-def toggle_fp_viewer_modal(view_clicks, close_clicks, current_style):
+def toggle_fp_viewer_modal(view_clicks, view_file_clicks, close_clicks, current_style):
     """Toggle the False Positives viewer modal and load data"""
     ctx = dash.callback_context
     if not ctx.triggered:
@@ -1155,8 +1423,8 @@ def toggle_fp_viewer_modal(view_clicks, close_clicks, current_style):
     if trigger_id == "close-fp-viewer-btn":
         return {**current_style, 'display': 'none'}, []
     
-    # View button clicked - open modal and load data
-    if trigger_id == "btn-view-fps":
+    # View button clicked - open modal and load data (from either view)
+    if trigger_id in ["btn-view-fps", "btn-view-fps-file"]:
         try:
             # Query false positives with reasons
             query = """
@@ -1290,27 +1558,47 @@ def restore_from_fp_viewer(n_clicks, selected_rows, table_data):
 
 # Jira Integration Callbacks
 @app.callback(
-    Output("jira-settings-modal", "style"),
+    [Output("jira-settings-modal", "style"),
+     Output("jira-server-url", "value"),
+     Output("jira-username", "value"),
+     Output("jira-api-token", "value"),
+     Output("jira-project-key", "value"),
+     Output("jira-issue-type", "value")],
     [Input("btn-jira-settings", "n_clicks"),
      Input("btn-close-jira-settings", "n_clicks"),
      Input("btn-save-jira", "n_clicks")]
 )
 def toggle_jira_settings_modal(open_clicks, close_clicks, save_clicks):
-    """Toggle the Jira settings modal"""
+    """Toggle the Jira settings modal and populate with saved values"""
     ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '50px'
+    }
+    
+    # Default values (empty or no update)
+    no_update = dash.no_update
+    
     if not ctx.triggered:
-        return {'display': 'none'}
+        return hidden_style, no_update, no_update, no_update, no_update, no_update
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
     if trigger_id == "btn-jira-settings":
-        return {
-            'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
-            'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-            'zIndex': '1000', 'paddingTop': '50px'
-        }
+        # Opening modal - populate with saved values from config
+        return (
+            visible_style,
+            config.jira.server_url or "",
+            config.jira.username or "",
+            config.jira.api_token or "",
+            config.jira.project_key or "",
+            config.jira.issue_type or "Task"
+        )
     
-    return {'display': 'none'}
+    # Closing modal
+    return hidden_style, no_update, no_update, no_update, no_update, no_update
 
 
 @app.callback(
@@ -1769,6 +2057,374 @@ def perform_cleanup(cleanup_clicks):
             'borderRadius': '8px', 'marginBottom': '10px'
         })
 
+
+# ============================================================================
+# NEW CALLBACKS FOR TOOL TABS, FILE GROUPING, AND VIEW TOGGLE
+# ============================================================================
+
+@app.callback(
+    [Output('file-grouped-container', 'style'),
+     Output('all-findings-container', 'style')],
+    [Input('view-mode-toggle', 'value')]
+)
+def toggle_view_mode(view_mode):
+    """Toggle between file-grouped view and all-findings view"""
+    if view_mode == 'by-file':
+        return {'display': 'block'}, {'display': 'none'}
+    else:
+        return {'display': 'none'}, {'display': 'block'}
+
+
+@app.callback(
+    Output('file-grouped-table', 'data'),
+    [Input('tool-tabs', 'value'),
+     Input('severity-filter', 'value'),
+     Input('project-filter', 'value'),
+     Input('refresh-btn', 'n_clicks'),
+     Input('interval-component', 'n_intervals'),
+     Input('file-search-input', 'value'),
+     Input('file-tool-filter', 'value'),
+     Input('file-severity-filter', 'value')]
+)
+@secure_callback
+def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh_clicks, n_intervals, 
+                               file_search, file_tool_filter, file_severity_filter):
+    """Update the file-grouped table based on filters"""
+    # Use local file filters if set, otherwise use global filters
+    tool_filter = file_tool_filter if file_tool_filter and file_tool_filter != 'all' else (
+        'all' if tool_tab == 'all-tools' else tool_tab
+    )
+    sev_filter = file_severity_filter if file_severity_filter and file_severity_filter != 'all' else severity_filter
+    
+    df = get_file_grouped_data(
+        tool_filter=sanitize_input(tool_filter or 'all', 50),
+        severity_filter=sanitize_input(sev_filter or 'all', 50),
+        project_filter=sanitize_input(project_filter or 'all', 200)
+    )
+    
+    if df.empty:
+        return []
+    
+    # Apply file search filter
+    if file_search and len(file_search) >= 2:
+        search_term = file_search.lower()
+        df = df[df['file_path'].str.lower().str.contains(search_term, na=False)]
+    
+    # Format for display
+    table_data = []
+    for _, row in df.iterrows():
+        tools_list = row.get('tools', [])
+        types_list = row.get('secret_types', [])
+        
+        # Format tools with emojis
+        tools_display = ', '.join(tools_list[:3]) if tools_list else 'N/A'
+        if len(tools_list) > 3:
+            tools_display += f' +{len(tools_list)-3}'
+        
+        # Format secret types
+        types_display = ', '.join(types_list[:2]) if types_list else 'N/A'
+        if len(types_list) > 2:
+            types_display += f' +{len(types_list)-2}'
+        
+        # Format date
+        latest = row.get('latest_finding')
+        if latest:
+            try:
+                latest_str = pd.to_datetime(latest).strftime('%Y-%m-%d')
+            except:
+                latest_str = str(latest)[:10]
+        else:
+            latest_str = 'N/A'
+        
+        table_data.append({
+            'file_path': sanitize_input(str(row.get('file_path', '')), 500),
+            'finding_count': row.get('finding_count', 0),
+            'max_severity': row.get('max_severity', 'Unknown'),
+            'tools_display': tools_display,
+            'types_display': types_display,
+            'project_name': sanitize_input(str(row.get('project_name', 'N/A')), 100),
+            'latest_finding': latest_str
+        })
+    
+    return table_data
+
+
+@app.callback(
+    [Output('tool-stats-panel', 'children'),
+     Output('tool-specific-chart', 'figure')],
+    [Input('tool-tabs', 'value'),
+     Input('refresh-btn', 'n_clicks'),
+     Input('interval-component', 'n_intervals')]
+)
+@secure_callback
+def update_tool_panel(selected_tool, refresh_clicks, n_intervals):
+    """Update the tool-specific stats panel and chart"""
+    stats = get_tool_summary_stats()
+    
+    # Determine if showing all tools or specific tool
+    is_dark_mode = True
+    template = 'plotly_dark'
+    
+    def build_severity_badges(tool_key):
+        """Build severity badges that only show non-zero values"""
+        tool_stats = stats.get(tool_key, {})
+        badges = []
+        
+        critical = tool_stats.get('critical', 0)
+        high = tool_stats.get('high', 0)
+        medium = tool_stats.get('medium', 0)
+        low = tool_stats.get('low', 0)
+        
+        if critical > 0:
+            badges.append(html.Span(f"🔴 Critical: {critical:,}", style={'color': '#ff0000', 'marginRight': '8px', 'fontSize': '12px'}))
+        if high > 0:
+            badges.append(html.Span(f"🟠 High: {high:,}", style={'color': '#f97316', 'marginRight': '8px', 'fontSize': '12px'}))
+        if medium > 0:
+            badges.append(html.Span(f"🟡 Medium: {medium:,}", style={'color': '#eab308', 'marginRight': '8px', 'fontSize': '12px'}))
+        if low > 0:
+            badges.append(html.Span(f"🟢 Low: {low:,}", style={'color': '#22c55e', 'fontSize': '12px'}))
+        
+        if not badges:
+            badges.append(html.Span("✅ No findings", style={'color': '#22c55e', 'fontSize': '12px'}))
+        
+        return badges
+    
+    if selected_tool == 'all-tools':
+        # Show summary for all tools
+        stats_children = html.Div([
+            html.Div([
+                html.Div([
+                    html.H4("🔍 Custom Scanner", style={'color': '#60a5fa', 'marginBottom': '10px'}),
+                    html.Div(f"Findings: {stats.get('custom', {}).get('total_findings', 0):,}"),
+                    html.Div(f"Files: {stats.get('custom', {}).get('unique_files', 0):,}"),
+                    html.Div(build_severity_badges('custom'), style={'marginTop': '5px', 'flexWrap': 'wrap'})
+                ], style={'flex': '1', 'padding': '10px', 'backgroundColor': '#1e1e1e', 'borderRadius': '6px', 'marginRight': '10px'}),
+                
+                html.Div([
+                    html.H4("🐷 TruffleHog", style={'color': '#22c55e', 'marginBottom': '10px'}),
+                    html.Div(f"Findings: {stats.get('trufflehog', {}).get('total_findings', 0):,}"),
+                    html.Div(f"Files: {stats.get('trufflehog', {}).get('unique_files', 0):,}"),
+                    html.Div(build_severity_badges('trufflehog'), style={'marginTop': '5px', 'flexWrap': 'wrap'})
+                ], style={'flex': '1', 'padding': '10px', 'backgroundColor': '#1e1e1e', 'borderRadius': '6px', 'marginRight': '10px'}),
+                
+                html.Div([
+                    html.H4("🔐 Gitleaks", style={'color': '#f59e0b', 'marginBottom': '10px'}),
+                    html.Div(f"Findings: {stats.get('gitleaks', {}).get('total_findings', 0):,}"),
+                    html.Div(f"Files: {stats.get('gitleaks', {}).get('unique_files', 0):,}"),
+                    html.Div(build_severity_badges('gitleaks'), style={'marginTop': '5px', 'flexWrap': 'wrap'})
+                ], style={'flex': '1', 'padding': '10px', 'backgroundColor': '#1e1e1e', 'borderRadius': '6px'}),
+            ], style={'display': 'flex', 'color': '#e0e0e0'})
+        ])
+        
+        # Create comparison chart
+        tool_names = ['Custom', 'TruffleHog', 'Gitleaks']
+        tool_keys = ['custom', 'trufflehog', 'gitleaks']
+        colors = ['#60a5fa', '#22c55e', '#f59e0b']
+        
+        fig = go.Figure()
+        for i, (name, key) in enumerate(zip(tool_names, tool_keys)):
+            tool_stats = stats.get(key, {})
+            fig.add_trace(go.Bar(
+                name=name,
+                x=['Critical', 'High', 'Medium', 'Low'],
+                y=[tool_stats.get('critical', 0), tool_stats.get('high', 0), 
+                   tool_stats.get('medium', 0), tool_stats.get('low', 0)],
+                marker_color=colors[i]
+            ))
+        
+        fig.update_layout(
+            title='Severity Breakdown by Tool',
+            barmode='group',
+            template=template,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+        
+    else:
+        # Show specific tool stats
+        tool_data = stats.get(selected_tool, {})
+        tool_names = {'custom': '🔍 Custom Scanner', 'trufflehog': '🐷 TruffleHog', 'gitleaks': '🔐 Gitleaks'}
+        tool_colors = {'custom': '#60a5fa', 'trufflehog': '#22c55e', 'gitleaks': '#f59e0b'}
+        
+        # Build severity badges for specific tool
+        severity_items = []
+        if tool_data.get('critical', 0) > 0:
+            severity_items.append(html.Div([
+                html.Span("🔴 Critical: ", style={'color': '#ff0000'}),
+                html.Span(f"{tool_data.get('critical', 0):,}")
+            ], style={'marginRight': '20px'}))
+        if tool_data.get('high', 0) > 0:
+            severity_items.append(html.Div([
+                html.Span("🟠 High: ", style={'color': '#f97316'}),
+                html.Span(f"{tool_data.get('high', 0):,}")
+            ], style={'marginRight': '20px'}))
+        if tool_data.get('medium', 0) > 0:
+            severity_items.append(html.Div([
+                html.Span("🟡 Medium: ", style={'color': '#eab308'}),
+                html.Span(f"{tool_data.get('medium', 0):,}")
+            ], style={'marginRight': '20px'}))
+        if tool_data.get('low', 0) > 0:
+            severity_items.append(html.Div([
+                html.Span("🟢 Low: ", style={'color': '#22c55e'}),
+                html.Span(f"{tool_data.get('low', 0):,}")
+            ]))
+        if not severity_items:
+            severity_items.append(html.Div([
+                html.Span("✅ No findings", style={'color': '#22c55e'})
+            ]))
+        
+        stats_children = html.Div([
+            html.H4(tool_names.get(selected_tool, selected_tool), 
+                    style={'color': tool_colors.get(selected_tool, '#e0e0e0'), 'marginBottom': '15px'}),
+            html.Div([
+                html.Div([
+                    html.Strong("Total Findings: "),
+                    html.Span(f"{tool_data.get('total_findings', 0):,}")
+                ], style={'marginRight': '30px'}),
+                html.Div([
+                    html.Strong("Unique Files: "),
+                    html.Span(f"{tool_data.get('unique_files', 0):,}")
+                ], style={'marginRight': '30px'}),
+            ] + severity_items, style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px'})
+        ], style={'color': '#e0e0e0'})
+        
+        # Create pie chart for single tool - only include non-zero severities
+        severity_data = [
+            ('Critical', tool_data.get('critical', 0), '#ff0000'),
+            ('High', tool_data.get('high', 0), '#f97316'),
+            ('Medium', tool_data.get('medium', 0), '#eab308'),
+            ('Low', tool_data.get('low', 0), '#22c55e')
+        ]
+        # Filter out zero values
+        severity_data = [(label, val, color) for label, val, color in severity_data if val > 0]
+        
+        if severity_data:
+            severity_labels, severity_values, severity_colors = zip(*severity_data)
+        else:
+            severity_labels, severity_values, severity_colors = [], [], []
+        
+        fig = go.Figure(data=[go.Pie(
+            labels=severity_labels,
+            values=severity_values,
+            marker_colors=severity_colors,
+            hole=0.4
+        )])
+        
+        fig.update_layout(
+            title=f'{tool_names.get(selected_tool, selected_tool)} - Severity Distribution',
+            template=template,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=50, r=50, t=50, b=50)
+        )
+    
+    return stats_children, fig
+
+
+@app.callback(
+    [Output('file-detail-modal', 'style'),
+     Output('file-detail-title', 'children'),
+     Output('file-detail-stats', 'children'),
+     Output('file-detail-findings', 'children')],
+    [Input('file-grouped-table', 'active_cell'),
+     Input('close-file-detail-btn', 'n_clicks')],
+    [State('file-grouped-table', 'data'),
+     State('file-detail-modal', 'style')]
+)
+@secure_callback
+def handle_file_detail_modal(active_cell, close_clicks, table_data, current_style):
+    """Show/hide the file detail modal when a file is clicked"""
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return {'display': 'none'}, "", [], []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Handle close button
+    if trigger_id == 'close-file-detail-btn':
+        return {'display': 'none'}, "", [], []
+    
+    # Handle file row click
+    if trigger_id == 'file-grouped-table' and active_cell and table_data:
+        row_idx = active_cell.get('row')
+        if row_idx is not None and row_idx < len(table_data):
+            row = table_data[row_idx]
+            file_path = row.get('file_path', '')
+            
+            # Get all findings for this file
+            findings = get_findings_for_file(file_path)
+            
+            if not findings:
+                return {'display': 'none'}, "", [], []
+            
+            # Build title
+            title = f"📄 {file_path}"
+            
+            # Build stats
+            stats_div = html.Div([
+                html.Span(f"📊 {len(findings)} findings in this file", style={'marginRight': '20px'}),
+                html.Span(f"Max Severity: {row.get('max_severity', 'Unknown')}", 
+                         style={'color': '#ff0000' if row.get('max_severity') == 'Critical' else '#e0e0e0'})
+            ], style={'color': '#9ca3af', 'marginBottom': '15px'})
+            
+            # Build findings list
+            findings_children = []
+            for finding in findings:
+                severity_colors = {
+                    'Critical': '#8b0000', 'High': '#6d2f2f', 
+                    'Medium': '#4a4020', 'Low': '#2c4a6b'
+                }
+                bg_color = severity_colors.get(finding.get('severity', 'Medium'), '#2d2d2d')
+                
+                finding_card = html.Div([
+                    html.Div([
+                        html.Span(finding.get('severity', 'Unknown'), 
+                                 style={'padding': '2px 8px', 'backgroundColor': bg_color, 
+                                        'borderRadius': '4px', 'marginRight': '10px', 'fontWeight': 'bold'}),
+                        html.Span(finding.get('tool_source', 'unknown'), 
+                                 style={'color': '#9ca3af', 'marginRight': '10px'}),
+                        html.Span(finding.get('secret_type', 'Unknown Type'), 
+                                 style={'color': '#60a5fa'})
+                    ], style={'marginBottom': '10px'}),
+                    
+                    html.Div([
+                        html.Strong("Value: "),
+                        html.Code(sanitize_input(str(finding.get('secret_value', 'N/A')), 200),
+                                 style={'backgroundColor': '#1e1e1e', 'padding': '2px 6px', 'borderRadius': '3px'})
+                    ], style={'marginBottom': '8px', 'wordBreak': 'break-all'}),
+                    
+                    html.Div([
+                        html.Strong("Context: "),
+                        html.Pre(sanitize_input(str(finding.get('context', 'N/A')), 500),
+                                style={'backgroundColor': '#1e1e1e', 'padding': '8px', 'borderRadius': '4px',
+                                       'margin': '5px 0', 'whiteSpace': 'pre-wrap', 'fontSize': '12px',
+                                       'maxHeight': '100px', 'overflowY': 'auto'})
+                    ], style={'marginBottom': '8px'}),
+                    
+                    html.Div([
+                        html.Span(f"Line: {finding.get('line_number', 'N/A')}", style={'marginRight': '15px'}),
+                        html.Span(f"Confidence: {finding.get('confidence_score', 'N/A')}", style={'marginRight': '15px'}),
+                        html.Span(f"ID: {str(finding.get('id', ''))[:8]}...", style={'color': '#6b7280'})
+                    ], style={'fontSize': '12px', 'color': '#9ca3af'})
+                ], style={
+                    'backgroundColor': '#374151', 'padding': '15px', 'borderRadius': '8px',
+                    'marginBottom': '10px', 'border': f'1px solid {bg_color}'
+                })
+                
+                findings_children.append(finding_card)
+            
+            modal_style = {
+                'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.8)',
+                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+            }
+            
+            return modal_style, title, stats_div, findings_children
+    
+    return current_style or {'display': 'none'}, "", [], []
+
+
 # Permanent dark mode - no toggle needed
 # Main container is always in dark mode
 
@@ -1923,70 +2579,351 @@ def create_layout():
                     )
                 ], className="filter-item"),
 
-                html.Button("🔄 Refresh Data", id="refresh-btn", className="refresh-btn")
+                html.Div([
+                    html.Label("Secret Type Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
+                    dcc.Dropdown(
+                        id="secret-type-filter",
+                        options=[{"label": "All Secret Types", "value": "all"}],
+                        value="all",
+                        clearable=False,
+                        searchable=True,
+                        placeholder="Search secret types...",
+                        optionHeight=35,
+                        style={'minWidth': '220px', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
+                    )
+                ], className="filter-item"),
             ], className="filters"),
 
-            # Charts Row
+            # Charts Section with Tool Tabs
             html.Div([
+                html.H3("📊 Findings Charts", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
+                dcc.Tabs(id='chart-tool-tabs', value='all', children=[
+                    dcc.Tab(label='📊 All Tools', value='all', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🔍 Custom', value='custom', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🐷 TruffleHog', value='trufflehog', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🔐 Gitleaks', value='gitleaks', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                ], style={'marginBottom': '15px'}),
+                
+                # Charts Row
                 html.Div([
-                    dcc.Graph(
-                        id="severity-chart", 
-                        className="chart",
-                        config={
-                            'displayModeBar': True,
-                            'displaylogo': False,
-                            'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
-                            'plotlyServerURL': False
-                        }
-                    )
-                ], className="chart-container"),
+                    html.Div([
+                        dcc.Loading(
+                            id="loading-severity",
+                            type="circle",
+                            color="#667eea",
+                            children=[
+                                dcc.Graph(
+                                    id="severity-chart", 
+                                    className="chart",
+                                    config={
+                                        'displayModeBar': True,
+                                        'displaylogo': False,
+                                        'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
+                                        'plotlyServerURL': False
+                                    }
+                                )
+                            ]
+                        )
+                    ], className="chart-container"),
 
-                html.Div([
-                    dcc.Graph(
-                        id="tool-distribution-chart", 
-                        className="chart",
-                        config={
-                            'displayModeBar': True,
-                            'displaylogo': False,
-                            'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
-                            'plotlyServerURL': False
-                        }
-                    )
-                ], className="chart-container")
-            ], className="charts-row"),
+                    html.Div([
+                        dcc.Loading(
+                            id="loading-tool-dist",
+                            type="circle",
+                            color="#667eea",
+                            children=[
+                                dcc.Graph(
+                                    id="tool-distribution-chart", 
+                                    className="chart",
+                                    config={
+                                        'displayModeBar': True,
+                                        'displaylogo': False,
+                                        'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
+                                        'plotlyServerURL': False
+                                    }
+                                )
+                            ]
+                        )
+                    ], className="chart-container")
+                ], className="charts-row"),
+            ], style={'marginBottom': '20px'}),
 
             # Additional Charts
             html.Div([
                 html.Div([
-                    dcc.Graph(
-                        id="timeline-chart", 
-                        className="chart",
-                        config={
-                            'displayModeBar': True,
-                            'displaylogo': False,
-                            'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
-                            'plotlyServerURL': False
-                        }
+                    dcc.Loading(
+                        id="loading-timeline",
+                        type="circle",
+                        color="#667eea",
+                        children=[
+                            dcc.Graph(
+                                id="timeline-chart", 
+                                className="chart",
+                                config={
+                                    'displayModeBar': True,
+                                    'displaylogo': False,
+                                    'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
+                                    'plotlyServerURL': False
+                                }
+                            )
+                        ]
                     )
                 ], className="chart-container"),
 
                 html.Div([
-                    dcc.Graph(
-                        id="file-types-chart", 
-                        className="chart",
-                        config={
-                            'displayModeBar': True,
-                            'displaylogo': False,
-                            'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
-                            'plotlyServerURL': False
-                        }
+                    dcc.Loading(
+                        id="loading-file-types",
+                        type="circle",
+                        color="#667eea",
+                        children=[
+                            dcc.Graph(
+                                id="file-types-chart", 
+                                className="chart",
+                                config={
+                                    'displayModeBar': True,
+                                    'displaylogo': False,
+                                    'modeBarButtonsToRemove': ['pan2d', 'lasso2d', 'select2d'],
+                                    'plotlyServerURL': False
+                                }
+                            )
+                        ]
                     )
                 ], className="chart-container")
             ], className="charts-row"),
 
-            # Data Table
+            # Tool-Specific Tabs Section
             html.Div([
-                html.H3("📋 Recent Findings (click any row for full details)"),
+                html.H3("🔧 Findings by Scanner Tool", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
+                dcc.Tabs(id='tool-tabs', value='all-tools', children=[
+                    dcc.Tab(label='📊 All Tools', value='all-tools', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🔍 Custom Scanner', value='custom', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🐷 TruffleHog', value='trufflehog', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                    dcc.Tab(label='🔐 Gitleaks', value='gitleaks', className='tool-tab',
+                           selected_className='tool-tab-selected'),
+                ], style={'marginBottom': '20px'}),
+                
+                # Tool-specific stats panel
+                html.Div(id='tool-stats-panel', style={
+                    'backgroundColor': '#2d3748', 'padding': '15px', 'borderRadius': '8px',
+                    'marginBottom': '20px', 'border': '1px solid #444'
+                }),
+                
+                # Tool-specific chart
+                html.Div([
+                    dcc.Graph(id='tool-specific-chart', className='chart',
+                              config={'displayModeBar': True, 'displaylogo': False})
+                ], className='chart-container', style={'marginBottom': '20px'})
+            ], className='tool-tabs-section', style={
+                'backgroundColor': '#1e1e1e', 'padding': '20px', 'borderRadius': '10px',
+                'marginBottom': '30px', 'border': '1px solid #444'
+            }),
+
+            # View Toggle - By File vs All Findings
+            html.Div([
+                html.H3("📁 Findings View", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
+                html.Div([
+                    html.Span("View Mode: ", style={'color': '#b0b0b0', 'marginRight': '10px'}),
+                    dcc.RadioItems(
+                        id='view-mode-toggle',
+                        options=[
+                            {'label': ' 📁 Group by File', 'value': 'by-file'},
+                            {'label': ' 📋 All Findings', 'value': 'all-findings'}
+                        ],
+                        value='by-file',
+                        inline=True,
+                        style={'display': 'inline-flex', 'gap': '20px'},
+                        inputStyle={'marginRight': '5px'},
+                        labelStyle={'color': '#e0e0e0', 'cursor': 'pointer'}
+                    )
+                ], style={'marginBottom': '15px'})
+            ]),
+
+            # File-Grouped Table (shown when view-mode is 'by-file')
+            html.Div([
+                html.Div([
+                    html.P("Click a file to see all findings in that file", 
+                           style={'color': '#9ca3af', 'marginBottom': '10px', 'fontStyle': 'italic', 'display': 'inline-block'}),
+                    html.Div([
+                        dcc.Input(
+                            id='file-search-input',
+                            type='text',
+                            placeholder='🔍 Search files...',
+                            debounce=True,
+                            style={
+                                'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '6px',
+                                'padding': '8px 12px', 'width': '300px',
+                                'fontSize': '14px'
+                            }
+                        ),
+                        dcc.Dropdown(
+                            id='file-tool-filter',
+                            options=[
+                                {"label": "All Tools", "value": "all"},
+                                {"label": "Custom", "value": "custom"},
+                                {"label": "TruffleHog", "value": "trufflehog"},
+                                {"label": "Gitleaks", "value": "gitleaks"}
+                            ],
+                            value="all",
+                            clearable=False,
+                            style={'width': '150px', 'display': 'inline-block', 'marginLeft': '10px'},
+                            className="dark-dropdown"
+                        ),
+                        dcc.Dropdown(
+                            id='file-severity-filter',
+                            options=[
+                                {"label": "All Severities", "value": "all"},
+                                {"label": "Critical", "value": "Critical"},
+                                {"label": "High", "value": "High"},
+                                {"label": "Medium", "value": "Medium"},
+                                {"label": "Low", "value": "Low"}
+                            ],
+                            value="all",
+                            clearable=False,
+                            style={'width': '150px', 'display': 'inline-block', 'marginLeft': '10px'},
+                            className="dark-dropdown"
+                        ),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px', 'marginBottom': '15px'}),
+                ]),
+                dcc.Loading(
+                    id="loading-file-table",
+                    type="circle",
+                    color="#667eea",
+                    children=[
+                        dash_table.DataTable(
+                            id='file-grouped-table',
+                            columns=[
+                                {"name": "File Path", "id": "file_path"},
+                                {"name": "Findings", "id": "finding_count"},
+                                {"name": "Max Severity", "id": "max_severity"},
+                                {"name": "Tools", "id": "tools_display"},
+                                {"name": "Secret Types", "id": "types_display"},
+                                {"name": "Project", "id": "project_name"},
+                                {"name": "Latest", "id": "latest_finding"},
+                            ],
+                            data=[],
+                            filter_action="native",
+                            sort_action="native",
+                            sort_mode="multi",
+                            page_action="native",
+                    page_current=0,
+                    page_size=25,
+                    style_table={'overflowX': 'auto', 'backgroundColor': '#1e1e1e'},
+                    style_header={
+                        'backgroundColor': '#2d3748', 'color': '#e0e0e0',
+                        'fontWeight': 'bold', 'border': '1px solid #444'
+                    },
+                    style_cell={
+                        'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                        'border': '1px solid #444', 'padding': '10px',
+                        'textAlign': 'left', 'fontSize': '13px',
+                        'fontFamily': 'Monaco, Consolas, monospace'
+                    },
+                    style_cell_conditional=[
+                        {'if': {'column_id': 'file_path'}, 'width': '40%', 'maxWidth': '400px', 
+                         'overflow': 'hidden', 'textOverflow': 'ellipsis'},
+                        {'if': {'column_id': 'finding_count'}, 'width': '80px', 'textAlign': 'center', 
+                         'fontWeight': 'bold'},
+                        {'if': {'column_id': 'max_severity'}, 'width': '100px', 'textAlign': 'center'},
+                        {'if': {'column_id': 'tools_display'}, 'width': '150px', 'textAlign': 'center'},
+                        {'if': {'column_id': 'types_display'}, 'width': '200px'},
+                        {'if': {'column_id': 'latest_finding'}, 'width': '120px', 'textAlign': 'center'},
+                    ],
+                    style_data_conditional=[
+                        {'if': {'filter_query': '{max_severity} = "Critical"'},
+                         'backgroundColor': '#8b0000', 'color': '#fff', 'fontWeight': 'bold'},
+                        {'if': {'filter_query': '{max_severity} = "High"'},
+                         'backgroundColor': '#6d2f2f', 'color': '#fff'},
+                        {'if': {'filter_query': '{max_severity} = "Medium"'},
+                         'backgroundColor': '#4a4020', 'color': '#fff'},
+                        {'if': {'row_index': 'odd'}, 'backgroundColor': '#252525'},
+                    ],
+                    row_selectable='multi'
+                        )
+                    ]
+                ),
+                # FP Controls for file-grouped view
+                html.Div([
+                    html.Div([
+                        html.Button(
+                            "�️ View False Positives",
+                            id='btn-view-fps-file',
+                            n_clicks=0,
+                            title="View all findings marked as false positives",
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "�🚫 Mark Files as FP", 
+                            id='btn-mark-file-fp',
+                            n_clicks=0,
+                            title="Mark all findings in selected files as false positives",
+                            style={
+                                'backgroundColor': '#dc2626', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "🎫 Create Jira for Files", 
+                            id='btn-create-file-jira',
+                            n_clicks=0,
+                            title="Create Jira tickets for all findings in selected files",
+                            style={
+                                'backgroundColor': '#0052cc', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold'
+                            }
+                        ),
+                    ], style={'display': 'flex', 'justifyContent': 'flex-end', 'marginTop': '15px'}),
+                    html.Div(id='file-action-result', style={'marginTop': '10px', 'textAlign': 'right'})
+                ], style={'padding': '10px 0'})
+            ], id='file-grouped-container', style={'display': 'block'}),
+            
+            # File Detail Modal - shows all findings for a selected file
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2(id='file-detail-title', style={'margin': '0', 'color': '#60a5fa'}),
+                        html.Button("✕", id='close-file-detail-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 
+                              'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.Div(id='file-detail-stats', style={'marginBottom': '15px'}),
+                    
+                    html.Div(id='file-detail-findings', style={
+                        'maxHeight': '500px', 'overflowY': 'auto'
+                    })
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px',
+                    'borderRadius': '8px', 'maxWidth': '1200px', 'width': '90%',
+                    'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='file-detail-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.8)',
+                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+            }),
+
+            # Data Table (original - shown when view-mode is 'all-findings')
+            html.Div([
+                html.H3("📋 All Findings (click any row for full details)"),
                 
                 # False Positive Controls Panel
                 html.Div([
@@ -2497,7 +3434,7 @@ def create_layout():
                     export_headers="display",
                     css=[{'selector': '.dash-cell div', 'rule': 'white-space: normal; height: auto;'}]
                 )
-            ], className="data-table"),
+            ], id="all-findings-container", className="data-table", style={'display': 'none'}),
 
             # Finding Detail Modal (opens when clicking a table row)
             html.Div([
@@ -2515,36 +3452,75 @@ def create_layout():
 
             # Custom Report Export Section
             html.Div([
-                html.H3("📄 Custom Report Export"),
+                html.H3("📄 Custom Report Export", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
                 html.Div([
-                    html.Label("Select Severity:"),
-                    dcc.Dropdown(
-                        id="report-severity-filter",
-                        options=[
-                            {"label": "All Severities", "value": "all"},
-                            {"label": "Critical", "value": "Critical"},
-                            {"label": "High", "value": "High"},
-                            {"label": "Medium", "value": "Medium"},
-                            {"label": "Low", "value": "Low"}
-                        ],
-                        value="all",
-                        multi=True
-                    ),
-                ], className="filter-item"),
+                    html.Div([
+                        html.Label("Select Severity:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Dropdown(
+                            id="report-severity-filter",
+                            options=[
+                                {"label": "All Severities", "value": "all"},
+                                {"label": "Critical", "value": "Critical"},
+                                {"label": "High", "value": "High"},
+                                {"label": "Medium", "value": "Medium"},
+                                {"label": "Low", "value": "Low"}
+                            ],
+                            value=["all"],
+                            multi=True,
+                            style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                            className="dark-dropdown"
+                        ),
+                    ], className="filter-item", style={'flex': '1', 'minWidth': '200px'}),
+                    html.Div([
+                        html.Label("Select Tool:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Dropdown(
+                            id="report-tool-filter",
+                            options=[
+                                {"label": "All Tools", "value": "all"},
+                                {"label": "Custom Scanner", "value": "custom"},
+                                {"label": "TruffleHog", "value": "trufflehog"},
+                                {"label": "Gitleaks", "value": "gitleaks"}
+                            ],
+                            value="all",
+                            style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                            className="dark-dropdown"
+                        ),
+                    ], className="filter-item", style={'flex': '1', 'minWidth': '200px'}),
+                ], style={'display': 'flex', 'gap': '20px', 'marginBottom': '15px', 'flexWrap': 'wrap'}),
                 html.Div([
-                    html.Label("Date Range:"),
-                    dcc.DatePickerRange(
-                        id="report-date-range",
-                        min_date_allowed=datetime.now() - timedelta(days=365),
-                        max_date_allowed=datetime.now(),
-                        initial_visible_month=datetime.now(),
-                        end_date=datetime.now(),
-                        start_date=datetime.now() - timedelta(days=7)
-                    ),
-                ], className="filter-item"),
-                html.Button("Export CSV", id="export-csv-btn", className="export-btn"),
-                html.Button("Export JSON", id="export-json-btn", className="export-btn"),
-                html.Button("Export PDF", id="export-pdf-btn", className="export-btn"),
+                    html.Label("Date Range:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                    html.Div([
+                        dcc.DatePickerRange(
+                            id="report-date-range",
+                            min_date_allowed=datetime.now() - timedelta(days=365),
+                            max_date_allowed=datetime.now() + timedelta(days=1),
+                            initial_visible_month=datetime.now(),
+                            end_date=datetime.now(),
+                            start_date=datetime.now() - timedelta(days=7),
+                            display_format='MM/DD/YYYY',
+                            start_date_placeholder_text="Start Date",
+                            end_date_placeholder_text="End Date",
+                            clearable=True,
+                            with_portal=True
+                        ),
+                    ], style={'display': 'inline-block'}),
+                    html.Div([
+                        html.Button("Last 7 Days", id="btn-last-7-days", n_clicks=0, 
+                                    style={'backgroundColor': '#4b5563', 'color': 'white', 'border': 'none', 
+                                           'padding': '6px 12px', 'borderRadius': '4px', 'margin': '0 5px', 'cursor': 'pointer'}),
+                        html.Button("Last 30 Days", id="btn-last-30-days", n_clicks=0,
+                                    style={'backgroundColor': '#4b5563', 'color': 'white', 'border': 'none', 
+                                           'padding': '6px 12px', 'borderRadius': '4px', 'margin': '0 5px', 'cursor': 'pointer'}),
+                        html.Button("All Time", id="btn-all-time", n_clicks=0,
+                                    style={'backgroundColor': '#4b5563', 'color': 'white', 'border': 'none', 
+                                           'padding': '6px 12px', 'borderRadius': '4px', 'margin': '0 5px', 'cursor': 'pointer'}),
+                    ], style={'display': 'inline-block', 'marginLeft': '15px'}),
+                ], className="filter-item", style={'marginBottom': '20px'}),
+                html.Div([
+                    html.Button("Export CSV", id="export-csv-btn", className="export-btn"),
+                    html.Button("Export JSON", id="export-json-btn", className="export-btn"),
+                    html.Button("Export PDF", id="export-pdf-btn", className="export-btn"),
+                ], style={'marginTop': '15px'}),
                 dcc.Download(id="report-download")
             ], className="report-section"),
 
@@ -2559,7 +3535,7 @@ def create_layout():
         # Interval component for auto-refresh
         dcc.Interval(
             id="interval-component",
-            interval=30000,  # 30 seconds
+            interval=60000,  # 60 seconds - reduced frequency for better performance
             n_intervals=0
         )
     ])
@@ -2657,7 +3633,7 @@ app.index_string = '''
                 display: block;
                 margin-bottom: 5px;
                 font-weight: 600;
-                color: #333;
+                color: #e0e0e0;
             }
             .refresh-btn {
                 background: #28a745;
@@ -2672,6 +3648,31 @@ app.index_string = '''
             .refresh-btn:hover {
                 background: #218838;
             }
+            
+            /* Tool Tabs Styling */
+            .tool-tab {
+                background-color: #374151 !important;
+                color: #9ca3af !important;
+                border: 1px solid #4b5563 !important;
+                border-bottom: none !important;
+                padding: 12px 24px !important;
+                font-weight: 600 !important;
+                cursor: pointer !important;
+                transition: all 0.2s ease !important;
+            }
+            .tool-tab:hover {
+                background-color: #4b5563 !important;
+                color: #e0e0e0 !important;
+            }
+            .tool-tab-selected {
+                background-color: #1e40af !important;
+                color: #ffffff !important;
+                border-color: #1e40af !important;
+            }
+            .tool-tabs-section {
+                margin-bottom: 30px;
+            }
+            
             .charts-row {
                 display: flex;
                 gap: 30px;
@@ -3167,6 +4168,17 @@ app.index_string = '''
                 background-color: #1e1e1e !important;
             }
 
+            /* Clickable table rows - pointer cursor */
+            .main-container.dark-mode .dash-table-container tbody tr {
+                cursor: pointer !important;
+            }
+            .main-container.dark-mode .dash-table-container tbody tr:hover {
+                background-color: #374151 !important;
+            }
+            .main-container.dark-mode .dash-table-container td {
+                cursor: pointer !important;
+            }
+
             /* Table pagination styling */
             .main-container.dark-mode .dash-table-container .previous-next-container,
             .main-container.dark-mode .dash-table-container .previous-page,
@@ -3252,11 +4264,51 @@ app.index_string = '''
                 color: #e0e0e0 !important;
                 border-color: #555 !important;
             }
+            
+            .main-container.dark-mode .DateInput_input {
+                background-color: #3d3d3d !important;
+                color: #e0e0e0 !important;
+                font-size: 14px !important;
+                padding: 10px !important;
+            }
 
             .main-container.dark-mode .DateRangePickerInput {
                 background-color: #3d3d3d !important;
                 border: 1px solid #555 !important;
                 border-radius: 5px;
+            }
+            
+            .main-container.dark-mode .DateRangePickerInput_arrow {
+                color: #e0e0e0 !important;
+            }
+            
+            /* Report section labels */
+            .main-container.dark-mode .report-section label {
+                color: #e0e0e0 !important;
+                font-weight: 600;
+                display: block;
+                margin-bottom: 8px;
+            }
+            
+            .main-container.dark-mode .report-section .filter-item {
+                margin-bottom: 15px;
+            }
+            
+            /* Date picker calendar dark mode */
+            .DayPicker {
+                background-color: #2d3748 !important;
+            }
+            .CalendarMonth_caption {
+                color: #e0e0e0 !important;
+            }
+            .CalendarDay__default {
+                background-color: #3d3d3d !important;
+                color: #e0e0e0 !important;
+                border: 1px solid #555 !important;
+            }
+            .CalendarDay__selected {
+                background-color: #667eea !important;
+                color: white !important;
             }
 
             /* Dark mode for modal content */

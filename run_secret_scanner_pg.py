@@ -226,14 +226,19 @@ class MultiScannerOrchestrator:
             for line in lines:
                 if line.strip():
                     finding_data = json.loads(line)
+                    
+                    # Map detector type to severity
+                    detector_name = finding_data.get('detector_name', 'unknown')
+                    severity = self._get_trufflehog_severity(detector_name, finding_data.get('verified', False))
+                    
                     finding_id = findings_manager.insert_finding(
                         scan_session_id=session_id,
                         project_id=project_id,
                         file_path=finding_data.get('path', ''),
-                        secret_type=finding_data.get('detector_name', 'unknown'),
+                        secret_type=detector_name,
                         secret_value=finding_data.get('raw', ''),
                         context=finding_data.get('context', ''),
-                        severity='High',  # Trufflehog typically finds high-severity issues
+                        severity=severity,
                         line_number=finding_data.get('line_number'),
                         tool_source='trufflehog',
                         metadata=finding_data
@@ -243,6 +248,54 @@ class MultiScannerOrchestrator:
         except Exception as e:
             logger.error(f"Error parsing Trufflehog output: {e}")
         return findings_ids
+    
+    def _get_trufflehog_severity(self, detector_name: str, verified: bool) -> str:
+        """Map TruffleHog detector types to severity levels.
+        
+        Verified secrets are automatically Critical.
+        Unverified secrets use detector-based mapping.
+        """
+        # Verified secrets are always critical - they're confirmed active
+        if verified:
+            return 'Critical'
+        
+        detector_lower = detector_name.lower()
+        
+        # Critical - Cloud provider keys, payment systems, high-impact
+        critical_detectors = [
+            'aws', 'azure', 'gcp', 'google', 'stripe', 'paypal', 'braintree',
+            'privatekey', 'private_key', 'rsa', 'ssh', 'pgp', 'certificate',
+            'database', 'postgres', 'mysql', 'mongodb', 'redis', 'elasticsearch',
+            'openai', 'anthropic', 'huggingface'
+        ]
+        
+        # High - API keys, tokens, webhooks
+        high_detectors = [
+            'github', 'gitlab', 'bitbucket', 'slack', 'discord', 'twilio',
+            'sendgrid', 'mailgun', 'mailchimp', 'npm', 'pypi', 'docker',
+            'jwt', 'bearer', 'oauth', 'api_key', 'apikey', 'auth', 'token',
+            'secret', 'password', 'credential'
+        ]
+        
+        # Medium - Less critical but still sensitive
+        medium_detectors = [
+            'webhook', 'url', 'endpoint', 'connection', 'config'
+        ]
+        
+        for detector in critical_detectors:
+            if detector in detector_lower:
+                return 'Critical'
+        
+        for detector in high_detectors:
+            if detector in detector_lower:
+                return 'High'
+        
+        for detector in medium_detectors:
+            if detector in detector_lower:
+                return 'Medium'
+        
+        # Default to High for unknown detectors (conservative)
+        return 'High'
     
     def _parse_trufflehog_output_incremental(self, output: str, session_id: str, project_id: str) -> List[str]:
         """Parse Trufflehog JSON output incrementally to reduce memory usage
@@ -301,11 +354,15 @@ class MultiScannerOrchestrator:
                     detector_name = finding_data.get('DetectorName', 
                                    finding_data.get('DetectorType', 'unknown'))
                     raw_secret = finding_data.get('Raw', '')
+                    verified = finding_data.get('Verified', False)
                     
                     # Skip if no file path (invalid finding)
                     if not file_path:
                         skipped_count += 1
                         continue
+                    
+                    # Map severity based on detector type and verification status
+                    severity = self._get_trufflehog_severity(detector_name, verified)
                     
                     # Insert finding
                     finding_id = findings_manager.insert_finding(
@@ -315,10 +372,10 @@ class MultiScannerOrchestrator:
                         secret_type=detector_name,
                         secret_value=raw_secret[:500],  # Truncate large secrets
                         context=str(finding_data.get('ExtraData', ''))[:1000],
-                        severity='High',
+                        severity=severity,
                         line_number=None,  # TruffleHog doesn't always provide line numbers
                         tool_source='trufflehog',
-                        metadata={'verified': finding_data.get('Verified', False)}
+                        metadata={'verified': verified}
                     )
                     if finding_id:
                         findings_ids.append(finding_id)
@@ -368,6 +425,16 @@ class MultiScannerOrchestrator:
                     if not secret_value:
                         logger.warning(f"Gitleaks finding missing Secret/Match field: {finding.keys()}")
                     
+                    # Get severity from Gitleaks or map from rule ID
+                    severity = finding.get('Severity', finding.get('severity'))
+                    if not severity:
+                        severity = self._get_gitleaks_severity(rule_id)
+                    else:
+                        # Normalize Gitleaks severity to our format
+                        severity = severity.capitalize()
+                        if severity not in ['Critical', 'High', 'Medium', 'Low']:
+                            severity = self._get_gitleaks_severity(rule_id)
+                    
                     finding_id = findings_manager.insert_finding(
                         scan_session_id=session_id,
                         project_id=project_id,
@@ -375,7 +442,7 @@ class MultiScannerOrchestrator:
                         secret_type=rule_id,
                         secret_value=secret_value,
                         context=description,
-                        severity=finding.get('severity', 'Medium'),
+                        severity=severity,
                         line_number=start_line,
                         tool_source='gitleaks',
                         metadata=finding
@@ -389,6 +456,59 @@ class MultiScannerOrchestrator:
         except Exception as e:
             logger.error(f"Error parsing Gitleaks output: {e}")
         return findings_ids
+
+    def _get_gitleaks_severity(self, rule_id: str) -> str:
+        """Map Gitleaks rule IDs to severity levels."""
+        rule_lower = rule_id.lower()
+        
+        # Critical - Cloud provider keys, private keys, payment systems
+        critical_rules = [
+            'aws', 'azure', 'gcp', 'google-api', 'private-key', 'privatekey',
+            'stripe', 'square', 'paypal', 'braintree', 'adafruit',
+            'alibaba', 'algolia', 'authress', 'bittrex', 'clojars',
+            'coinbase', 'confluent', 'databricks', 'datadog', 'definednetworking',
+            'digitalocean', 'doppler', 'dropbox', 'duffel', 'dynatrace',
+            'easypost', 'facebook', 'fastly', 'finicity', 'flutterwave',
+            'frameio', 'freshbooks', 'gitter', 'grafana', 'harness',
+            'hashicorp', 'heroku', 'hubspot', 'intercom', 'kraken',
+            'kucoin', 'launchdarkly', 'linear', 'lob', 'mailgun',
+            'mapbox', 'messagebird', 'netlify', 'newrelic', 'nytimes',
+            'okta', 'openai', 'pagerduty', 'planetscale', 'plaid',
+            'postman', 'prefect', 'pulumi', 'pypi', 'rapidapi',
+            'readme', 'rubygems', 'scalingo', 'segment', 'sendbird',
+            'sendinblue', 'sentry', 'shippo', 'shopify', 'sidekiq',
+            'snyk', 'sourcegraph', 'sqlserver', 'supabase', 'telegram',
+            'travisci', 'trello', 'twilio', 'twitter', 'typeform',
+            'vault-token', 'vercel', 'webflow', 'yandex', 'zendesk'
+        ]
+        
+        # High - API keys, tokens, webhooks
+        high_rules = [
+            'github', 'gitlab', 'bitbucket', 'slack', 'discord',
+            'npm', 'nuget', 'jwt', 'bearer', 'oauth', 'api-key', 'apikey',
+            'generic-api-key', 'secret', 'password', 'credential',
+            'sendgrid', 'mailchimp', 'docker', 'kubernetes', 'artifactory',
+            'asana', 'atera', 'auth0', 'beamer', 'buildkite', 'buttercms',
+            'calendly', 'circleci', 'clickup', 'codecov', 'contentful',
+            'crates', 'droneci', 'figma', 'firebase', 'fleetbase',
+            'gitea', 'intra42', 'jfrog', 'linenotify', 'localstack',
+            'mattermost', 'maxmind', 'mux', 'notion', 'patreon',
+            'rollbar', 'sauce', 'sonarcloud', 'sumologic', 'tailscale',
+            'tines', 'upcloud', 'vault', 'vault-batch-token', 'wiz'
+        ]
+        
+        # Check Critical rules
+        for rule in critical_rules:
+            if rule in rule_lower:
+                return 'Critical'
+        
+        # Check High rules  
+        for rule in high_rules:
+            if rule in rule_lower:
+                return 'High'
+        
+        # Default to Medium for unknown rules
+        return 'Medium'
 
     def run_multi_scan(self, directory: Path, project_name: str = "multi-scan",
                        scanners: List[str] = None) -> Dict[str, Any]:

@@ -108,6 +108,13 @@ services:
       - ./config.json:/app/config.json:ro
       - ${SCAN_VOLUME:-./monitor_data:/scan:ro}
       - ./logs:/app/logs
+      # Mount Python files for live development
+      - ./secret_snipe_pg.py:/app/secret_snipe_pg.py:ro
+      - ./run_secret_scanner_pg.py:/app/run_secret_scanner_pg.py:ro
+      - ./continuous_multi_scanner.py:/app/continuous_multi_scanner.py:ro
+      - ./database_manager.py:/app/database_manager.py:ro
+      - ./redis_manager.py:/app/redis_manager.py:ro
+      - ./config.py:/app/config.py:ro
     logging:
       driver: "json-file"
       options:
@@ -169,6 +176,11 @@ services:
       - ./logs:/app/logs
       - ./dashboard_audit.log:/app/dashboard_audit.log
       - ./jira_config:/app/jira_config  # Persist Jira settings (host directory)
+      # Mount Python files for live development
+      - ./unified_visualizer_pg.py:/app/unified_visualizer_pg.py:ro
+      - ./database_manager.py:/app/database_manager.py:ro
+      - ./redis_manager.py:/app/redis_manager.py:ro
+      - ./config.py:/app/config.py:ro
     networks:
       - secretsnipe-network
     depends_on:

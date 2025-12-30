@@ -226,6 +226,13 @@ CREATE INDEX idx_findings_resolution_status ON findings(resolution_status);
 CREATE INDEX idx_findings_first_seen ON findings(first_seen);
 CREATE INDEX idx_findings_last_seen ON findings(last_seen);
 
+-- Composite indexes for common dashboard queries
+CREATE INDEX idx_findings_resolution_first_seen ON findings(resolution_status, first_seen DESC);
+CREATE INDEX idx_findings_tool_resolution ON findings(tool_source, resolution_status);
+CREATE INDEX idx_findings_severity_resolution ON findings(severity, resolution_status);
+CREATE INDEX idx_findings_file_resolution ON findings(file_path, resolution_status);
+CREATE INDEX idx_findings_secret_type ON findings(secret_type);
+
 -- Text search indexes
 CREATE INDEX idx_findings_file_path_gin ON findings USING gin(file_path gin_trgm_ops);
 CREATE INDEX idx_findings_secret_type_gin ON findings USING gin(secret_type gin_trgm_ops);

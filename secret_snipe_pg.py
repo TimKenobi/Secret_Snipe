@@ -345,6 +345,337 @@ def luhn_checksum(card_number: str) -> bool:
     return checksum % 10 == 0
 
 
+def is_test_credit_card(card_number: str) -> bool:
+    """
+    Detect test/dummy credit card numbers that are clearly not real.
+    
+    Patterns detected:
+    - Repeating groups (e.g., 5575 5575 5575 5575, 4000 4000 4000 4000)
+    - Sequential numbers (e.g., 1234 5678 9012 3456)
+    - All same digits (e.g., 4444 4444 4444 4444)
+    - Known test card numbers from payment processors
+    
+    Args:
+        card_number: The card number string
+        
+    Returns:
+        True if the card appears to be test data, False otherwise
+    """
+    # Remove spaces, dashes, and any other non-digit characters
+    digits = ''.join(c for c in card_number if c.isdigit())
+    
+    if len(digits) < 13:
+        return False
+    
+    # Check for repeating 4-digit groups (e.g., 5575 5575 5575 5575)
+    if len(digits) == 16:
+        groups = [digits[i:i+4] for i in range(0, 16, 4)]
+        if len(set(groups)) == 1:
+            return True  # All 4 groups are identical
+        # Check for 2-group repeat pattern (e.g., 1234 5678 1234 5678)
+        if groups[0] == groups[2] and groups[1] == groups[3]:
+            return True
+    
+    # Check for all same digits (e.g., 4444444444444444)
+    if len(set(digits)) == 1:
+        return True
+    
+    # Check for sequential patterns
+    sequential_asc = ''.join(str(i % 10) for i in range(len(digits)))
+    sequential_desc = ''.join(str((9 - i) % 10) for i in range(len(digits)))
+    if digits == sequential_asc[:len(digits)] or digits == sequential_desc[:len(digits)]:
+        return True
+    
+    # Known test card numbers from major payment processors
+    known_test_cards = {
+        # Stripe test cards
+        '4242424242424242',  # Visa
+        '4000056655665556',  # Visa (debit)
+        '5555555555554444',  # Mastercard
+        '2223003122003222',  # Mastercard (2-series)
+        '5200828282828210',  # Mastercard (debit)
+        '378282246310005',   # Amex
+        '371449635398431',   # Amex
+        '6011111111111117',  # Discover
+        '6011000990139424',  # Discover
+        # PayPal test cards
+        '4111111111111111',  # Visa
+        '4012888888881881',  # Visa
+        # Braintree test cards
+        '4009348888881881',
+        '4012000033330026',
+        '4012000077777777',
+        # Authorize.net test cards
+        '370000000000002',   # Amex
+        '6011000000000012',  # Discover
+        # Generic test patterns
+        '0000000000000000',
+        '1111111111111111',
+        '1234567890123456',
+    }
+    
+    if digits in known_test_cards:
+        return True
+    
+    return False
+
+
+def validate_ssn(ssn: str) -> tuple:
+    """
+    Validate a Social Security Number using known rules.
+    
+    SSN validation rules:
+    - Cannot be all zeros in any group (000-XX-XXXX, XXX-00-XXXX, XXX-XX-0000)
+    - Area number (first 3 digits) cannot be 000, 666, or 900-999
+    - Cannot be known invalid/advertisement SSNs
+    
+    Args:
+        ssn: The SSN string (with or without dashes)
+        
+    Returns:
+        Tuple of (is_valid, reason) where reason explains invalidation
+    """
+    # Remove spaces and dashes
+    digits = ''.join(c for c in ssn if c.isdigit())
+    
+    if len(digits) != 9:
+        return False, "Invalid length"
+    
+    area = int(digits[:3])
+    group = int(digits[3:5])
+    serial = int(digits[5:])
+    
+    # Area number cannot be 000, 666, or 900-999
+    if area == 0:
+        return False, "Invalid area number (000)"
+    if area == 666:
+        return False, "Invalid area number (666)"
+    if area >= 900:
+        return False, "Invalid area number (900-999)"
+    
+    # Group number cannot be 00
+    if group == 0:
+        return False, "Invalid group number (00)"
+    
+    # Serial number cannot be 0000
+    if serial == 0:
+        return False, "Invalid serial number (0000)"
+    
+    # Known invalid SSNs (used in advertisements, etc.)
+    known_invalid = {
+        '078051120',  # Woolworth wallet SSN (most misused)
+        '219099999',  # Used in advertisements
+        '457555462',  # Used in commercials
+        '123456789',  # Obviously fake
+        '111111111',  # All same digits
+        '222222222',
+        '333333333',
+        '444444444',
+        '555555555',
+        '666666666',
+        '777777777',
+        '888888888',
+        '999999999',
+    }
+    
+    if digits in known_invalid:
+        return False, f"Known invalid/test SSN"
+    
+    # Check for repeating patterns
+    if len(set(digits)) <= 2:
+        return False, "Suspicious repeating pattern"
+    
+    return True, ""
+
+
+def validate_aws_access_key(key: str) -> tuple:
+    """
+    Validate AWS Access Key ID format.
+    
+    AWS Access Key IDs:
+    - Start with 'AKIA' (IAM user) or 'ASIA' (temporary/STS)
+    - Followed by 16 alphanumeric characters
+    - Total length: 20 characters
+    
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    # Remove any whitespace
+    key = key.strip()
+    
+    # Must be exactly 20 characters
+    if len(key) != 20:
+        return False, f"Invalid length: {len(key)} (expected 20)"
+    
+    # Must start with AKIA (long-term) or ASIA (temporary)
+    if not key.startswith(('AKIA', 'ASIA', 'AIDA', 'AROA', 'AIPA', 'ANPA', 'ANVA', 'AGPA')):
+        return False, "Invalid prefix (not a valid AWS key type)"
+    
+    # Rest must be alphanumeric (uppercase and digits)
+    if not key[4:].isalnum():
+        return False, "Contains invalid characters"
+    
+    # Check for obvious test patterns
+    test_patterns = {
+        'AKIAIOSFODNN7EXAMPLE',  # AWS documentation example
+        'AKIAI44QH8DHBEXAMPLE',  # Another AWS example
+        'AKIAXXXXXXXXXXXXXXXX',  # Placeholder pattern
+        'AKIA0000000000000000',  # Zeros pattern
+    }
+    if key in test_patterns:
+        return False, "Known test/example key"
+    
+    # Check for repeating patterns in the suffix
+    suffix = key[4:]
+    if len(set(suffix)) <= 2:
+        return False, "Suspicious repeating pattern"
+    
+    return True, ""
+
+
+def validate_jwt_token(token: str) -> tuple:
+    """
+    Validate JWT token structure and check for obvious test tokens.
+    
+    JWT structure: header.payload.signature (base64url encoded)
+    
+    Returns:
+        Tuple of (is_valid, is_expired, reason)
+    """
+    import base64
+    import json
+    
+    parts = token.split('.')
+    if len(parts) != 3:
+        return False, "Invalid JWT structure (not 3 parts)"
+    
+    try:
+        # Decode header
+        header_b64 = parts[0] + '=' * (4 - len(parts[0]) % 4)  # Add padding
+        header = json.loads(base64.urlsafe_b64decode(header_b64))
+        
+        # Check for valid algorithm
+        alg = header.get('alg', '')
+        valid_algs = ['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512', 
+                      'ES256', 'ES384', 'ES512', 'PS256', 'PS384', 'PS512']
+        if alg not in valid_algs and alg != 'none':
+            return False, f"Unknown algorithm: {alg}"
+        
+        # Decode payload
+        payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        
+        # Check for test/example payloads
+        sub = payload.get('sub', '')
+        if sub in ['1234567890', 'test', 'example', 'user', 'admin']:
+            return False, f"Likely test token (sub: {sub})"
+        
+        # Check if expired (if exp claim exists)
+        exp = payload.get('exp')
+        if exp:
+            import time
+            if exp < time.time():
+                return False, "Token is expired"
+        
+        return True, ""
+        
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        return False, f"Invalid base64/JSON: {str(e)}"
+
+
+def validate_private_key(key: str) -> tuple:
+    """
+    Validate that a private key block is not a test/example key.
+    
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    # Check for obviously fake/test keys
+    test_markers = [
+        'EXAMPLE', 'example', 'TEST', 'test', 'FAKE', 'fake',
+        'SAMPLE', 'sample', 'DUMMY', 'dummy', 'PLACEHOLDER'
+    ]
+    
+    for marker in test_markers:
+        if marker in key:
+            return False, f"Contains test marker: {marker}"
+    
+    # Check key length (real keys have substantial content)
+    key_content = key.replace('-', '').replace(' ', '').replace('\n', '')
+    if len(key_content) < 100:
+        return False, "Key content too short"
+    
+    return True, ""
+
+
+def validate_database_url(url: str) -> tuple:
+    """
+    Validate database connection string and check for test credentials.
+    
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    url_lower = url.lower()
+    
+    # Check for localhost/test hosts (less critical)
+    test_hosts = ['localhost', '127.0.0.1', '0.0.0.0', 'example.com', 'test.local']
+    for host in test_hosts:
+        if host in url_lower:
+            return False, f"Test/local host: {host}"
+    
+    # Check for obvious test credentials
+    test_creds = ['password', 'admin:admin', 'root:root', 'test:test', 
+                  'user:password', 'postgres:postgres', 'sa:sa']
+    for cred in test_creds:
+        if cred in url_lower:
+            return False, f"Obvious test credential: {cred}"
+    
+    return True, ""
+
+
+def validate_api_token_entropy(token: str) -> tuple:
+    """
+    Check if an API token has sufficient entropy (randomness).
+    Low entropy tokens are likely test/placeholder values.
+    
+    Returns:
+        Tuple of (is_valid, reason)
+    """
+    import math
+    
+    # Remove common prefixes
+    for prefix in ['sk_', 'pk_', 'api_', 'key_', 'token_']:
+        if token.lower().startswith(prefix):
+            token = token[len(prefix):]
+            break
+    
+    if len(token) < 10:
+        return False, "Token too short"
+    
+    # Calculate character frequency
+    freq = {}
+    for char in token:
+        freq[char] = freq.get(char, 0) + 1
+    
+    # Calculate Shannon entropy
+    entropy = 0.0
+    for count in freq.values():
+        p = count / len(token)
+        if p > 0:
+            entropy -= p * math.log2(p)
+    
+    # Real tokens typically have entropy > 3.5 bits per character
+    # Test tokens like 'xxxxxx' or 'abcdef' have low entropy
+    if entropy < 2.5:
+        return False, f"Low entropy ({entropy:.2f} bits) - likely placeholder"
+    
+    # Check for repeating patterns
+    if len(set(token)) <= 3:
+        return False, "Too few unique characters"
+    
+    return True, ""
+
+
 def is_in_comment(context, position):
     """Check if a match is within a comment"""
     # Simple comment detection - can be enhanced
@@ -402,12 +733,67 @@ def scan_text_with_signatures(text, file_path_str):
                     is_valid = False
                     validation_reason = "In comment"
 
-                # Validate credit card numbers with Luhn algorithm
+                # Validate credit card numbers with Luhn algorithm and test pattern detection
                 if is_valid and sig["name"] == "Credit Card Number":
-                    if not luhn_checksum(value):
+                    # First check if it's a test/dummy card number
+                    if is_test_credit_card(value):
+                        is_valid = False
+                        validation_reason = "Test/dummy credit card number (repeating pattern or known test card)"
+                        logging.debug(f"Credit card {value[:6]}...{value[-4:]} identified as test card")
+                    # Then validate with Luhn algorithm
+                    elif not luhn_checksum(value):
                         is_valid = False
                         validation_reason = "Failed Luhn checksum validation"
                         logging.debug(f"Credit card {value[:6]}...{value[-4:]} failed Luhn check")
+
+                # Validate SSN numbers using known rules
+                if is_valid and sig["name"] in ["Social Security Number", "SSN Format (Context Required)"]:
+                    ssn_valid, ssn_reason = validate_ssn(value)
+                    if not ssn_valid:
+                        is_valid = False
+                        validation_reason = f"Invalid SSN: {ssn_reason}"
+                        logging.debug(f"SSN failed validation: {ssn_reason}")
+
+                # Validate AWS Access Key IDs
+                if is_valid and sig["name"] == "AWS Access Key ID":
+                    aws_valid, aws_reason = validate_aws_access_key(value)
+                    if not aws_valid:
+                        is_valid = False
+                        validation_reason = f"Invalid AWS Key: {aws_reason}"
+                        logging.debug(f"AWS key failed validation: {aws_reason}")
+
+                # Validate JWT tokens
+                if is_valid and sig["name"] == "JWT Token":
+                    jwt_valid, jwt_reason = validate_jwt_token(value)
+                    if not jwt_valid:
+                        is_valid = False
+                        validation_reason = f"Invalid JWT: {jwt_reason}"
+                        logging.debug(f"JWT failed validation: {jwt_reason}")
+
+                # Validate Private Keys
+                if is_valid and sig["name"] == "Private Key":
+                    key_valid, key_reason = validate_private_key(value)
+                    if not key_valid:
+                        is_valid = False
+                        validation_reason = f"Invalid Private Key: {key_reason}"
+                        logging.debug(f"Private key failed validation: {key_reason}")
+
+                # Validate Database Connection Strings
+                if is_valid and sig["name"] == "Database Connection String":
+                    db_valid, db_reason = validate_database_url(value)
+                    if not db_valid:
+                        is_valid = False
+                        validation_reason = f"Test DB URL: {db_reason}"
+                        logging.debug(f"Database URL failed validation: {db_reason}")
+
+                # Validate generic API tokens for entropy (catches placeholders)
+                if is_valid and sig["name"] in ["API Key", "Generic Auth Token", "Slack Token", 
+                                                  "SendGrid API Key", "Twilio API Key", "NPM Token"]:
+                    entropy_valid, entropy_reason = validate_api_token_entropy(value)
+                    if not entropy_valid:
+                        is_valid = False
+                        validation_reason = f"Low quality token: {entropy_reason}"
+                        logging.debug(f"API token failed entropy check: {entropy_reason}")
 
                 finding = {
                     "file_path": file_path_str,
@@ -433,30 +819,44 @@ def scan_text_with_signatures(text, file_path_str):
     return findings
 
 def process_file(file_path, project_id, scan_session_id):
-    """Process a single file for secrets"""
+    """Process a single file for secrets with incremental scanning support.
+    
+    Files that haven't changed since last scan are skipped for efficiency.
+    """
     file_path_str = str(file_path)
     
     logging.info(f"Starting processing of file: {file_path_str} (size: {os.path.getsize(file_path)} bytes)")
 
     try:
         # Check file size limit
-        if os.path.getsize(file_path) > config.scanner.max_file_size_mb * 1024 * 1024:
+        file_size = os.path.getsize(file_path)
+        if file_size > config.scanner.max_file_size_mb * 1024 * 1024:
             logging.warning(f"File too large: {file_path_str}")
             return []
+
+        # Calculate file hash early for change detection
+        file_hash = xxhash.xxh64(open(file_path, 'rb').read()).hexdigest()
+        
+        # Check if file has changed since last scan (incremental scanning)
+        if not file_cache_manager.is_file_changed(file_path_str, file_hash):
+            logging.debug(f"File unchanged, skipping: {file_path_str}")
+            return []  # File hasn't changed, skip processing
+        
+        logging.info(f"File changed or new, scanning: {file_path_str}")
 
         # Extract text from file
         text = extract_text_from_file(file_path)
         if not text:
+            # Still cache the file even if no text extracted (e.g., binary)
+            file_cache_manager.cache_file(file_path_str, file_hash, scan_session_id)
             return []
 
         # Get file metadata for change detection
         try:
             file_stat = file_path.stat()
             file_modified_at = datetime.fromtimestamp(file_stat.st_mtime)
-            file_size = file_stat.st_size
         except Exception:
             file_modified_at = None
-            file_size = None
 
         # Scan text for secrets
         findings = scan_text_with_signatures(text, file_path_str)
@@ -485,8 +885,7 @@ def process_file(file_path, project_id, scan_session_id):
             if finding_id:
                 stored_findings.append(finding_id)
 
-        # Cache file processing
-        file_hash = xxhash.xxh64(open(file_path, 'rb').read()).hexdigest()
+        # Cache file processing (update cache with new hash)
         file_cache_manager.cache_file(file_path_str, file_hash, scan_session_id)
 
         return stored_findings

@@ -274,4 +274,4 @@ setInterval(function() {
     if (tables.length > 0) {
         initColumnResizing();
     }
-}, 2000);
+}, 10000);

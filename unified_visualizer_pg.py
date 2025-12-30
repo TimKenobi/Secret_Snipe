@@ -3535,8 +3535,9 @@ def create_layout():
         # Interval component for auto-refresh
         dcc.Interval(
             id="interval-component",
-            interval=60000,  # 60 seconds - reduced frequency for better performance
-            n_intervals=0
+            interval=120000,  # 2 minutes - use Refresh button for manual updates
+            n_intervals=0,
+            disabled=False  # Can be disabled if needed
         )
     ])
 

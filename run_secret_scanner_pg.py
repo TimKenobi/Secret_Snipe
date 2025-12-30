@@ -227,50 +227,95 @@ class MultiScannerOrchestrator:
                 if line.strip():
                     finding_data = json.loads(line)
                     
+                    # Skip log messages
+                    if 'level' in finding_data:
+                        continue
+                    
                     # Map detector type to severity
                     detector_name = finding_data.get('detector_name', finding_data.get('DetectorName', 'unknown'))
                     raw_secret = finding_data.get('raw', finding_data.get('Raw', ''))
                     verified = finding_data.get('verified', finding_data.get('Verified', False))
-                    file_path = finding_data.get('path', finding_data.get('SourceMetadata', {}).get('Data', {}).get('Filesystem', {}).get('file', ''))
+                    
+                    # Extract file path and line number from SourceMetadata
+                    source_meta = finding_data.get('SourceMetadata', {})
+                    data = source_meta.get('Data', {})
+                    file_path = finding_data.get('path', '')
+                    line_number = finding_data.get('line_number')
+                    
+                    if not file_path:
+                        if 'Filesystem' in data:
+                            file_path = data['Filesystem'].get('file', '')
+                            line_number = data['Filesystem'].get('line')
+                        elif 'Git' in data:
+                            file_path = data['Git'].get('file', '')
+                            line_number = data['Git'].get('line')
+                    
+                    if not file_path:
+                        continue
                     
                     severity = self._get_trufflehog_severity(detector_name, verified)
                     
-                    # Build informative context string
+                    # Build informative context string using all available fields
                     context_parts = []
                     
-                    # Add verification status
+                    # Add verification status with details
                     if verified:
-                        context_parts.append("✅ VERIFIED - This secret was confirmed active!")
+                        context_parts.append("✅ VERIFIED - Secret confirmed active!")
                     else:
-                        context_parts.append("⚠️ Unverified - Requires manual review")
+                        verification_error = finding_data.get('VerificationError', '')
+                        if verification_error:
+                            if 'SignatureDoesNotMatch' in verification_error:
+                                context_parts.append("⚠️ Unverified - Invalid signature (likely rotated)")
+                            elif 'context deadline exceeded' in verification_error:
+                                context_parts.append("⚠️ Unverified - Verification timed out")
+                            elif '403' in verification_error or 'Forbidden' in verification_error:
+                                context_parts.append("⚠️ Unverified - Access denied")
+                            elif '401' in verification_error or 'Unauthorized' in verification_error:
+                                context_parts.append("⚠️ Unverified - Invalid credentials")
+                            else:
+                                context_parts.append(f"⚠️ Unverified - {verification_error[:80]}")
+                        else:
+                            context_parts.append("⚠️ Unverified - Requires manual review")
                     
-                    # Add detector info
+                    # Add detector and decoder info
                     context_parts.append(f"Detector: {detector_name}")
+                    decoder_name = finding_data.get('DecoderName', '')
+                    if decoder_name and decoder_name.lower() not in ['plain', 'base64']:
+                        context_parts.append(f"Decoder: {decoder_name}")
                     
-                    # Add redacted preview of the secret
-                    if raw_secret:
-                        preview = raw_secret[:20] + "..." if len(raw_secret) > 20 else raw_secret
-                        # Mask middle portion
-                        if len(preview) > 8:
-                            masked = preview[:4] + "*" * (len(preview) - 8) + preview[-4:]
-                            context_parts.append(f"Secret preview: {masked}")
+                    # Use the already-redacted value from TruffleHog (preferred)
+                    redacted_secret = finding_data.get('Redacted', '')
+                    if redacted_secret:
+                        context_parts.append(f"Secret: {redacted_secret[:40]}{'...' if len(redacted_secret) > 40 else ''}")
+                    elif raw_secret:
+                        if len(raw_secret) > 8:
+                            masked = raw_secret[:4] + "*" * min(len(raw_secret) - 8, 20) + raw_secret[-4:]
+                            context_parts.append(f"Secret: {masked[:40]}")
                     
-                    # Add extra data if available
+                    # Add resource type from ExtraData
                     extra_data = finding_data.get('ExtraData', finding_data.get('extra_data', {}))
                     if extra_data and isinstance(extra_data, dict):
-                        for key, value in list(extra_data.items())[:5]:
-                            if value and str(value).strip():
-                                context_parts.append(f"{key}: {str(value)[:100]}")
+                        resource_type = extra_data.get('resource_type', '')
+                        if resource_type:
+                            context_parts.append(f"Type: {resource_type}")
+                        for key in ['account', 'email', 'username', 'owner', 'org']:
+                            if key in extra_data and extra_data[key]:
+                                context_parts.append(f"{key.title()}: {str(extra_data[key])[:50]}")
                     
-                    context_str = " | ".join(context_parts) if context_parts else finding_data.get('context', f"TruffleHog finding: {detector_name}")
+                    # Add line number if available
+                    if line_number:
+                        context_parts.append(f"Line: {line_number}")
+                    
+                    context_str = " | ".join(context_parts) if context_parts else f"TruffleHog finding: {detector_name}"
                     
                     # Build comprehensive metadata
                     metadata = {
                         'verified': verified,
                         'detector_name': detector_name,
                         'detector_type': finding_data.get('DetectorType', finding_data.get('detector_type', '')),
-                        'decoder_name': finding_data.get('DecoderName', ''),
-                        'original_data': {k: v for k, v in finding_data.items() if k not in ['Raw', 'raw', 'SourceMetadata']}
+                        'decoder_name': decoder_name,
+                        'verification_error': finding_data.get('VerificationError', '')[:200] if finding_data.get('VerificationError') else '',
+                        'redacted': redacted_secret[:100] if redacted_secret else ''
                     }
                     
                     finding_id = findings_manager.insert_finding(
@@ -281,7 +326,7 @@ class MultiScannerOrchestrator:
                         secret_value=raw_secret[:500],
                         context=context_str[:1000],
                         severity=severity,
-                        line_number=finding_data.get('line_number'),
+                        line_number=line_number,
                         tool_source='trufflehog',
                         metadata=metadata
                     )
@@ -406,39 +451,66 @@ class MultiScannerOrchestrator:
                     # Map severity based on detector type and verification status
                     severity = self._get_trufflehog_severity(detector_name, verified)
                     
-                    # Build informative context string
+                    # Extract line number if available
+                    line_number = None
+                    if 'Filesystem' in data:
+                        line_number = data['Filesystem'].get('line')
+                    elif 'Git' in data:
+                        line_number = data['Git'].get('line')
+                    
+                    # Build informative context string using all available fields
                     context_parts = []
                     
-                    # Add verification status
+                    # Add verification status with details
                     if verified:
-                        context_parts.append("✅ VERIFIED - This secret was confirmed active!")
+                        context_parts.append("✅ VERIFIED - Secret confirmed active!")
                     else:
-                        context_parts.append("⚠️ Unverified - Requires manual review")
+                        verification_error = finding_data.get('VerificationError', '')
+                        if verification_error:
+                            # Summarize the error
+                            if 'SignatureDoesNotMatch' in verification_error:
+                                context_parts.append("⚠️ Unverified - Invalid signature (likely rotated)")
+                            elif 'context deadline exceeded' in verification_error:
+                                context_parts.append("⚠️ Unverified - Verification timed out")
+                            elif '403' in verification_error or 'Forbidden' in verification_error:
+                                context_parts.append("⚠️ Unverified - Access denied")
+                            elif '401' in verification_error or 'Unauthorized' in verification_error:
+                                context_parts.append("⚠️ Unverified - Invalid credentials")
+                            else:
+                                context_parts.append(f"⚠️ Unverified - {verification_error[:80]}")
+                        else:
+                            context_parts.append("⚠️ Unverified - Requires manual review")
                     
-                    # Add detector info
+                    # Add detector and decoder info
                     context_parts.append(f"Detector: {detector_name}")
+                    decoder_name = finding_data.get('DecoderName', '')
+                    if decoder_name and decoder_name.lower() not in ['plain', 'base64']:
+                        context_parts.append(f"Decoder: {decoder_name}")
                     
-                    # Add redacted preview of the secret
-                    if raw_secret:
-                        preview = raw_secret[:20] + "..." if len(raw_secret) > 20 else raw_secret
-                        # Mask middle portion
-                        if len(preview) > 8:
-                            masked = preview[:4] + "*" * (len(preview) - 8) + preview[-4:]
-                            context_parts.append(f"Secret preview: {masked}")
+                    # Use the already-redacted value from TruffleHog (preferred)
+                    redacted_secret = finding_data.get('Redacted', '')
+                    if redacted_secret:
+                        context_parts.append(f"Secret: {redacted_secret[:40]}{'...' if len(redacted_secret) > 40 else ''}")
+                    elif raw_secret:
+                        # Fallback: mask manually
+                        if len(raw_secret) > 8:
+                            masked = raw_secret[:4] + "*" * min(len(raw_secret) - 8, 20) + raw_secret[-4:]
+                            context_parts.append(f"Secret: {masked[:40]}")
                     
-                    # Add extra data if available
+                    # Add resource type from ExtraData
                     extra_data = finding_data.get('ExtraData', {})
                     if extra_data and isinstance(extra_data, dict):
-                        for key, value in list(extra_data.items())[:5]:  # Limit to 5 fields
-                            if value and str(value).strip():
-                                context_parts.append(f"{key}: {str(value)[:100]}")
+                        resource_type = extra_data.get('resource_type', '')
+                        if resource_type:
+                            context_parts.append(f"Type: {resource_type}")
+                        # Add other useful extra fields
+                        for key in ['account', 'email', 'username', 'owner', 'org']:
+                            if key in extra_data and extra_data[key]:
+                                context_parts.append(f"{key.title()}: {str(extra_data[key])[:50]}")
                     
-                    # Add structured info (like regex name, decoder steps, etc.)
-                    if 'StructuredData' in finding_data:
-                        struct_data = finding_data['StructuredData']
-                        if isinstance(struct_data, dict):
-                            for key, value in list(struct_data.items())[:3]:
-                                context_parts.append(f"{key}: {str(value)[:100]}")
+                    # Add line number if available
+                    if line_number:
+                        context_parts.append(f"Line: {line_number}")
                     
                     context_str = " | ".join(context_parts) if context_parts else f"TruffleHog finding: {detector_name}"
                     
@@ -447,8 +519,10 @@ class MultiScannerOrchestrator:
                         'verified': verified,
                         'detector_name': detector_name,
                         'detector_type': finding_data.get('DetectorType', ''),
-                        'decoder_name': finding_data.get('DecoderName', ''),
+                        'decoder_name': decoder_name,
                         'source_type': list(data.keys())[0] if data else '',
+                        'verification_error': finding_data.get('VerificationError', '')[:200] if finding_data.get('VerificationError') else '',
+                        'redacted': redacted_secret[:100] if redacted_secret else '',
                         'extra_data': extra_data if isinstance(extra_data, dict) else {}
                     }
                     
@@ -461,7 +535,7 @@ class MultiScannerOrchestrator:
                         secret_value=raw_secret[:500],  # Truncate large secrets
                         context=context_str[:1000],
                         severity=severity,
-                        line_number=None,  # TruffleHog doesn't always provide line numbers
+                        line_number=line_number,
                         tool_source='trufflehog',
                         metadata=metadata
                     )

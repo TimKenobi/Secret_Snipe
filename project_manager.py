@@ -21,6 +21,7 @@ Usage:
 """
 
 import os
+import json
 import logging
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from database_manager import DatabaseManager
+from psycopg2.extras import Json
 
 logger = logging.getLogger(__name__)
 
@@ -347,7 +349,7 @@ class ProjectManager:
             result = self.db.execute_query(
                 query,
                 (directory_id, dir_info.project_id, scan_type, 
-                 requested_by, scan_options or {})
+                 requested_by, Json(scan_options or {}))
             )
             
             if result:

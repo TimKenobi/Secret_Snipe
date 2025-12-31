@@ -1672,11 +1672,14 @@ except ImportError:
 )
 def toggle_project_modal(open_clicks, close_clicks, add_clicks, scan_clicks, current_style):
     """Toggle project management modal and refresh data"""
+    logger.info(f"toggle_project_modal called: open={open_clicks}, close={close_clicks}, add={add_clicks}, scan={scan_clicks}")
     ctx = dash.callback_context
     if not ctx.triggered:
+        logger.warning("toggle_project_modal: no trigger, preventing update")
         raise PreventUpdate
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    logger.info(f"toggle_project_modal triggered by: {trigger_id}")
     
     # Default hidden state
     hidden_style = {
@@ -2757,7 +2760,7 @@ def create_layout():
                             title="Run all scanners on /scan directory (custom + gitleaks + trufflehog)"),
                         html.Button("📁 Custom Scan", id="custom-scan-btn", className="scan-btn",
                             title="Configure and run a custom scan with specific settings"),
-                        html.Button("📂 Projects", id="btn-project-manager", className="scan-btn",
+                        html.Button("📂 Projects", id="btn-project-manager", n_clicks=0, className="scan-btn",
                             title="Manage scan directories and projects"),
                         html.Button("🧹 Cleanup Old Data", id="cleanup-btn", className="cleanup-btn",
                             title="Remove findings older than 30 days to free up database space")

@@ -1663,23 +1663,47 @@ except ImportError:
 
 # Server-side callback for project modal data only
 @app.callback(
-    [Output("project-directory-list", "children"),
+    [Output("project-manager-modal", "style"),
+     Output("project-directory-list", "children"),
      Output("scan-dir-selector", "options"),
      Output("pending-scans-list", "children")],
     [Input("btn-project-manager", "n_clicks"),
+     Input("close-project-modal-btn", "n_clicks"),
      Input("btn-add-directory", "n_clicks"),
      Input("btn-trigger-scan", "n_clicks")]
 )
-def update_project_modal_data(open_clicks, add_clicks, scan_clicks):
-    """Update project management modal data"""
+def update_project_modal_data(open_clicks, close_clicks, add_clicks, scan_clicks):
+    """Update project management modal data and toggle visibility"""
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+        'zIndex': '9999', 'paddingTop': '30px'
+    }
+    
     empty_list = html.P("No directories configured yet.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
     empty_options = [{"label": "No directories available", "value": ""}]
     no_pending = html.P("No pending scans.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
     
+    # Determine which button triggered the callback
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return hidden_style, empty_list, empty_options, no_pending
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # Handle close button
+    if trigger_id == "close-project-modal-btn":
+        return hidden_style, dash.no_update, dash.no_update, dash.no_update
+    
+    # For open button, show modal and load data
+    # For add/scan buttons, keep modal open (they're inside the modal)
+    modal_style = visible_style if trigger_id in ["btn-project-manager", "btn-add-directory", "btn-trigger-scan"] else hidden_style
+    
     if not PROJECT_MANAGER_AVAILABLE:
         error_msg = html.P("⚠️ Project manager not initialized. Run the database migration first.", 
                           style={'color': '#f59e0b'})
-        return error_msg, empty_options, no_pending
+        return modal_style, error_msg, empty_options, no_pending
     
     try:
         # Get directories
@@ -1733,12 +1757,12 @@ def update_project_modal_data(open_clicks, add_clicks, scan_clicks):
             pending_list = no_pending
         
         logger.info(f"Returning project modal data: {len(directories)} directories, {len(pending)} pending scans")
-        return directory_list, dropdown_options, pending_list
+        return modal_style, directory_list, dropdown_options, pending_list
             
     except Exception as e:
         logger.error(f"Error in project modal: {e}")
         error_msg = html.P(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
-        return error_msg, empty_options, no_pending
+        return modal_style, error_msg, empty_options, no_pending
 
 
 @app.callback(

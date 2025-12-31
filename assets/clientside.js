@@ -1,5 +1,43 @@
 window.dash_clientside = Object.assign({}, window.dash_clientside, {
     clientside: {
+        // Toggle project modal visibility
+        toggle_project_modal: function(open_clicks, close_clicks) {
+            const modal = document.getElementById('project-manager-modal');
+            if (!modal) {
+                console.error('Project modal not found');
+                return window.dash_clientside.no_update;
+            }
+            
+            // Determine which button was clicked
+            const ctx = window.dash_clientside.callback_context;
+            if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+                return {'display': 'none'};
+            }
+            
+            const triggerId = ctx.triggered[0].prop_id.split('.')[0];
+            console.log('Project modal triggered by:', triggerId);
+            
+            if (triggerId === 'btn-project-manager' && open_clicks > 0) {
+                console.log('Opening project modal');
+                return {
+                    'display': 'block',
+                    'position': 'fixed',
+                    'top': '0',
+                    'left': '0',
+                    'right': '0',
+                    'bottom': '0',
+                    'backgroundColor': 'rgba(0,0,0,0.85)',
+                    'zIndex': '9999',
+                    'paddingTop': '30px'
+                };
+            } else if (triggerId === 'close-project-modal-btn') {
+                console.log('Closing project modal');
+                return {'display': 'none'};
+            }
+            
+            return window.dash_clientside.no_update;
+        },
+        
         setup_chart_observer: function(dark_mode_value) {
             // This function sets up a MutationObserver to fix chart backgrounds in dark mode.
             // It watches for when Plotly charts are added to the DOM and applies

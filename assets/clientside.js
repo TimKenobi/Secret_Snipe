@@ -173,11 +173,16 @@ document.addEventListener('DOMContentLoaded', function() {
         mutations.forEach(function(mutation) {
             mutation.addedNodes.forEach(function(node) {
                 if (node.nodeType === 1) {
+                    // Get className as string (handles SVG elements which have SVGAnimatedString)
+                    const classNameStr = typeof node.className === 'string' 
+                        ? node.className 
+                        : (node.className && node.className.baseVal) || '';
+                    
                     // Check for dropdown menu elements
                     if (node.classList && (
                         node.classList.contains('Select-menu-outer') ||
                         node.classList.contains('Select-menu') ||
-                        node.className.includes('-menu')
+                        classNameStr.includes('-menu')
                     )) {
                         node.style.backgroundColor = '#2d2d2d';
                         node.style.borderColor = '#555';

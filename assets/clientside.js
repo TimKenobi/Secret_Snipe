@@ -318,3 +318,53 @@ setInterval(function() {
         initColumnResizing();
     }
 }, 10000);
+
+// Direct DOM-based project modal toggle (more reliable than Dash callbacks)
+document.addEventListener('DOMContentLoaded', function() {
+    // Wait for Dash to render, then attach click handlers
+    setTimeout(function() {
+        setupProjectModalHandlers();
+    }, 2000);
+});
+
+function setupProjectModalHandlers() {
+    const openBtn = document.getElementById('btn-project-manager');
+    const closeBtn = document.getElementById('close-project-modal-btn');
+    const modal = document.getElementById('project-manager-modal');
+    
+    if (openBtn && modal) {
+        openBtn.addEventListener('click', function(e) {
+            console.log('Project button clicked - opening modal');
+            modal.style.display = 'block';
+            modal.style.position = 'fixed';
+            modal.style.top = '0';
+            modal.style.left = '0';
+            modal.style.right = '0';
+            modal.style.bottom = '0';
+            modal.style.backgroundColor = 'rgba(0,0,0,0.85)';
+            modal.style.zIndex = '9999';
+            modal.style.paddingTop = '30px';
+        });
+        console.log('Project modal open handler attached');
+    } else {
+        console.log('Project button or modal not found, retrying in 2s');
+        setTimeout(setupProjectModalHandlers, 2000);
+    }
+    
+    if (closeBtn && modal) {
+        closeBtn.addEventListener('click', function(e) {
+            console.log('Close button clicked - hiding modal');
+            modal.style.display = 'none';
+        });
+        console.log('Project modal close handler attached');
+    }
+}
+
+// Also run when page might have been updated by Dash
+setInterval(function() {
+    const openBtn = document.getElementById('btn-project-manager');
+    if (openBtn && !openBtn.hasAttribute('data-modal-handler')) {
+        openBtn.setAttribute('data-modal-handler', 'true');
+        setupProjectModalHandlers();
+    }
+}, 3000);

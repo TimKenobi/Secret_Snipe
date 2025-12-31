@@ -1658,41 +1658,8 @@ except ImportError:
     logger.warning("Project manager not available - multi-directory features disabled")
 
 
-# Clientside callback for project modal visibility (more reliable)
-app.clientside_callback(
-    """
-    function(open_clicks, close_clicks) {
-        const ctx = dash_clientside.callback_context;
-        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
-            return {'display': 'none'};
-        }
-        
-        const triggerId = ctx.triggered[0].prop_id.split('.')[0];
-        console.log('Project modal triggered by:', triggerId);
-        
-        if (triggerId === 'btn-project-manager' && open_clicks > 0) {
-            return {
-                'display': 'block',
-                'position': 'fixed',
-                'top': '0',
-                'left': '0',
-                'right': '0',
-                'bottom': '0',
-                'backgroundColor': 'rgba(0,0,0,0.85)',
-                'zIndex': '9999',
-                'paddingTop': '30px'
-            };
-        } else if (triggerId === 'close-project-modal-btn') {
-            return {'display': 'none'};
-        }
-        
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("project-manager-modal", "style"),
-    [Input("btn-project-manager", "n_clicks"),
-     Input("close-project-modal-btn", "n_clicks")]
-)
+# Project modal visibility is handled by direct DOM manipulation in clientside.js
+# This is more reliable than Dash callbacks for modal show/hide
 
 # Server-side callback for project modal data only
 @app.callback(

@@ -319,7 +319,159 @@ setInterval(function() {
     }
 }, 10000);
 
-// Project modal is now handled by Dash server-side callback
-// No JavaScript handlers needed - the btn-project-manager click triggers
-// the update_project_modal_data callback which returns the visible style
-console.log('Project modal controlled by Dash callback');
+// Project modal - bypass Dash completely with pure JavaScript modal
+setTimeout(function() {
+    const projectBtn = document.getElementById('btn-project-manager');
+    if (projectBtn && !projectBtn.hasAttribute('data-js-modal')) {
+        projectBtn.setAttribute('data-js-modal', 'true');
+        
+        projectBtn.addEventListener('click', function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            
+            // Remove any existing JS modal
+            const existing = document.getElementById('js-project-modal');
+            if (existing) existing.remove();
+            
+            // Create modal overlay
+            const overlay = document.createElement('div');
+            overlay.id = 'js-project-modal';
+            overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.9);z-index:99999;display:flex;align-items:flex-start;justify-content:center;padding-top:30px;overflow-y:auto;';
+            
+            // Create modal content
+            const content = document.createElement('div');
+            content.style.cssText = 'background:#2d3748;padding:25px;border-radius:8px;max-width:700px;width:90%;max-height:85vh;overflow-y:auto;color:#e0e0e0;border:1px solid #555;';
+            content.innerHTML = `
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+                    <h2 style="margin:0;color:#60a5fa;">📂 Project & Directory Management</h2>
+                    <button id="js-modal-close" style="background:none;border:none;color:#aaa;font-size:24px;cursor:pointer;">✕</button>
+                </div>
+                <p style="color:#9ca3af;margin-bottom:20px;">Manage scan directories and trigger scans.</p>
+                
+                <div style="background:#1f2937;padding:15px;border-radius:8px;margin-bottom:20px;">
+                    <h4 style="color:#e0e0e0;margin:0 0 10px 0;">📁 Scan Directories</h4>
+                    <div id="js-dir-list" style="color:#9ca3af;">Loading...</div>
+                </div>
+                
+                <div style="background:#1f2937;padding:15px;border-radius:8px;margin-bottom:20px;">
+                    <h4 style="color:#e0e0e0;margin:0 0 10px 0;">🔍 Trigger Manual Scan</h4>
+                    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+                        <select id="js-scan-dir" style="padding:8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;">
+                            <option value="">Loading directories...</option>
+                        </select>
+                        <select id="js-scan-type" style="padding:8px;background:#3d3d3d;color:#e0e0e0;border:1px solid #555;border-radius:4px;">
+                            <option value="full">🔄 Full Scan</option>
+                            <option value="custom_only">🔍 Custom Only</option>
+                            <option value="gitleaks_only">🔐 Gitleaks Only</option>
+                            <option value="trufflehog_only">🐷 TruffleHog Only</option>
+                        </select>
+                        <button id="js-start-scan" style="padding:8px 16px;background:#3b82f6;color:white;border:none;border-radius:6px;cursor:pointer;font-weight:bold;">▶️ Start Scan</button>
+                    </div>
+                    <div id="js-scan-result" style="margin-top:10px;"></div>
+                </div>
+                
+                <div style="background:#1f2937;padding:15px;border-radius:8px;">
+                    <h4 style="color:#e0e0e0;margin:0 0 10px 0;">⏳ Pending/Running Scans</h4>
+                    <div id="js-pending-list" style="color:#9ca3af;">Loading...</div>
+                </div>
+            `;
+            
+            overlay.appendChild(content);
+            document.body.appendChild(overlay);
+            
+            // Close button
+            document.getElementById('js-modal-close').addEventListener('click', function() {
+                overlay.remove();
+            });
+            
+            // Close on overlay click
+            overlay.addEventListener('click', function(e) {
+                if (e.target === overlay) overlay.remove();
+            });
+            
+            // Escape key to close
+            document.addEventListener('keydown', function escHandler(e) {
+                if (e.key === 'Escape') {
+                    overlay.remove();
+                    document.removeEventListener('keydown', escHandler);
+                }
+            });
+            
+            // Fetch project data from API
+            fetch('/api/projects/directories')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.directories && data.directories.length > 0) {
+                        let html = '';
+                        let options = '<option value="">Select directory...</option>';
+                        data.directories.forEach(d => {
+                            const status = d.is_active ? '✅' : '⏸️';
+                            const lastScan = d.last_scan_at || 'Never';
+                            html += '<div style="padding:8px;border-bottom:1px solid #444;"><strong style="color:#e0e0e0;">' + status + ' ' + d.display_name + '</strong> <span style="color:#6b7280;font-size:12px;">(' + d.scan_schedule + ')</span><br><span style="color:#9ca3af;font-size:12px;">' + d.directory_path + '</span><span style="color:#6b7280;font-size:11px;"> | Last: ' + lastScan + ' | Files: ' + (d.total_files || 0).toLocaleString() + ' | Findings: ' + (d.total_findings || 0).toLocaleString() + '</span></div>';
+                            if (d.is_active) {
+                                options += '<option value="' + d.id + '">' + d.display_name + '</option>';
+                            }
+                        });
+                        document.getElementById('js-dir-list').innerHTML = html;
+                        document.getElementById('js-scan-dir').innerHTML = options;
+                    } else {
+                        document.getElementById('js-dir-list').innerHTML = '<p style="font-style:italic;">No directories configured.</p>';
+                    }
+                })
+                .catch(err => {
+                    document.getElementById('js-dir-list').innerHTML = '<p style="color:#ef4444;">Error loading: ' + err + '</p>';
+                });
+            
+            // Fetch pending scans
+            fetch('/api/projects/pending-scans')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.pending && data.pending.length > 0) {
+                        let html = '';
+                        data.pending.forEach(p => {
+                            const color = p.status === 'running' ? '#22c55e' : (p.status === 'pending' ? '#f59e0b' : '#3b82f6');
+                            html += '<div style="padding:5px;border-bottom:1px solid #333;"><span style="color:' + color + ';font-weight:bold;">⏳ ' + p.scan_type + '</span> <span style="color:#9ca3af;"> - ' + p.status + '</span></div>';
+                        });
+                        document.getElementById('js-pending-list').innerHTML = html;
+                    } else {
+                        document.getElementById('js-pending-list').innerHTML = '<p style="font-style:italic;">No pending scans.</p>';
+                    }
+                })
+                .catch(err => {
+                    document.getElementById('js-pending-list').innerHTML = '<p style="color:#ef4444;">Error: ' + err + '</p>';
+                });
+            
+            // Start scan button
+            document.getElementById('js-start-scan').addEventListener('click', function() {
+                const dirId = document.getElementById('js-scan-dir').value;
+                const scanType = document.getElementById('js-scan-type').value;
+                if (!dirId) {
+                    document.getElementById('js-scan-result').innerHTML = '<span style="color:#f59e0b;">Please select a directory</span>';
+                    return;
+                }
+                document.getElementById('js-scan-result').innerHTML = '<span style="color:#3b82f6;">Starting scan...</span>';
+                fetch('/api/projects/trigger-scan', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({directory_id: parseInt(dirId), scan_type: scanType})
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        document.getElementById('js-scan-result').innerHTML = '<span style="color:#22c55e;">✅ Scan queued! ID: ' + (data.request_id || 'unknown').substring(0,8) + '...</span>';
+                    } else {
+                        document.getElementById('js-scan-result').innerHTML = '<span style="color:#ef4444;">❌ ' + (data.error || 'Failed') + '</span>';
+                    }
+                })
+                .catch(err => {
+                    document.getElementById('js-scan-result').innerHTML = '<span style="color:#ef4444;">❌ Error: ' + err + '</span>';
+                });
+            });
+            
+            console.log('✅ JavaScript modal opened');
+        }, true);
+        
+        console.log('✅ JavaScript modal handler attached to Projects button');
+    }
+}, 2000);
+

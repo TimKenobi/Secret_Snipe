@@ -1658,48 +1658,61 @@ except ImportError:
     logger.warning("Project manager not available - multi-directory features disabled")
 
 
+# Clientside callback for project modal visibility (more reliable)
+app.clientside_callback(
+    """
+    function(open_clicks, close_clicks) {
+        const ctx = dash_clientside.callback_context;
+        if (!ctx || !ctx.triggered || ctx.triggered.length === 0) {
+            return {'display': 'none'};
+        }
+        
+        const triggerId = ctx.triggered[0].prop_id.split('.')[0];
+        console.log('Project modal triggered by:', triggerId);
+        
+        if (triggerId === 'btn-project-manager' && open_clicks > 0) {
+            return {
+                'display': 'block',
+                'position': 'fixed',
+                'top': '0',
+                'left': '0',
+                'right': '0',
+                'bottom': '0',
+                'backgroundColor': 'rgba(0,0,0,0.85)',
+                'zIndex': '9999',
+                'paddingTop': '30px'
+            };
+        } else if (triggerId === 'close-project-modal-btn') {
+            return {'display': 'none'};
+        }
+        
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("project-manager-modal", "style"),
+    [Input("btn-project-manager", "n_clicks"),
+     Input("close-project-modal-btn", "n_clicks")]
+)
+
+# Server-side callback for project modal data only
 @app.callback(
-    [Output("project-manager-modal", "style"),
-     Output("project-directory-list", "children"),
+    [Output("project-directory-list", "children"),
      Output("scan-dir-selector", "options"),
      Output("pending-scans-list", "children")],
     [Input("btn-project-manager", "n_clicks"),
-     Input("close-project-modal-btn", "n_clicks"),
      Input("btn-add-directory", "n_clicks"),
-     Input("btn-trigger-scan", "n_clicks")],
-    [State("project-manager-modal", "style")],
-    prevent_initial_call=True
+     Input("btn-trigger-scan", "n_clicks")]
 )
-def toggle_project_modal(open_clicks, close_clicks, add_clicks, scan_clicks, current_style):
-    """Toggle project management modal and refresh data"""
-    logger.info(f"toggle_project_modal called: open={open_clicks}, close={close_clicks}, add={add_clicks}, scan={scan_clicks}")
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        logger.warning("toggle_project_modal: no trigger, preventing update")
-        raise PreventUpdate
-    
-    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    logger.info(f"toggle_project_modal triggered by: {trigger_id}")
-    
-    # Default hidden state
-    hidden_style = {
-        'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '30px'
-    }
-    visible_style = {**hidden_style, 'display': 'block'}
-    
+def update_project_modal_data(open_clicks, add_clicks, scan_clicks):
+    """Update project management modal data"""
     empty_list = html.P("No directories configured yet.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
     empty_options = [{"label": "No directories available", "value": ""}]
     no_pending = html.P("No pending scans.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
     
-    if trigger_id == "close-project-modal-btn":
-        return hidden_style, empty_list, empty_options, no_pending
-    
     if not PROJECT_MANAGER_AVAILABLE:
         error_msg = html.P("⚠️ Project manager not initialized. Run the database migration first.", 
                           style={'color': '#f59e0b'})
-        return visible_style if trigger_id == "btn-project-manager" else hidden_style, error_msg, empty_options, no_pending
+        return error_msg, empty_options, no_pending
     
     try:
         # Get directories
@@ -1752,17 +1765,13 @@ def toggle_project_modal(open_clicks, close_clicks, add_clicks, scan_clicks, cur
         else:
             pending_list = no_pending
         
-        # Show modal if opened
-        if trigger_id == "btn-project-manager":
-            return visible_style, directory_list, dropdown_options, pending_list
-        else:
-            # Refresh data after add/scan actions
-            return current_style, directory_list, dropdown_options, pending_list
+        logger.info(f"Returning project modal data: {len(directories)} directories, {len(pending)} pending scans")
+        return directory_list, dropdown_options, pending_list
             
     except Exception as e:
         logger.error(f"Error in project modal: {e}")
         error_msg = html.P(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
-        return visible_style if trigger_id == "btn-project-manager" else current_style, error_msg, empty_options, no_pending
+        return error_msg, empty_options, no_pending
 
 
 @app.callback(
@@ -3670,8 +3679,8 @@ def create_layout():
                     })
                 ], id='project-manager-modal', style={
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '1000', 'paddingTop': '30px'
+                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+                    'zIndex': '9999', 'paddingTop': '30px'
                 }),
                 
                 # False Positives Viewer Modal

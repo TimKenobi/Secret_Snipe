@@ -232,6 +232,101 @@ def handle_logout():
     audit_log('logout', 'system', {'username': username})
     return redirect('/')
 
+
+# ============================================================================
+# Project Management API Endpoints (for JavaScript modal)
+# ============================================================================
+
+@server.route('/api/projects/directories', methods=['GET'])
+def api_get_directories():
+    """API endpoint to get scan directories"""
+    from flask import jsonify
+    if not session.get('authenticated'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        return jsonify({'error': 'Project manager not available', 'directories': []})
+    
+    try:
+        directories = project_manager.get_all_directories(active_only=False)
+        result = []
+        for d in directories:
+            result.append({
+                'id': d.id,
+                'directory_path': d.directory_path,
+                'display_name': d.display_name,
+                'scan_schedule': d.scan_schedule,
+                'is_active': d.is_active,
+                'last_scan_at': d.last_scan_at.strftime('%Y-%m-%d %H:%M') if d.last_scan_at else None,
+                'total_files': d.total_files,
+                'total_findings': d.total_findings
+            })
+        return jsonify({'directories': result})
+    except Exception as e:
+        logger.error(f"API error getting directories: {e}")
+        return jsonify({'error': str(e), 'directories': []})
+
+
+@server.route('/api/projects/pending-scans', methods=['GET'])
+def api_get_pending_scans():
+    """API endpoint to get pending scans"""
+    from flask import jsonify
+    if not session.get('authenticated'):
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        return jsonify({'error': 'Project manager not available', 'pending': []})
+    
+    try:
+        pending = project_manager.get_pending_scans()
+        result = []
+        for p in pending:
+            result.append({
+                'id': p.id,
+                'scan_type': p.scan_type,
+                'status': p.status,
+                'requested_at': p.requested_at.strftime('%H:%M') if p.requested_at else None
+            })
+        return jsonify({'pending': result})
+    except Exception as e:
+        logger.error(f"API error getting pending scans: {e}")
+        return jsonify({'error': str(e), 'pending': []})
+
+
+@server.route('/api/projects/trigger-scan', methods=['POST'])
+def api_trigger_scan():
+    """API endpoint to trigger a scan"""
+    from flask import jsonify, request as flask_request
+    if not session.get('authenticated'):
+        return jsonify({'error': 'Not authenticated', 'success': False}), 401
+    
+    if not PROJECT_MANAGER_AVAILABLE:
+        return jsonify({'error': 'Project manager not available', 'success': False})
+    
+    try:
+        data = flask_request.get_json()
+        directory_id = data.get('directory_id')
+        scan_type = data.get('scan_type', 'full')
+        
+        if not directory_id:
+            return jsonify({'error': 'Missing directory_id', 'success': False})
+        
+        request_id = project_manager.request_scan(
+            directory_id=directory_id,
+            scan_type=scan_type,
+            requested_by=session.get('username', 'api')
+        )
+        
+        if request_id:
+            logger.info(f"API triggered scan: dir={directory_id}, type={scan_type}, request_id={request_id}")
+            return jsonify({'success': True, 'request_id': request_id})
+        else:
+            return jsonify({'error': 'Failed to queue scan', 'success': False})
+    except Exception as e:
+        logger.error(f"API error triggering scan: {e}")
+        return jsonify({'error': str(e), 'success': False})
+
+
 # Global data cache with security
 data_cache = {
     'findings_df': None,
@@ -1688,17 +1783,21 @@ def update_project_modal_data(open_clicks, close_clicks, add_clicks, scan_clicks
     # Determine which button triggered the callback
     ctx = dash.callback_context
     if not ctx.triggered:
+        logger.info("Project modal: no trigger, returning hidden")
         return hidden_style, empty_list, empty_options, no_pending
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    logger.info(f"Project modal: trigger_id = {trigger_id}")
     
     # Handle close button
     if trigger_id == "close-project-modal-btn":
+        logger.info("Project modal: closing modal")
         return hidden_style, dash.no_update, dash.no_update, dash.no_update
     
     # For open button, show modal and load data
     # For add/scan buttons, keep modal open (they're inside the modal)
     modal_style = visible_style if trigger_id in ["btn-project-manager", "btn-add-directory", "btn-trigger-scan"] else hidden_style
+    logger.info(f"Project modal: modal_style display = {modal_style.get('display')}")
     
     if not PROJECT_MANAGER_AVAILABLE:
         error_msg = html.P("⚠️ Project manager not initialized. Run the database migration first.", 

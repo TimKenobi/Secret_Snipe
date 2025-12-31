@@ -4,6 +4,29 @@ Comprehensive dark mode implementation with responsive tables
 */
 
 /* ==========================================================================
+   Project Modal - Force visibility via CSS class (bypasses Dash state)
+   ========================================================================== */
+#project-manager-modal.modal-visible {
+    display: block !important;
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    background-color: rgba(0,0,0,0.9) !important;
+    z-index: 99999 !important;
+    padding-top: 30px !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+#project-manager-modal.modal-visible > div {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+}
+
+/* ==========================================================================
    Base Styles and Variables
    ========================================================================== */
 

@@ -64,4 +64,10 @@ logs/
 security_audit_report.txt
 
 # Jira credentials (contains API tokens)
-jira_config/
+jira_config/jira_config.json
+
+# Config with credentials (use config.json.example as template)
+config.json
+
+# Cookie files
+cookies.txt

@@ -8,8 +8,8 @@
     "host": "localhost",
     "port": 5432,
     "database": "secretsnipe",
-    "username": "secretsnipe",
-    "password": "secretsnipe_password",
+    "username": "your_db_username",
+    "password": "your_db_password",
     "ssl_mode": "prefer",
     "connection_pool_size": 10,
     "connection_timeout": 30
@@ -59,7 +59,7 @@
     "retry_delay_seconds": 5,
     "headers": {
       "Content-Type": "application/json",
-      "Authorization": "Bearer your-token-here"
+      "Authorization": "Bearer your-webhook-token"
     }
   },
   "report": {
@@ -96,7 +96,7 @@
     "ssl_key_path": null,
     "enable_auth": true,
     "auth_username": "admin",
-    "auth_password_hash": "$2b$12$REPLACE_WITH_YOUR_BCRYPT_HASH_HERE",
+    "auth_password_hash": "$2b$12$REPLACE_WITH_YOUR_BCRYPT_HASH",
     "enable_csrf_protection": true,
     "max_input_length": 1000,
     "enable_audit_log": true,

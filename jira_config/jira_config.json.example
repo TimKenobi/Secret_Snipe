@@ -1,0 +1,12 @@
+{
+  "server_url": "https://your-company.atlassian.net",
+  "username": "your-email@company.com",
+  "api_token": "YOUR_JIRA_API_TOKEN",
+  "project_key": "YOUR_PROJECT_KEY",
+  "issue_type": "Task",
+  "labels": [
+    "secretsnipe",
+    "security",
+    "secret-detection"
+  ]
+}

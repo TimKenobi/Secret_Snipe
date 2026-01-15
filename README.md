@@ -453,6 +453,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🆘 Support
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Support-orange.svg)](https://coff.ee/timkenobi)
+
 - **Documentation**: See `/docs` directory
 - **Issues**: GitHub Issues
 - **Discussions**: GitHub Discussions

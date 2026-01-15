@@ -45,7 +45,7 @@ POSTGRES_PASSWORD=your_secure_password_here
 
 # Dashboard credentials (required)
 DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=YourSecurePassword123!
+DASHBOARD_PASSWORD=SecretSnipe2024!
 
 # Optional: Webhook for notifications
 WEBHOOK_URL=https://your-teams-webhook-url
@@ -65,7 +65,7 @@ docker-compose logs -f
 
 - **URL**: http://localhost:8050
 - **Username**: admin (or your configured username)
-- **Password**: YourSecurePassword123! (or your configured password)
+- **Password**: SecretSnipe2024! (or your configured password)
 
 ### 5. Run Your First Scan
 

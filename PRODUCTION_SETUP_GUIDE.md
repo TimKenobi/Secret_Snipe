@@ -27,7 +27,7 @@ POSTGRES_PASSWORD=your_secure_password
 
 # Required: Dashboard credentials
 DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=YourSecurePassword123!
+DASHBOARD_PASSWORD=SecretSnipe2024!
 
 # Optional: Teams notifications
 WEBHOOK_URL=https://your-teams-webhook-url
@@ -51,7 +51,7 @@ The dashboard includes robust authentication and security features:
 #### Login Configuration
 ```env
 DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=YourSecurePassword123!
+DASHBOARD_PASSWORD=SecretSnipe2024!
 JWT_SECRET_KEY=your_jwt_secret_minimum_32_chars
 ```
 

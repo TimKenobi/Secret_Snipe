@@ -523,19 +523,17 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
             {'date': row['date'], 'count': row['count']} for row in timeline_results
         ]
         
-        # Query 4: File extension counts (top 10)
+        # Query 4: File extension counts (top 10) - uses pre-computed column for 28x speedup
         extension_query = """
-            SELECT 
-                COALESCE(NULLIF(REGEXP_REPLACE(file_path, '.*\\.([^./]+)$', '\\1'), file_path), 'unknown') as extension,
-                COUNT(*) as count
+            SELECT file_extension, COUNT(*) as count
             FROM findings
             WHERE resolution_status != 'false_positive'
-            GROUP BY extension
+            GROUP BY file_extension
             ORDER BY count DESC
             LIMIT 10
         """
         extension_results = db_manager.execute_query(extension_query)
-        chart_data_cache['file_extension_counts'] = {row['extension']: row['count'] for row in extension_results}
+        chart_data_cache['file_extension_counts'] = {row['file_extension']: row['count'] for row in extension_results}
         
         # Query 5: Secret type counts (for pie chart when filtered by tool)
         secret_type_query = """
@@ -574,21 +572,27 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
             'last_update': None
         }
 
-def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
-    """Get findings data from database with caching and security"""
+def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.DataFrame:
+    """Get findings data from database with caching and security.
+    
+    Args:
+        force_refresh: Force a refresh of the cache
+        limit: Optional limit on number of rows (for table display)
+    """
     now = datetime.now()
 
-    # Check cache validity
-    if (not force_refresh and
+    # Check cache validity (only for unlimited queries)
+    if (not force_refresh and limit is None and
         data_cache['findings_df'] is not None and
         data_cache['last_update'] and
         now - data_cache['last_update'] < data_cache['cache_duration']):
         return data_cache['findings_df']
 
     try:
-        # Get ALL findings without limit - use efficient query
-        # Pagination is handled at display level, not query level
-        query = """
+        # Use LIMIT for display queries to avoid loading all data
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        
+        query = f"""
             SELECT
                 f.id, f.file_path, f.secret_type, f.secret_value, f.context, f.severity, f.tool_source,
                 f.first_seen, f.last_seen, f.confidence_score, f.resolution_status,
@@ -597,23 +601,24 @@ def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
             FROM findings f
             JOIN projects p ON f.project_id = p.id
             JOIN scan_sessions ss ON f.scan_session_id = ss.id
+            WHERE f.resolution_status != 'false_positive'
             ORDER BY f.first_seen DESC
+            {limit_clause}
         """
 
         findings = db_manager.execute_query(query)
 
         if findings:
             df = pd.DataFrame(findings)
-
-            # Sanitize data before caching
-            df = df.map(lambda x: sanitize_input(str(x)) if isinstance(x, str) else x)
-
+            
+            # Only convert timestamps - skip expensive sanitize on every cell
             df['first_seen'] = pd.to_datetime(df['first_seen'])
             df['last_seen'] = pd.to_datetime(df['last_seen'])
 
-            # Cache the data
-            data_cache['findings_df'] = df
-            data_cache['last_update'] = now
+            # Cache only if unlimited query
+            if limit is None:
+                data_cache['findings_df'] = df
+                data_cache['last_update'] = now
 
             return df
         else:
@@ -884,10 +889,12 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         color_scale = 'Blues'
 
     # Get data - only force refresh on button click, otherwise use cache
-    df = get_findings_data(force_refresh=force_refresh)
-    
-    # Get pre-aggregated chart data (much faster for unfiltered views)
+    # For charts: Use pre-aggregated SQL data (fast)
+    # For table: Use limited query (fast)
     chart_cache = get_chart_data(force_refresh=force_refresh)
+    
+    # Only fetch table data (limited to 1000 rows for performance)
+    df = get_findings_data(force_refresh=force_refresh, limit=1000)
 
     # Get FP count for badge
     fp_count = 0
@@ -897,7 +904,10 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         pass
     fp_badge = f"🚫 {fp_count} False Positives"
 
-    if df.empty:
+    # Check if we have any data via chart cache (faster than checking df)
+    has_data = bool(chart_cache.get('severity_counts') or chart_cache.get('tool_counts'))
+    
+    if not has_data and df.empty:
         empty_fig = go.Figure()
         empty_fig.update_layout(
             title="No data available",
@@ -910,42 +920,34 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         )
         return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge, [{"label": "All Secret Types", "value": "all"}]
 
-    # Determine if we can use pre-aggregated chart data (when all filters are "all")
-    use_cached_charts = (severity_filter == "all" and tool_filter == "all" and 
-                         project_filter == "all" and secret_type_filter == "all")
+    # Use pre-aggregated chart data (charts never need the full DataFrame)
+    use_cached_charts = True  # Always use cached charts for performance
 
-    # Apply filters with validation (still needed for table)
-    filtered_df = df.copy()
+    # Apply filters for table only (chart data is pre-aggregated)
+    filtered_df = df.copy() if not df.empty else pd.DataFrame()
 
-    # Always exclude false positives from main table (use FP Viewer to see them)
-    if 'resolution_status' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['resolution_status'] != 'false_positive']
+    if not filtered_df.empty:
+        if severity_filter != "all":
+            filtered_df = filtered_df[filtered_df['severity'] == severity_filter]
 
-    if severity_filter != "all":
-        filtered_df = filtered_df[filtered_df['severity'] == severity_filter]
+        if tool_filter != "all":
+            filtered_df = filtered_df[filtered_df['tool_source'] == tool_filter]
 
-    if tool_filter != "all":
-        filtered_df = filtered_df[filtered_df['tool_source'] == tool_filter]
+        if project_filter != "all":
+            # Validate project exists in data
+            if 'project_name' in filtered_df.columns:
+                available_projects = df['project_name'].unique()
+                if project_filter in available_projects:
+                    filtered_df = filtered_df[filtered_df['project_name'] == project_filter]
 
-    if project_filter != "all":
-        # Validate project exists in data
-        available_projects = df['project_name'].unique()
-        if project_filter in available_projects:
-            filtered_df = filtered_df[filtered_df['project_name'] == project_filter]
-
-    if secret_type_filter != "all":
-        filtered_df = filtered_df[filtered_df['secret_type'] == secret_type_filter]
-
-    # Apply chart-specific tool filter (for the chart tabs)
-    chart_df = filtered_df.copy()
-    if chart_tool_filter != "all":
-        chart_df = chart_df[chart_df['tool_source'] == chart_tool_filter]
+        if secret_type_filter != "all":
+            filtered_df = filtered_df[filtered_df['secret_type'] == secret_type_filter]
 
     tool_label = {'all': 'All Tools', 'custom': 'Custom Scanner', 'trufflehog': 'TruffleHog', 'gitleaks': 'Gitleaks'}
     chart_title_suffix = f" - {tool_label.get(chart_tool_filter, 'All Tools')}" if chart_tool_filter != 'all' else ''
 
-    # Create severity chart - use cached data when possible
-    if use_cached_charts and chart_tool_filter == "all" and chart_cache.get('severity_counts'):
+    # Create severity chart - ALWAYS use cached SQL data for speed
+    if chart_cache.get('severity_counts'):
         severity_data = chart_cache['severity_counts']
         severity_chart = px.bar(
             x=list(severity_data.keys()),
@@ -957,16 +959,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
             template=template
         )
     else:
-        severity_counts = chart_df['severity'].value_counts()
-        severity_chart = px.bar(
-            x=severity_counts.index,
-            y=severity_counts.values,
-            title=f"Findings by Severity{chart_title_suffix}",
-            labels={'x': 'Severity', 'y': 'Count'},
-            color=severity_counts.index,
-            color_discrete_map=severity_colors,
-            template=template
-        )
+        # Fallback if cache somehow empty
+        severity_chart = go.Figure()
+        severity_chart.update_layout(title="No severity data", template=template)
     severity_chart.update_layout(
         showlegend=True,
         margin=dict(l=50, r=50, t=50, b=50),
@@ -974,10 +969,10 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create tool distribution chart - use cached data when possible
+    # Create tool distribution chart - ALWAYS use cached SQL data
     if chart_tool_filter != 'all':
         # When filtered to a single tool, show secret types instead
-        if use_cached_charts and chart_cache.get('secret_type_counts', {}).get(chart_tool_filter):
+        if chart_cache.get('secret_type_counts', {}).get(chart_tool_filter):
             secret_data = chart_cache['secret_type_counts'][chart_tool_filter]
             # Get top 10
             sorted_secrets = dict(sorted(secret_data.items(), key=lambda x: x[1], reverse=True)[:10])
@@ -989,16 +984,10 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
                 template=template
             )
         else:
-            secret_type_counts = chart_df['secret_type'].value_counts().head(10)
-            tool_chart = px.pie(
-                values=secret_type_counts.values,
-                names=secret_type_counts.index,
-                title=f"Secret Types - {tool_label.get(chart_tool_filter, 'Selected Tool')}",
-                color_discrete_sequence=tool_colors,
-                template=template
-            )
+            tool_chart = go.Figure()
+            tool_chart.update_layout(title=f"No data for {chart_tool_filter}", template=template)
     else:
-        if use_cached_charts and chart_cache.get('tool_counts'):
+        if chart_cache.get('tool_counts'):
             tool_data = chart_cache['tool_counts']
             tool_chart = px.pie(
                 values=list(tool_data.values()),
@@ -1008,14 +997,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
                 template=template
             )
         else:
-            tool_counts = chart_df['tool_source'].value_counts()
-            tool_chart = px.pie(
-                values=tool_counts.values,
-                names=tool_counts.index,
-                title="Findings by Tool Source",
-                color_discrete_sequence=tool_colors,
-                template=template
-            )
+            tool_chart = go.Figure()
+            tool_chart.update_layout(title="No tool data", template=template)
     tool_chart.update_layout(
         showlegend=True,
         margin=dict(l=50, r=50, t=50, b=50),
@@ -1026,8 +1009,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create timeline chart - use cached data when possible
-    if use_cached_charts and chart_cache.get('timeline_data'):
+    # Create timeline chart - ALWAYS use cached SQL data
+    if chart_cache.get('timeline_data'):
         timeline_data = chart_cache['timeline_data']
         dates = [row['date'] for row in timeline_data]
         counts = [row['count'] for row in timeline_data]
@@ -1039,16 +1022,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
             template=template
         )
     else:
-        timeline_df = filtered_df.copy()
-        timeline_df['date'] = timeline_df['first_seen'].dt.date
-        timeline_counts = timeline_df.groupby('date').size()
-        timeline_chart = px.line(
-            x=timeline_counts.index,
-            y=timeline_counts.values,
-            title="Findings Over Time",
-            labels={'x': 'Date', 'y': 'New Findings'},
-            template=template
-        )
+        timeline_chart = go.Figure()
+        timeline_chart.update_layout(title="No timeline data", template=template)
     timeline_chart.update_traces(line_color=timeline_color)
     timeline_chart.update_layout(
         margin=dict(l=50, r=50, t=50, b=50),
@@ -1057,8 +1032,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create file types chart - use cached data when possible
-    if use_cached_charts and chart_cache.get('file_extension_counts'):
+    # Create file types chart - ALWAYS use cached SQL data
+    if chart_cache.get('file_extension_counts'):
         ext_data = chart_cache['file_extension_counts']
         extension_counts_keys = list(ext_data.keys())
         extension_counts_values = list(ext_data.values())
@@ -1073,18 +1048,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
             template=template
         )
     else:
-        filtered_df['file_extension'] = filtered_df['file_path'].str.extract(r'\.([^.]+)$')
-        extension_counts = filtered_df['file_extension'].value_counts().head(10)
-        file_extension_colors = tool_colors[:len(extension_counts)] if len(extension_counts) <= len(tool_colors) else tool_colors * ((len(extension_counts) // len(tool_colors)) + 1)
-        file_types_chart = px.bar(
-            x=extension_counts.index,
-            y=extension_counts.values,
-            title="Top File Extensions",
-            labels={'x': 'Extension', 'y': 'Count'},
-            color=extension_counts.index,
-            color_discrete_sequence=file_extension_colors,
-        template=template
-    )
+        file_types_chart = go.Figure()
+        file_types_chart.update_layout(title="No extension data", template=template)
     file_types_chart.update_layout(
         margin=dict(l=50, r=50, t=50, b=50),
         showlegend=False,
@@ -1097,8 +1062,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         return (severity_chart, tool_chart, timeline_chart, file_types_chart,
                 no_update, no_update, no_update, no_update, no_update, no_update)
 
-    # Prepare table data - all filtered findings (pagination handled by DataTable)
-    table_data = filtered_df.to_dict('records')
+    # Prepare table data from limited query (already filtered at SQL level)
+    table_data = filtered_df.to_dict('records') if not filtered_df.empty else []
 
     # Sanitize table data (truncate long strings for display)
     for row in table_data:

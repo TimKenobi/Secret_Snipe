@@ -195,6 +195,9 @@ class FindingsManager:
             file_path, secret_type, secret_value, line_number
         )
 
+        # Extract file extension for optimized queries
+        file_extension = self._extract_file_extension(file_path)
+
         # Extract file metadata from metadata dict if present
         file_modified_at = None
         file_size = None
@@ -215,14 +218,14 @@ class FindingsManager:
             result = self.db.execute_query(query, (existing['id'],))
             return str(result[0]['id']) if result else None
 
-        # Insert new finding with file metadata
+        # Insert new finding with file metadata and extension
         query = """
             INSERT INTO findings (
                 scan_session_id, project_id, file_path, line_number,
                 secret_type, secret_value, context, severity,
                 confidence_score, tool_source, fingerprint, metadata,
-                file_modified_at, file_size
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                file_modified_at, file_size, file_extension
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """
 
@@ -231,11 +234,21 @@ class FindingsManager:
             secret_type, secret_value, context, severity,
             confidence_score, tool_source, fingerprint,
             json.dumps(metadata or {}),
-            file_modified_at, file_size
+            file_modified_at, file_size, file_extension
         )
 
         result = self.db.execute_query(query, params)
         return str(result[0]['id']) if result else None
+
+    def _extract_file_extension(self, file_path: str) -> str:
+        """Extract lowercase file extension from path for optimized chart queries"""
+        import os
+        if not file_path:
+            return 'unknown'
+        _, ext = os.path.splitext(file_path)
+        if ext and ext.startswith('.'):
+            return ext[1:].lower()[:20]  # Remove dot, lowercase, limit length
+        return 'unknown'
 
     def _generate_fingerprint(self, file_path: str, secret_type: str,
                             secret_value: str, line_number: Optional[int]) -> str:

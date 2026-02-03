@@ -420,6 +420,91 @@ def is_test_credit_card(card_number: str) -> bool:
     return False
 
 
+def is_likely_not_credit_card(value: str, context: str) -> tuple:
+    """
+    Additional heuristics to detect false positive credit card numbers.
+    
+    Checks for patterns that look like credit cards but are actually:
+    - Version numbers (1.2.3.4, v4.5.6.7)
+    - Timestamps/dates (20241231123456)
+    - UUIDs with numbers
+    - Phone numbers
+    - Hex color codes
+    - IP addresses with ports
+    - Build/revision numbers
+    - Object IDs, sequence numbers
+    
+    Args:
+        value: The matched credit card-like number
+        context: Surrounding text context
+        
+    Returns:
+        Tuple of (is_likely_false_positive, reason)
+    """
+    import re
+    
+    digits = ''.join(c for c in value if c.isdigit())
+    context_lower = context.lower()
+    
+    # Check if the context suggests this is NOT a credit card
+    non_card_context = [
+        'version', 'v.', 'build', 'revision', 'rev.', 'release',
+        'timestamp', 'datetime', 'date', 'time', 
+        'id:', 'id=', 'id ', 'identifier', 'uid', 'uuid',
+        'phone', 'tel', 'fax', 'mobile',
+        'order', 'invoice', 'ref', 'reference', 'tracking',
+        'serial', 'sn:', 'part', 'model', 'sku',
+        'ip:', 'address:', 'port', 'sequence', 'seq',
+        'index', 'offset', 'position', 'count',
+        'checksum', 'hash', 'digest', 'crc',
+    ]
+    
+    for marker in non_card_context:
+        if marker in context_lower:
+            # But not if card context is also present
+            card_context = ['credit', 'card', 'payment', 'visa', 'mastercard', 
+                           'amex', 'discover', 'pan', 'ccn', 'cardnum']
+            has_card_context = any(cc in context_lower for cc in card_context)
+            if not has_card_context:
+                return True, f"Context suggests non-card data: '{marker}'"
+    
+    # Check for version number patterns (digits with dots nearby)
+    if re.search(r'v?\d+\.\d+', context, re.IGNORECASE):
+        return True, "Appears to be version number"
+    
+    # Check for timestamp-like patterns (year prefix)
+    if digits[:4] in ['2024', '2025', '2026', '2023', '2022', '2021', '2020', '2019']:
+        if len(digits) >= 14:  # Timestamp: YYYYMMDDHHMMSS
+            return True, "Appears to be timestamp"
+    
+    # Check for year suffix (common in IDs)
+    if digits[-4:] in ['2024', '2025', '2026', '2023', '2022', '2021', '2020']:
+        if re.search(r'id|ref|order|invoice|tracking', context_lower):
+            return True, "Appears to be dated reference number"
+    
+    # Check if all digit groups are the same length (often IDs, not cards)
+    parts = re.findall(r'\d+', value)
+    if len(parts) >= 3:
+        lengths = [len(p) for p in parts]
+        if len(set(lengths)) == 1 and lengths[0] <= 3:
+            return True, "Appears to be formatted ID (uniform groups)"
+    
+    # Check for hex-like patterns nearby suggesting UUID/hash
+    if re.search(r'[0-9a-f]{8}-?[0-9a-f]{4}', context, re.IGNORECASE):
+        return True, "Appears to be part of UUID/hash"
+    
+    # Check for file path patterns that might contain version-like numbers
+    if re.search(r'[\\/]v?\d+[\\/]', context) or re.search(r'_\d{13,16}_', context):
+        return True, "Appears to be file path component or sequence"
+    
+    # If the match is mostly zeros (placeholder patterns)
+    zero_count = digits.count('0')
+    if zero_count >= len(digits) * 0.7:  # 70% or more zeros
+        return True, "Too many zeros (likely placeholder)"
+    
+    return False, ""
+
+
 def validate_ssn(ssn: str) -> tuple:
     """
     Validate a Social Security Number using known rules.
@@ -745,6 +830,13 @@ def scan_text_with_signatures(text, file_path_str):
                         is_valid = False
                         validation_reason = "Failed Luhn checksum validation"
                         logging.debug(f"Credit card {value[:6]}...{value[-4:]} failed Luhn check")
+                    # Finally check for false positive patterns using context
+                    else:
+                        is_false_positive, fp_reason = is_likely_not_credit_card(value, context)
+                        if is_false_positive:
+                            is_valid = False
+                            validation_reason = f"Likely false positive: {fp_reason}"
+                            logging.debug(f"Credit card {value[:6]}...{value[-4:]} rejected: {fp_reason}")
 
                 # Validate SSN numbers using known rules
                 if is_valid and sig["name"] in ["Social Security Number", "SSN Format (Context Required)"]:

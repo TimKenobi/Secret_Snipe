@@ -453,6 +453,127 @@ def secure_callback(callback_func):
 
     return wrapper
 
+
+# Cache for pre-aggregated chart data (longer TTL than raw findings)
+chart_data_cache = {
+    'severity_counts': None,
+    'tool_counts': None,
+    'timeline_data': None,
+    'file_extension_counts': None,
+    'secret_type_counts': None,
+    'last_update': None,
+    'cache_duration': timedelta(seconds=60)  # Longer TTL for aggregated data
+}
+
+
+def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
+    """
+    Get pre-aggregated chart data using optimized SQL queries.
+    This is much faster than computing aggregations in Python from raw data.
+    """
+    global chart_data_cache
+    now = datetime.now()
+    
+    # Check cache validity
+    if (not force_refresh and
+        chart_data_cache['last_update'] and
+        now - chart_data_cache['last_update'] < chart_data_cache['cache_duration']):
+        return chart_data_cache
+    
+    try:
+        # Query 1: Severity counts (simple aggregation)
+        severity_query = """
+            SELECT severity, COUNT(*) as count
+            FROM findings
+            WHERE resolution_status != 'false_positive'
+            GROUP BY severity
+            ORDER BY 
+                CASE severity
+                    WHEN 'Critical' THEN 1
+                    WHEN 'High' THEN 2
+                    WHEN 'Medium' THEN 3
+                    WHEN 'Low' THEN 4
+                    ELSE 5
+                END
+        """
+        severity_results = db_manager.execute_query(severity_query)
+        chart_data_cache['severity_counts'] = {row['severity']: row['count'] for row in severity_results}
+        
+        # Query 2: Tool distribution counts
+        tool_query = """
+            SELECT tool_source, COUNT(*) as count
+            FROM findings
+            WHERE resolution_status != 'false_positive'
+            GROUP BY tool_source
+        """
+        tool_results = db_manager.execute_query(tool_query)
+        chart_data_cache['tool_counts'] = {row['tool_source']: row['count'] for row in tool_results}
+        
+        # Query 3: Timeline data (grouped by date)
+        timeline_query = """
+            SELECT DATE(first_seen) as date, COUNT(*) as count
+            FROM findings
+            WHERE resolution_status != 'false_positive'
+              AND first_seen >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY DATE(first_seen)
+            ORDER BY date
+        """
+        timeline_results = db_manager.execute_query(timeline_query)
+        chart_data_cache['timeline_data'] = [
+            {'date': row['date'], 'count': row['count']} for row in timeline_results
+        ]
+        
+        # Query 4: File extension counts (top 10)
+        extension_query = """
+            SELECT 
+                COALESCE(NULLIF(REGEXP_REPLACE(file_path, '.*\\.([^./]+)$', '\\1'), file_path), 'unknown') as extension,
+                COUNT(*) as count
+            FROM findings
+            WHERE resolution_status != 'false_positive'
+            GROUP BY extension
+            ORDER BY count DESC
+            LIMIT 10
+        """
+        extension_results = db_manager.execute_query(extension_query)
+        chart_data_cache['file_extension_counts'] = {row['extension']: row['count'] for row in extension_results}
+        
+        # Query 5: Secret type counts (for pie chart when filtered by tool)
+        secret_type_query = """
+            SELECT tool_source, secret_type, COUNT(*) as count
+            FROM findings
+            WHERE resolution_status != 'false_positive'
+            GROUP BY tool_source, secret_type
+            ORDER BY count DESC
+        """
+        secret_results = db_manager.execute_query(secret_type_query)
+        # Organize by tool
+        secret_by_tool = {}
+        for row in secret_results:
+            tool = row['tool_source']
+            if tool not in secret_by_tool:
+                secret_by_tool[tool] = {}
+            secret_by_tool[tool][row['secret_type']] = row['count']
+        chart_data_cache['secret_type_counts'] = secret_by_tool
+        
+        chart_data_cache['last_update'] = now
+        logger.debug("Chart data cache refreshed")
+        
+        return chart_data_cache
+        
+    except Exception as e:
+        logger.error(f"Error fetching chart data: {e}")
+        # Return cached data if available
+        if chart_data_cache['last_update']:
+            return chart_data_cache
+        return {
+            'severity_counts': {},
+            'tool_counts': {},
+            'timeline_data': [],
+            'file_extension_counts': {},
+            'secret_type_counts': {},
+            'last_update': None
+        }
+
 def get_findings_data(force_refresh: bool = False) -> pd.DataFrame:
     """Get findings data from database with caching and security"""
     now = datetime.now()
@@ -764,6 +885,9 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
 
     # Get data - only force refresh on button click, otherwise use cache
     df = get_findings_data(force_refresh=force_refresh)
+    
+    # Get pre-aggregated chart data (much faster for unfiltered views)
+    chart_cache = get_chart_data(force_refresh=force_refresh)
 
     # Get FP count for badge
     fp_count = 0
@@ -786,7 +910,11 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         )
         return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge, [{"label": "All Secret Types", "value": "all"}]
 
-    # Apply filters with validation
+    # Determine if we can use pre-aggregated chart data (when all filters are "all")
+    use_cached_charts = (severity_filter == "all" and tool_filter == "all" and 
+                         project_filter == "all" and secret_type_filter == "all")
+
+    # Apply filters with validation (still needed for table)
     filtered_df = df.copy()
 
     # Always exclude false positives from main table (use FP Viewer to see them)
@@ -813,20 +941,32 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
     if chart_tool_filter != "all":
         chart_df = chart_df[chart_df['tool_source'] == chart_tool_filter]
 
-    # Create severity chart (uses chart_df which includes chart tool filter)
-    severity_counts = chart_df['severity'].value_counts()
     tool_label = {'all': 'All Tools', 'custom': 'Custom Scanner', 'trufflehog': 'TruffleHog', 'gitleaks': 'Gitleaks'}
     chart_title_suffix = f" - {tool_label.get(chart_tool_filter, 'All Tools')}" if chart_tool_filter != 'all' else ''
-    
-    severity_chart = px.bar(
-        x=severity_counts.index,
-        y=severity_counts.values,
-        title=f"Findings by Severity{chart_title_suffix}",
-        labels={'x': 'Severity', 'y': 'Count'},
-        color=severity_counts.index,
-        color_discrete_map=severity_colors,
-        template=template
-    )
+
+    # Create severity chart - use cached data when possible
+    if use_cached_charts and chart_tool_filter == "all" and chart_cache.get('severity_counts'):
+        severity_data = chart_cache['severity_counts']
+        severity_chart = px.bar(
+            x=list(severity_data.keys()),
+            y=list(severity_data.values()),
+            title=f"Findings by Severity{chart_title_suffix}",
+            labels={'x': 'Severity', 'y': 'Count'},
+            color=list(severity_data.keys()),
+            color_discrete_map=severity_colors,
+            template=template
+        )
+    else:
+        severity_counts = chart_df['severity'].value_counts()
+        severity_chart = px.bar(
+            x=severity_counts.index,
+            y=severity_counts.values,
+            title=f"Findings by Severity{chart_title_suffix}",
+            labels={'x': 'Severity', 'y': 'Count'},
+            color=severity_counts.index,
+            color_discrete_map=severity_colors,
+            template=template
+        )
     severity_chart.update_layout(
         showlegend=True,
         margin=dict(l=50, r=50, t=50, b=50),
@@ -834,26 +974,48 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create tool distribution chart (uses chart_df if filtered, otherwise show tool breakdown)
+    # Create tool distribution chart - use cached data when possible
     if chart_tool_filter != 'all':
         # When filtered to a single tool, show secret types instead
-        secret_type_counts = chart_df['secret_type'].value_counts().head(10)  # Top 10 secret types
-        tool_chart = px.pie(
-            values=secret_type_counts.values,
-            names=secret_type_counts.index,
-            title=f"Secret Types - {tool_label.get(chart_tool_filter, 'Selected Tool')}",
-            color_discrete_sequence=tool_colors,
-            template=template
-        )
+        if use_cached_charts and chart_cache.get('secret_type_counts', {}).get(chart_tool_filter):
+            secret_data = chart_cache['secret_type_counts'][chart_tool_filter]
+            # Get top 10
+            sorted_secrets = dict(sorted(secret_data.items(), key=lambda x: x[1], reverse=True)[:10])
+            tool_chart = px.pie(
+                values=list(sorted_secrets.values()),
+                names=list(sorted_secrets.keys()),
+                title=f"Secret Types - {tool_label.get(chart_tool_filter, 'Selected Tool')}",
+                color_discrete_sequence=tool_colors,
+                template=template
+            )
+        else:
+            secret_type_counts = chart_df['secret_type'].value_counts().head(10)
+            tool_chart = px.pie(
+                values=secret_type_counts.values,
+                names=secret_type_counts.index,
+                title=f"Secret Types - {tool_label.get(chart_tool_filter, 'Selected Tool')}",
+                color_discrete_sequence=tool_colors,
+                template=template
+            )
     else:
-        tool_counts = chart_df['tool_source'].value_counts()
-        tool_chart = px.pie(
-            values=tool_counts.values,
-            names=tool_counts.index,
-            title="Findings by Tool Source",
-            color_discrete_sequence=tool_colors,
-            template=template
-        )
+        if use_cached_charts and chart_cache.get('tool_counts'):
+            tool_data = chart_cache['tool_counts']
+            tool_chart = px.pie(
+                values=list(tool_data.values()),
+                names=list(tool_data.keys()),
+                title="Findings by Tool Source",
+                color_discrete_sequence=tool_colors,
+                template=template
+            )
+        else:
+            tool_counts = chart_df['tool_source'].value_counts()
+            tool_chart = px.pie(
+                values=tool_counts.values,
+                names=tool_counts.index,
+                title="Findings by Tool Source",
+                color_discrete_sequence=tool_colors,
+                template=template
+            )
     tool_chart.update_layout(
         showlegend=True,
         margin=dict(l=50, r=50, t=50, b=50),
@@ -864,17 +1026,29 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create timeline chart
-    timeline_df = filtered_df.copy()
-    timeline_df['date'] = timeline_df['first_seen'].dt.date
-    timeline_counts = timeline_df.groupby('date').size()
-    timeline_chart = px.line(
-        x=timeline_counts.index,
-        y=timeline_counts.values,
-        title="Findings Over Time",
-        labels={'x': 'Date', 'y': 'New Findings'},
-        template=template
-    )
+    # Create timeline chart - use cached data when possible
+    if use_cached_charts and chart_cache.get('timeline_data'):
+        timeline_data = chart_cache['timeline_data']
+        dates = [row['date'] for row in timeline_data]
+        counts = [row['count'] for row in timeline_data]
+        timeline_chart = px.line(
+            x=dates,
+            y=counts,
+            title="Findings Over Time",
+            labels={'x': 'Date', 'y': 'New Findings'},
+            template=template
+        )
+    else:
+        timeline_df = filtered_df.copy()
+        timeline_df['date'] = timeline_df['first_seen'].dt.date
+        timeline_counts = timeline_df.groupby('date').size()
+        timeline_chart = px.line(
+            x=timeline_counts.index,
+            y=timeline_counts.values,
+            title="Findings Over Time",
+            labels={'x': 'Date', 'y': 'New Findings'},
+            template=template
+        )
     timeline_chart.update_traces(line_color=timeline_color)
     timeline_chart.update_layout(
         margin=dict(l=50, r=50, t=50, b=50),
@@ -883,20 +1057,32 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
 
-    # Create file types chart
-    filtered_df['file_extension'] = filtered_df['file_path'].str.extract(r'\.([^.]+)$')
-    extension_counts = filtered_df['file_extension'].value_counts().head(10)
-    
-    # Use discrete colors for better visual distinction
-    file_extension_colors = tool_colors[:len(extension_counts)] if len(extension_counts) <= len(tool_colors) else tool_colors * ((len(extension_counts) // len(tool_colors)) + 1)
-    
-    file_types_chart = px.bar(
-        x=extension_counts.index,
-        y=extension_counts.values,
-        title="Top File Extensions",
-        labels={'x': 'Extension', 'y': 'Count'},
-        color=extension_counts.index,
-        color_discrete_sequence=file_extension_colors,
+    # Create file types chart - use cached data when possible
+    if use_cached_charts and chart_cache.get('file_extension_counts'):
+        ext_data = chart_cache['file_extension_counts']
+        extension_counts_keys = list(ext_data.keys())
+        extension_counts_values = list(ext_data.values())
+        file_extension_colors = tool_colors[:len(extension_counts_keys)] if len(extension_counts_keys) <= len(tool_colors) else tool_colors * ((len(extension_counts_keys) // len(tool_colors)) + 1)
+        file_types_chart = px.bar(
+            x=extension_counts_keys,
+            y=extension_counts_values,
+            title="Top File Extensions",
+            labels={'x': 'Extension', 'y': 'Count'},
+            color=extension_counts_keys,
+            color_discrete_sequence=file_extension_colors,
+            template=template
+        )
+    else:
+        filtered_df['file_extension'] = filtered_df['file_path'].str.extract(r'\.([^.]+)$')
+        extension_counts = filtered_df['file_extension'].value_counts().head(10)
+        file_extension_colors = tool_colors[:len(extension_counts)] if len(extension_counts) <= len(tool_colors) else tool_colors * ((len(extension_counts) // len(tool_colors)) + 1)
+        file_types_chart = px.bar(
+            x=extension_counts.index,
+            y=extension_counts.values,
+            title="Top File Extensions",
+            labels={'x': 'Extension', 'y': 'Count'},
+            color=extension_counts.index,
+            color_discrete_sequence=file_extension_colors,
         template=template
     )
     file_types_chart.update_layout(

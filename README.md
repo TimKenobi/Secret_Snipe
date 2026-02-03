@@ -263,7 +263,7 @@ sudo chmod 600 /etc/samba/credentials
 3. **Mount the share**:
 ```bash
 sudo mkdir -p /mnt/secretsnipe_monitor
-sudo mount -t cifs //shsna1cifs1.stahls.net/open /mnt/secretsnipe_monitor \
+sudo mount -t cifs //fileserver.example.local/open /mnt/secretsnipe_monitor \
   -o credentials=/etc/samba/credentials,vers=3.0,sec=ntlmssp
 ```
 

@@ -331,7 +331,7 @@ def api_trigger_scan():
 data_cache = {
     'findings_df': None,
     'last_update': None,
-    'cache_duration': timedelta(minutes=5),  # 5 minute cache for better performance
+    'cache_duration': timedelta(hours=24),  # Long cache - use Refresh button for updates
     'access_log': [],
     'rate_limits': {}
 }
@@ -591,8 +591,24 @@ def get_findings_for_file(file_path: str) -> List[Dict[str, Any]]:
         return []
 
 
-def get_tool_summary_stats() -> Dict[str, Dict[str, Any]]:
+# Cache for tool stats
+tool_stats_cache = {
+    'data': None,
+    'last_update': None
+}
+
+def get_tool_summary_stats(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     """Get summary statistics per tool for the separate tool sections."""
+    global tool_stats_cache
+    now = datetime.now()
+    
+    # Use cache if available and not forcing refresh
+    if (not force_refresh and 
+        tool_stats_cache['data'] is not None and 
+        tool_stats_cache['last_update'] and
+        now - tool_stats_cache['last_update'] < data_cache['cache_duration']):
+        return tool_stats_cache['data']
+    
     try:
         query = """
             SELECT 
@@ -621,10 +637,15 @@ def get_tool_summary_stats() -> Dict[str, Dict[str, Any]]:
                 'low': row['low_count'],
                 'last_finding': row['last_finding_date']
             }
+        
+        # Cache the results
+        tool_stats_cache['data'] = stats
+        tool_stats_cache['last_update'] = now
+        
         return stats
     except Exception as e:
         logger.error(f"Error getting tool summary stats: {e}")
-        return {}
+        return tool_stats_cache['data'] if tool_stats_cache['data'] else {}
 
 
 def get_distinct_secret_types() -> list:
@@ -668,6 +689,17 @@ def get_distinct_secret_types() -> list:
 @secure_callback
 def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_filter, chart_tool_filter, refresh_clicks, n_intervals):
     """Update all dashboard components with permanent dark mode and security validation"""
+    
+    # Check what triggered the callback
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    # Force data refresh on: refresh button click, OR initial page load (no trigger)
+    is_initial_load = not ctx.triggered or ctx.triggered[0]['prop_id'] == '.'
+    force_refresh = (trigger_id == "refresh-btn") or is_initial_load
+    
+    # Check if this is just a chart tab switch (only update charts, skip everything else)
+    chart_tab_switch = (trigger_id == "chart-tool-tabs")
 
     # Sanitize all input parameters
     severity_filter = sanitize_input(severity_filter or "all", 100)
@@ -713,8 +745,8 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         timeline_color = '#3b82f6'
         color_scale = 'Blues'
 
-    # Get data
-    df = get_findings_data(force_refresh=(refresh_clicks is not None and refresh_clicks > 0))
+    # Get data - only force refresh on button click, otherwise use cache
+    df = get_findings_data(force_refresh=force_refresh)
 
     # Get FP count for badge
     fp_count = 0
@@ -856,6 +888,11 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
         paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
         plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
     )
+
+    # If just switching chart tabs, return charts only, skip expensive table/stats processing
+    if chart_tab_switch:
+        return (severity_chart, tool_chart, timeline_chart, file_types_chart,
+                no_update, no_update, no_update, no_update, no_update, no_update)
 
     # Prepare table data - all filtered findings (pagination handled by DataTable)
     table_data = filtered_df.to_dict('records')
@@ -2461,6 +2498,14 @@ def toggle_view_mode(view_mode):
 def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh_clicks, n_intervals, 
                                file_search, file_tool_filter, file_severity_filter, file_secret_type_filter):
     """Update the file-grouped table based on filters"""
+    # Check what triggered the callback - skip full refresh on just tab switches
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    # If just switching tool-tabs with no filter changes, return no_update
+    if trigger_id == 'tool-tabs':
+        raise PreventUpdate
+    
     # Use local file filters if set, otherwise use global filters
     tool_filter = file_tool_filter if file_tool_filter and file_tool_filter != 'all' else (
         'all' if tool_tab == 'all-tools' else tool_tab
@@ -2552,7 +2597,15 @@ def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh
 @secure_callback
 def update_tool_panel(selected_tool, refresh_clicks, n_intervals):
     """Update the tool-specific stats panel and chart"""
-    stats = get_tool_summary_stats()
+    # Check what triggered the callback
+    ctx = dash.callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    # Only force data refresh on refresh button click or initial page load
+    is_initial_load = not ctx.triggered or ctx.triggered[0]['prop_id'] == '.'
+    force_refresh = (trigger_id == "refresh-btn") or is_initial_load
+    
+    stats = get_tool_summary_stats(force_refresh=force_refresh)
     
     # Determine if showing all tools or specific tool
     is_dark_mode = True
@@ -4113,12 +4166,12 @@ def create_layout():
 
         ], id="main-container", className="main-container dark-mode"),
 
-        # Interval component for auto-refresh
+        # Interval component for auto-refresh (DISABLED - use Refresh button for manual updates)
         dcc.Interval(
             id="interval-component",
-            interval=120000,  # 2 minutes - use Refresh button for manual updates
+            interval=3600000,  # 1 hour - effectively disabled, use Refresh button
             n_intervals=0,
-            disabled=False  # Can be disabled if needed
+            disabled=True  # Disabled to prevent constant reloading
         )
     ])
 

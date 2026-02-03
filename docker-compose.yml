@@ -182,6 +182,7 @@ services:
       - ./redis_manager.py:/app/redis_manager.py:ro
       - ./config.py:/app/config.py:ro
     networks:
+      - stahlsitsec_web
       - secretsnipe-network
     depends_on:
       postgres:
@@ -362,4 +363,5 @@ volumes:
 
 networks:
   secretsnipe-network:
+  stahlsitsec_web:
     external: true

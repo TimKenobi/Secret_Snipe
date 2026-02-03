@@ -514,6 +514,317 @@ class FindingsManager:
             logger.error(f"Error getting cleanup stats: {e}")
             return {}
 
+    # =========================================================================
+    # ENHANCED FINDINGS MANAGEMENT V2
+    # =========================================================================
+
+    def update_finding_category(self, finding_id: str, category: str, 
+                                 updated_by: str = "user") -> bool:
+        """Update the category of a finding
+        
+        Categories: real_password, real_api_key, finance_data, placeholder, 
+                   test_data, sample_key, etc.
+        """
+        query = """
+            UPDATE findings 
+            SET finding_category = %s, updated_at = NOW()
+            WHERE id = %s
+        """
+        affected = self.db.execute_update(query, (category, finding_id))
+        
+        if affected > 0:
+            # Log to history
+            self._log_finding_change(finding_id, 'finding_category', None, category, updated_by)
+        
+        return affected > 0
+
+    def update_finding_severity(self, finding_id: str, new_severity: str,
+                                 reason: str = None, adjusted_by: str = "user") -> bool:
+        """Update severity with audit trail - preserves original severity
+        
+        Args:
+            finding_id: The finding to update
+            new_severity: New severity value (Critical, High, Medium, Low)
+            reason: Reason for the adjustment
+            adjusted_by: Who made the change
+        """
+        # Get current severity first
+        current_query = "SELECT severity, original_severity FROM findings WHERE id = %s"
+        current = self.db.execute_query(current_query, (finding_id,))
+        
+        if not current:
+            return False
+        
+        old_severity = current[0]['severity']
+        original = current[0].get('original_severity') or old_severity
+        
+        query = """
+            UPDATE findings 
+            SET severity = %s,
+                original_severity = %s,
+                severity_adjusted_by = %s,
+                severity_adjusted_at = NOW(),
+                severity_adjustment_reason = %s,
+                updated_at = NOW()
+            WHERE id = %s
+        """
+        affected = self.db.execute_update(query, (
+            new_severity, original, adjusted_by, reason, finding_id
+        ))
+        
+        if affected > 0:
+            self._log_finding_change(finding_id, 'severity', old_severity, new_severity, adjusted_by)
+        
+        return affected > 0
+
+    def update_finding_proof_content(self, finding_id: str, proof_content: str,
+                                      start_line: int = None, end_line: int = None) -> bool:
+        """Store full proof context for a finding"""
+        query = """
+            UPDATE findings 
+            SET proof_content = %s,
+                proof_start_line = %s,
+                proof_end_line = %s,
+                updated_at = NOW()
+            WHERE id = %s
+        """
+        return self.db.execute_update(query, (
+            proof_content, start_line, end_line, finding_id
+        )) > 0
+
+    def assign_owner(self, finding_id: str, owner_name: str, owner_email: str,
+                     assigned_by: str = "user") -> bool:
+        """Assign an owner to a finding for notification purposes"""
+        query = """
+            UPDATE findings 
+            SET assigned_owner = %s,
+                owner_email = %s,
+                updated_at = NOW()
+            WHERE id = %s
+        """
+        affected = self.db.execute_update(query, (owner_name, owner_email, finding_id))
+        
+        if affected > 0:
+            self._log_finding_change(finding_id, 'assigned_owner', None, owner_email, assigned_by)
+        
+        return affected > 0
+
+    def mark_file_as_clean(self, file_path: str, reason: str = None,
+                           fp_category: str = None, marked_by: str = "user") -> Dict[str, Any]:
+        """Mark all findings in a file as false positive
+        
+        This ensures symmetry between Group by File and All Findings views.
+        """
+        query = """
+            UPDATE findings 
+            SET resolution_status = 'false_positive',
+                fp_reason = %s,
+                fp_category = %s,
+                fp_marked_by = %s,
+                fp_marked_at = NOW(),
+                resolved_at = NOW(),
+                updated_at = NOW()
+            WHERE file_path = %s AND resolution_status = 'open'
+            RETURNING id
+        """
+        results = self.db.execute_query(query, (reason, fp_category, marked_by, file_path))
+        
+        affected_ids = [str(r['id']) for r in results] if results else []
+        
+        logger.info(f"Marked {len(affected_ids)} findings in {file_path} as false positive")
+        
+        return {
+            'file_path': file_path,
+            'findings_marked': len(affected_ids),
+            'finding_ids': affected_ids
+        }
+
+    def get_findings_by_folder(self, folder_path: str, include_subfolders: bool = True,
+                               resolution_status: str = 'open') -> List[Dict[str, Any]]:
+        """Get all findings in a folder for grouped assignment"""
+        if include_subfolders:
+            query = """
+                SELECT f.*, p.name as project_name
+                FROM findings f
+                LEFT JOIN projects p ON f.project_id = p.id
+                WHERE f.file_path LIKE %s
+                  AND f.resolution_status = %s
+                ORDER BY f.parent_folder, f.file_path, f.line_number
+            """
+            pattern = f"{folder_path}%"
+        else:
+            query = """
+                SELECT f.*, p.name as project_name
+                FROM findings f
+                LEFT JOIN projects p ON f.project_id = p.id
+                WHERE f.parent_folder = %s
+                  AND f.resolution_status = %s
+                ORDER BY f.file_path, f.line_number
+            """
+            pattern = folder_path
+        
+        return self.db.execute_query(query, (pattern, resolution_status))
+
+    def get_folder_summary(self) -> List[Dict[str, Any]]:
+        """Get summary of findings grouped by parent folder"""
+        query = """
+            SELECT 
+                parent_folder,
+                COUNT(*) as finding_count,
+                COUNT(DISTINCT file_path) as file_count,
+                MAX(severity) as max_severity,
+                array_agg(DISTINCT tool_source) as tools,
+                array_agg(DISTINCT secret_type) as secret_types
+            FROM findings
+            WHERE resolution_status = 'open'
+              AND parent_folder IS NOT NULL
+            GROUP BY parent_folder
+            ORDER BY finding_count DESC
+        """
+        return self.db.execute_query(query, ())
+
+    def get_finding_categories(self) -> List[Dict[str, Any]]:
+        """Get all available finding categories"""
+        query = """
+            SELECT category_key, display_name, description, color_code, icon, severity_weight
+            FROM finding_categories
+            WHERE is_active = true
+            ORDER BY sort_order
+        """
+        return self.db.execute_query(query, ())
+
+    def get_fp_categories(self) -> List[Dict[str, Any]]:
+        """Get all available false positive categories"""
+        query = """
+            SELECT category_key, display_name, description
+            FROM fp_categories
+            WHERE is_active = true
+            ORDER BY display_name
+        """
+        return self.db.execute_query(query, ())
+
+    def get_findings_pending_escalation(self) -> List[Dict[str, Any]]:
+        """Get findings that are approaching or past escalation date"""
+        query = """
+            SELECT f.*, p.name as project_name
+            FROM findings f
+            LEFT JOIN projects p ON f.project_id = p.id
+            WHERE f.resolution_status = 'open'
+              AND f.escalation_status = 'pending'
+              AND f.escalation_date IS NOT NULL
+            ORDER BY f.escalation_date ASC
+        """
+        return self.db.execute_query(query, ())
+
+    def get_finding_with_proof(self, finding_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single finding with all details including proof content"""
+        query = """
+            SELECT f.*, 
+                   p.name as project_name,
+                   fc.display_name as category_display,
+                   fc.color_code as category_color,
+                   fc.icon as category_icon
+            FROM findings f
+            LEFT JOIN projects p ON f.project_id = p.id
+            LEFT JOIN finding_categories fc ON f.finding_category = fc.category_key
+            WHERE f.id = %s
+        """
+        result = self.db.execute_query(query, (finding_id,))
+        return dict(result[0]) if result else None
+
+    def bulk_update_category(self, finding_ids: List[str], category: str,
+                              updated_by: str = "user") -> Dict[str, Any]:
+        """Update category for multiple findings at once"""
+        if not finding_ids:
+            return {'success': 0, 'failed': 0}
+        
+        results = {'success': 0, 'failed': 0}
+        
+        for finding_id in finding_ids:
+            if self.update_finding_category(finding_id, category, updated_by):
+                results['success'] += 1
+            else:
+                results['failed'] += 1
+        
+        return results
+
+    def bulk_assign_owner(self, finding_ids: List[str], owner_name: str,
+                          owner_email: str, assigned_by: str = "user") -> Dict[str, Any]:
+        """Assign owner to multiple findings at once"""
+        if not finding_ids:
+            return {'success': 0, 'failed': 0}
+        
+        placeholders = ','.join(['%s'] * len(finding_ids))
+        query = f"""
+            UPDATE findings 
+            SET assigned_owner = %s,
+                owner_email = %s,
+                updated_at = NOW()
+            WHERE id IN ({placeholders})
+        """
+        
+        params = [owner_name, owner_email] + list(finding_ids)
+        affected = self.db.execute_update(query, tuple(params))
+        
+        return {'success': affected, 'failed': len(finding_ids) - affected}
+
+    def _log_finding_change(self, finding_id: str, field_name: str,
+                            old_value: Any, new_value: Any, changed_by: str):
+        """Log a change to finding_history table"""
+        try:
+            query = """
+                INSERT INTO finding_history (finding_id, field_changed, old_value, new_value, changed_by)
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            self.db.execute_update(query, (
+                finding_id, field_name, str(old_value) if old_value else None,
+                str(new_value) if new_value else None, changed_by
+            ))
+        except Exception as e:
+            logger.warning(f"Could not log finding change: {e}")
+
+    def refresh_materialized_views(self) -> bool:
+        """Refresh materialized views for performance"""
+        try:
+            self.db.execute_update("SELECT refresh_findings_summary()", ())
+            logger.info("Materialized views refreshed")
+            return True
+        except Exception as e:
+            logger.warning(f"Could not refresh materialized views: {e}")
+            return False
+
+    def get_dashboard_summary_fast(self) -> Dict[str, Any]:
+        """Get dashboard summary using materialized view for performance"""
+        try:
+            # Try materialized view first
+            query = """
+                SELECT 
+                    SUM(open_count) as total_open,
+                    SUM(fp_count) as total_fps,
+                    SUM(CASE WHEN resolution_status = 'open' AND severity = 'Critical' THEN finding_count ELSE 0 END) as critical_count,
+                    SUM(CASE WHEN resolution_status = 'open' AND severity = 'High' THEN finding_count ELSE 0 END) as high_count,
+                    SUM(pending_escalation) as pending_escalations
+                FROM mv_findings_summary
+            """
+            result = self.db.execute_query(query, ())
+            if result:
+                return dict(result[0])
+        except Exception:
+            pass
+        
+        # Fallback to direct query
+        query = """
+            SELECT 
+                COUNT(CASE WHEN resolution_status = 'open' THEN 1 END) as total_open,
+                COUNT(CASE WHEN resolution_status = 'false_positive' THEN 1 END) as total_fps,
+                COUNT(CASE WHEN resolution_status = 'open' AND severity = 'Critical' THEN 1 END) as critical_count,
+                COUNT(CASE WHEN resolution_status = 'open' AND severity = 'High' THEN 1 END) as high_count,
+                COUNT(CASE WHEN escalation_status = 'pending' THEN 1 END) as pending_escalations
+            FROM findings
+        """
+        result = self.db.execute_query(query, ())
+        return dict(result[0]) if result else {}
+
 
 class FileCacheManager:
     """File processing cache operations"""

@@ -55,6 +55,13 @@ import redis_manager
 from jira_manager import jira_manager, update_jira_config
 from config import config
 
+# Email manager - import with fallback for missing dependencies
+try:
+    from email_manager import email_manager
+except ImportError:
+    email_manager = None
+    logger.warning("Email manager not available - email features disabled")
+
 logger = logging.getLogger(__name__)
 
 # Security configuration
@@ -502,6 +509,7 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
     """Get findings grouped by file path for display efficiency.
     
     Returns a DataFrame with one row per file, containing aggregated finding info.
+    Includes parent_folder for sorting files in the same directory together.
     """
     try:
         # Build dynamic WHERE clause
@@ -523,6 +531,7 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
         
         where_clause = " AND ".join(conditions)
         
+        # Extract parent folder from file path for grouping
         query = f"""
             SELECT 
                 f.file_path,
@@ -533,12 +542,17 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
                 MAX(f.severity) as max_severity,
                 MAX(f.first_seen) as latest_finding,
                 MIN(f.first_seen) as earliest_finding,
-                p.name as project_name
+                p.name as project_name,
+                -- Extract parent folder (everything before the last /)
+                REGEXP_REPLACE(f.file_path, '/[^/]+$', '') as parent_folder
             FROM findings f
             JOIN projects p ON f.project_id = p.id
             WHERE {where_clause}
             GROUP BY f.file_path, p.name
             ORDER BY 
+                -- Sort by parent folder first so files in same directory are grouped
+                REGEXP_REPLACE(f.file_path, '/[^/]+$', '') ASC,
+                -- Then by severity within folder
                 CASE MAX(f.severity)
                     WHEN 'Critical' THEN 1
                     WHEN 'High' THEN 2
@@ -546,7 +560,10 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
                     WHEN 'Low' THEN 4
                     ELSE 5
                 END,
-                COUNT(*) DESC
+                -- Then by count within severity
+                COUNT(*) DESC,
+                -- Finally alphabetically by filename
+                f.file_path ASC
         """
         
         results = db_manager.execute_query(query, tuple(params) if params else None)
@@ -1025,7 +1042,8 @@ def toggle_scan_modal(custom_scan_clicks, cancel_clicks, start_clicks, current_c
 # Finding Detail Modal Callbacks
 @app.callback(
     [Output("finding-detail-modal", "className"),
-     Output("finding-detail-content", "children")],
+     Output("finding-detail-content", "children"),
+     Output("finding-detail-store", "data")],
     [Input("findings-table", "active_cell"),
      Input("close-detail-modal-btn-bottom", "n_clicks")],
     [State("findings-table", "data"),
@@ -1036,19 +1054,28 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
     """Show detailed view of a finding when clicking a table row"""
     ctx = dash.callback_context
     if not ctx.triggered:
-        return "modal-container", []
+        return "modal-container", [], {}
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
     # Close button clicked
     if trigger_id == "close-detail-modal-btn-bottom":
-        return "modal-container", []
+        return "modal-container", [], {}
     
     # Table cell clicked
     if trigger_id == "findings-table" and active_cell and table_data:
         row_idx = active_cell.get('row')
         if row_idx is not None and row_idx < len(table_data):
             row = table_data[row_idx]
+            
+            # Store finding data for proof viewer
+            finding_store_data = {
+                'id': row.get('id'),
+                'file_path': row.get('file_path'),
+                'line_number': row.get('line_number', 1),
+                'match_text': row.get('secret_value', ''),
+                'context': row.get('context', '')
+            }
             
             # Build detailed view
             detail_content = html.Div([
@@ -1058,7 +1085,12 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                         row.get('severity', 'Unknown'),
                         className=f"severity-badge severity-{row.get('severity', 'unknown').lower()}"
                     ),
-                    html.Span(f" • {row.get('tool_source', 'Unknown Tool')}", className="tool-badge")
+                    html.Span(f" • {row.get('tool_source', 'Unknown Tool')}", className="tool-badge"),
+                    # Category badge if set
+                    html.Span(
+                        f" • 🏷️ {row.get('finding_category', 'uncategorized').replace('_', ' ').title()}",
+                        className="category-badge"
+                    ) if row.get('finding_category') else html.Span(),
                 ], className="detail-badges"),
                 
                 # Main fields
@@ -1078,9 +1110,41 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                 ], className="detail-field"),
                 
                 html.Div([
-                    html.Label("📝 Full Context:"),
-                    html.Pre(row.get('context', 'N/A'), className="detail-value context-value-full")
+                    html.Label("📝 Context Preview:"),
+                    html.Pre(row.get('context', 'N/A')[:500] + ('...' if len(row.get('context', '')) > 500 else ''), 
+                            className="detail-value context-value-full")
                 ], className="detail-field"),
+                
+                # View Full Proof button
+                html.Div([
+                    html.Button(
+                        "📄 View Full File Context", 
+                        id='btn-view-proof',
+                        n_clicks=0,
+                        style={
+                            'backgroundColor': '#22c55e', 'color': 'white',
+                            'border': 'none', 'padding': '10px 20px',
+                            'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginTop': '10px'
+                        }
+                    )
+                ], style={'textAlign': 'center'}),
+                
+                # Owner/notification info
+                html.Div([
+                    html.Div([
+                        html.Label("👤 Owner:"),
+                        html.Div(row.get('owner_name', 'Not assigned'), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("📧 Owner Email:"),
+                        html.Div(row.get('owner_email', 'N/A'), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("📬 Notified:"),
+                        html.Div("Yes" if row.get('email_notified') else "No", className="detail-value")
+                    ], className="detail-field-small"),
+                ], className="detail-metadata-row", style={'marginTop': '15px'}),
                 
                 # Metadata row
                 html.Div([
@@ -1097,6 +1161,16 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                         html.Div(row.get('project_name', 'N/A'), className="detail-value")
                     ], className="detail-field-small")
                 ], className="detail-metadata-row"),
+                
+                # Severity adjustment info (if adjusted)
+                html.Div([
+                    html.Label("⚡ Severity Adjusted:"),
+                    html.Div([
+                        html.Span(f"Original: {row.get('original_severity', 'N/A')} → Current: {row.get('severity', 'N/A')}"),
+                        html.Br(),
+                        html.Span(f"Reason: {row.get('severity_adjusted_reason', 'N/A')}", style={'fontSize': '12px', 'color': '#9ca3af'})
+                    ], className="detail-value", style={'backgroundColor': '#2d3322', 'padding': '8px', 'borderRadius': '4px'})
+                ], className="detail-field", style={'marginTop': '10px'}) if row.get('severity_adjusted') else html.Div(),
                 
                 # False Positive info (only show if marked as FP)
                 html.Div([
@@ -1130,9 +1204,9 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                 }) if row.get('resolution_status') == 'false_positive' else html.Div()
             ], className="finding-detail-container")
             
-            return "modal-container show", detail_content
+            return "modal-container show", detail_content, finding_store_data
     
-    return current_class or "modal-container", []
+    return current_class or "modal-container", [], {}
 
 
 # Quick date range buttons callback
@@ -1619,6 +1693,154 @@ def create_jira_tickets_for_files(n_clicks, selected_rows, table_data):
     except Exception as e:
         logger.error(f"Error creating file-based Jira tickets: {e}")
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# File-based Mark as Clean Callback
+@app.callback(
+    Output("file-action-result", "children", allow_duplicate=True),
+    [Input("btn-mark-file-clean", "n_clicks")],
+    [State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
+)
+def mark_files_as_clean(n_clicks, selected_rows, table_data):
+    """Mark all findings in selected files as reviewed/clean"""
+    if not n_clicks or not selected_rows or not table_data:
+        return ""
+    
+    try:
+        selected_files = []
+        for i in selected_rows:
+            if i < len(table_data):
+                file_path = table_data[i].get('file_path')
+                if file_path:
+                    selected_files.append(file_path)
+        
+        if not selected_files:
+            return html.Span("⚠️ No files selected", style={'color': '#f59e0b'})
+        
+        total_cleaned = 0
+        for file_path in selected_files:
+            result = findings_manager.mark_file_as_clean(
+                file_path=file_path, 
+                marked_by="dashboard_user",
+                reason="File reviewed and marked as clean via dashboard"
+            )
+            total_cleaned += result.get('count', 0)
+        
+        # Force cache refresh
+        data_cache['findings_df'] = None
+        data_cache['last_update'] = None
+        
+        if total_cleaned > 0:
+            return html.Span(
+                f"✅ Marked {total_cleaned} findings in {len(selected_files)} file(s) as clean/reviewed",
+                style={'color': '#22c55e', 'fontWeight': 'bold'}
+            )
+        else:
+            return html.Span("⚠️ No findings to mark", style={'color': '#f59e0b'})
+    
+    except Exception as e:
+        logger.error(f"Error marking files as clean: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# File-based Categorization Callback - Opens Category Modal with file findings
+@app.callback(
+    [Output("category-modal", "style", allow_duplicate=True),
+     Output("selected-findings-for-category", "data", allow_duplicate=True)],
+    [Input("btn-categorize-files", "n_clicks")],
+    [State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
+)
+def open_category_modal_for_files(n_clicks, selected_rows, table_data):
+    """Open category modal with findings from selected files"""
+    if not n_clicks or not selected_rows or not table_data:
+        return {'display': 'none'}, []
+    
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '100px'
+    }
+    
+    try:
+        selected_files = []
+        for i in selected_rows:
+            if i < len(table_data):
+                file_path = table_data[i].get('file_path')
+                if file_path:
+                    selected_files.append(file_path)
+        
+        if not selected_files:
+            return {'display': 'none'}, []
+        
+        # Get all finding IDs for these files
+        all_finding_ids = []
+        for file_path in selected_files:
+            query = """
+                SELECT id FROM findings 
+                WHERE file_path = %s 
+                AND resolution_status != 'false_positive'
+            """
+            results = db_manager.execute_query(query, (file_path,))
+            all_finding_ids.extend([row['id'] for row in results])
+        
+        return visible_style, all_finding_ids
+    
+    except Exception as e:
+        logger.error(f"Error opening category modal for files: {e}")
+        return {'display': 'none'}, []
+
+
+# File-based Email Owner Callback - Opens Email Modal with file findings
+@app.callback(
+    [Output("send-email-modal", "style", allow_duplicate=True),
+     Output("selected-findings-for-email", "data", allow_duplicate=True)],
+    [Input("btn-email-file-owners", "n_clicks")],
+    [State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
+)
+def open_email_modal_for_files(n_clicks, selected_rows, table_data):
+    """Open email notification modal with findings from selected files"""
+    if not n_clicks or not selected_rows or not table_data:
+        return {'display': 'none'}, []
+    
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '100px'
+    }
+    
+    try:
+        selected_files = []
+        for i in selected_rows:
+            if i < len(table_data):
+                file_path = table_data[i].get('file_path')
+                if file_path:
+                    selected_files.append(file_path)
+        
+        if not selected_files:
+            return {'display': 'none'}, []
+        
+        # Get all finding IDs for these files
+        all_finding_ids = []
+        for file_path in selected_files:
+            query = """
+                SELECT id FROM findings 
+                WHERE file_path = %s 
+                AND resolution_status != 'false_positive'
+            """
+            results = db_manager.execute_query(query, (file_path,))
+            all_finding_ids.extend([row['id'] for row in results])
+        
+        return visible_style, all_finding_ids
+    
+    except Exception as e:
+        logger.error(f"Error opening email modal for files: {e}")
+        return {'display': 'none'}, []
 
 
 # False Positives Viewer Modal Callbacks
@@ -2192,6 +2414,362 @@ def create_jira_tickets(n_clicks, selected_rows, table_data):
         )
 
 
+# ==================== EMAIL SETTINGS CALLBACKS ====================
+
+@app.callback(
+    Output("email-settings-modal", "style"),
+    [Input("btn-email-settings", "n_clicks"),
+     Input("close-email-settings-btn", "n_clicks"),
+     Input("btn-save-email", "n_clicks")]
+)
+def toggle_email_settings_modal(open_clicks, close_clicks, save_clicks):
+    """Toggle the email settings modal"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+        'zIndex': '9999', 'paddingTop': '30px', 'overflowY': 'auto'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-email-settings":
+        return visible_style
+    
+    return hidden_style
+
+
+@app.callback(
+    Output("email-test-result", "children"),
+    [Input("btn-test-email", "n_clicks")],
+    [State("email-smtp-host", "value"),
+     State("email-smtp-port", "value"),
+     State("email-username", "value"),
+     State("email-password", "value")]
+)
+def test_email_connection(n_clicks, host, port, username, password):
+    """Test email SMTP connection"""
+    if not n_clicks:
+        return ""
+    
+    if not host or not port:
+        return html.Span("⚠️ Please fill in SMTP host and port", style={'color': '#f59e0b'})
+    
+    try:
+        import smtplib
+        with smtplib.SMTP(host, int(port), timeout=10) as server:
+            server.starttls()
+            if username and password:
+                server.login(username, password)
+            return html.Span("✅ Connection successful!", style={'color': '#22c55e'})
+    except Exception as e:
+        return html.Span(f"❌ Connection failed: {str(e)}", style={'color': '#ef4444'})
+
+
+@app.callback(
+    Output("email-save-result", "children"),
+    [Input("btn-save-email", "n_clicks")],
+    [State("email-smtp-host", "value"),
+     State("email-smtp-port", "value"),
+     State("email-security", "value"),
+     State("email-username", "value"),
+     State("email-password", "value"),
+     State("email-from-address", "value"),
+     State("email-from-name", "value"),
+     State("email-escalation-days", "value")]
+)
+def save_email_settings(n_clicks, host, port, security, username, password, from_addr, from_name, escalation_days):
+    """Save email settings to database"""
+    if not n_clicks:
+        return ""
+    
+    if not host or not from_addr:
+        return html.Span("⚠️ Please fill in required fields (SMTP host, from address)", style={'color': '#f59e0b'})
+    
+    try:
+        # Save to database
+        query = """
+            INSERT INTO email_config (config_name, smtp_host, smtp_port, smtp_username, smtp_password, 
+                                       from_email, from_name, use_tls, use_ssl, escalation_days)
+            VALUES ('default', %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (config_name) DO UPDATE SET
+                smtp_host = EXCLUDED.smtp_host,
+                smtp_port = EXCLUDED.smtp_port,
+                smtp_username = EXCLUDED.smtp_username,
+                smtp_password = EXCLUDED.smtp_password,
+                from_email = EXCLUDED.from_email,
+                from_name = EXCLUDED.from_name,
+                use_tls = EXCLUDED.use_tls,
+                use_ssl = EXCLUDED.use_ssl,
+                escalation_days = EXCLUDED.escalation_days,
+                updated_at = NOW()
+        """
+        use_tls = security == 'tls'
+        use_ssl = security == 'ssl'
+        
+        with findings_manager.connection_pool.getconn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (host, port, username, password, from_addr, from_name, use_tls, use_ssl, escalation_days))
+            conn.commit()
+            findings_manager.connection_pool.putconn(conn)
+        
+        return html.Span("✅ Settings saved successfully!", style={'color': '#22c55e'})
+    except Exception as e:
+        logger.error(f"Error saving email settings: {e}")
+        return html.Span(f"❌ Failed to save: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== CATEGORY MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("category-modal", "style"),
+     Output("selected-findings-for-category", "data")],
+    [Input("btn-open-category", "n_clicks"),
+     Input("close-category-modal-btn", "n_clicks"),
+     Input("btn-cancel-category", "n_clicks"),
+     Input("btn-apply-category", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def toggle_category_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks, selected_rows, table_data):
+    """Toggle the category assignment modal"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '100px'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-open-category" and selected_rows and table_data:
+        # Extract finding IDs
+        finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
+        return visible_style, finding_ids
+    
+    return hidden_style, []
+
+
+@app.callback(
+    Output("category-result", "children"),
+    [Input("btn-apply-category", "n_clicks")],
+    [State("category-selector", "value"),
+     State("selected-findings-for-category", "data")]
+)
+def apply_category(n_clicks, category, finding_ids):
+    """Apply category to selected findings"""
+    if not n_clicks or not category or not finding_ids:
+        return ""
+    
+    try:
+        success_count = findings_manager.bulk_update_category(finding_ids, category)
+        return html.Span(f"✅ Category applied to {success_count} finding(s)", style={'color': '#22c55e'})
+    except Exception as e:
+        logger.error(f"Error applying category: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== SEVERITY MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("severity-modal", "style"),
+     Output("selected-findings-for-severity", "data")],
+    [Input("btn-open-severity", "n_clicks"),
+     Input("close-severity-modal-btn", "n_clicks"),
+     Input("btn-cancel-severity", "n_clicks"),
+     Input("btn-apply-severity", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def toggle_severity_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks, selected_rows, table_data):
+    """Toggle the severity adjustment modal"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '100px'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-open-severity" and selected_rows and table_data:
+        finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
+        return visible_style, finding_ids
+    
+    return hidden_style, []
+
+
+@app.callback(
+    Output("severity-result", "children"),
+    [Input("btn-apply-severity", "n_clicks")],
+    [State("severity-selector", "value"),
+     State("severity-reason", "value"),
+     State("selected-findings-for-severity", "data")]
+)
+def apply_severity(n_clicks, severity, reason, finding_ids):
+    """Apply severity adjustment to selected findings"""
+    if not n_clicks or not severity or not finding_ids:
+        return ""
+    
+    try:
+        success_count = 0
+        for finding_id in finding_ids:
+            if findings_manager.update_finding_severity(finding_id, severity, reason or "Manual adjustment"):
+                success_count += 1
+        return html.Span(f"✅ Severity updated for {success_count} finding(s)", style={'color': '#22c55e'})
+    except Exception as e:
+        logger.error(f"Error updating severity: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== SEND EMAIL MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("send-email-modal", "style"),
+     Output("selected-findings-for-email", "data")],
+    [Input("btn-open-send-email", "n_clicks"),
+     Input("close-send-email-modal-btn", "n_clicks"),
+     Input("btn-cancel-send-email", "n_clicks"),
+     Input("btn-send-notification", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data")]
+)
+def toggle_send_email_modal(open_clicks, close_clicks, cancel_clicks, send_clicks, selected_rows, table_data):
+    """Toggle the send email notification modal"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '100px'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-open-send-email" and selected_rows and table_data:
+        finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
+        return visible_style, finding_ids
+    
+    return hidden_style, []
+
+
+@app.callback(
+    Output("send-email-result", "children"),
+    [Input("btn-send-notification", "n_clicks")],
+    [State("notify-owner-name", "value"),
+     State("notify-owner-email", "value"),
+     State("notify-escalation-days", "value"),
+     State("selected-findings-for-email", "data")]
+)
+def send_email_notification(n_clicks, owner_name, owner_email, escalation_days, finding_ids):
+    """Send email notification to file owner"""
+    if not n_clicks or not owner_email or not finding_ids:
+        return ""
+    
+    try:
+        from email_manager import email_manager
+        
+        # Assign owner and set escalation for each finding
+        success_count = 0
+        for finding_id in finding_ids:
+            findings_manager.assign_owner(finding_id, owner_email, owner_name or "File Owner")
+            success_count += 1
+        
+        # Send notification email
+        result = email_manager.send_bulk_notifications(finding_ids, owner_email)
+        
+        if result.get('success'):
+            return html.Span(
+                f"✅ Email sent to {owner_email} for {success_count} finding(s). Escalation in {escalation_days} days.",
+                style={'color': '#22c55e'}
+            )
+        else:
+            return html.Span(f"❌ Email failed: {result.get('error', 'Unknown error')}", style={'color': '#ef4444'})
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== PROOF VIEWER MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("proof-modal", "style"),
+     Output("proof-file-path", "children"),
+     Output("proof-finding-info", "children"),
+     Output("proof-content-display", "children")],
+    [Input("btn-view-proof", "n_clicks"),
+     Input("close-proof-modal-btn", "n_clicks"),
+     Input("btn-close-proof", "n_clicks")],
+    [State("finding-detail-store", "data")]
+)
+def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
+    """Toggle the proof viewer modal and load full context"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+        'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style, "", "", ""
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-view-proof" and finding_data:
+        finding_id = finding_data.get('id')
+        file_path = finding_data.get('file_path', 'Unknown')
+        line_number = finding_data.get('line_number', 0)
+        match_text = finding_data.get('match_text', '')
+        
+        # Try to read the actual file for full context
+        proof_content = "Unable to load file content"
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'r', errors='ignore') as f:
+                    lines = f.readlines()
+                    # Show 10 lines before and after
+                    start_line = max(0, line_number - 11)
+                    end_line = min(len(lines), line_number + 10)
+                    
+                    context_lines = []
+                    for i, line in enumerate(lines[start_line:end_line], start=start_line + 1):
+                        marker = ">>> " if i == line_number else "    "
+                        context_lines.append(f"{i:4d} {marker}{line.rstrip()}")
+                    
+                    proof_content = "\n".join(context_lines)
+            else:
+                # Use stored match text as fallback
+                proof_content = f"File not accessible. Stored match:\n\n{match_text}"
+        except Exception as e:
+            proof_content = f"Error reading file: {e}\n\nStored match:\n{match_text}"
+        
+        return (
+            visible_style,
+            f"📁 {file_path}",
+            f"Line {line_number} | Finding ID: {finding_id}",
+            proof_content
+        )
+    
+    return hidden_style, "", "", ""
+
+
 @app.callback(
     [Output("scanner-status-custom", "children"),
      Output("scanner-status-custom", "className"),
@@ -2574,6 +3152,12 @@ def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh
         else:
             latest_str = 'N/A'
         
+        # Get parent folder for display
+        parent_folder = row.get('parent_folder', '')
+        if not parent_folder:
+            file_path = str(row.get('file_path', ''))
+            parent_folder = '/'.join(file_path.split('/')[:-1]) if '/' in file_path else ''
+        
         table_data.append({
             'file_path': sanitize_input(str(row.get('file_path', '')), 500),
             'finding_count': row.get('finding_count', 0),
@@ -2581,7 +3165,8 @@ def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh
             'tools_display': tools_display,
             'types_display': types_display,
             'project_name': sanitize_input(str(row.get('project_name', 'N/A')), 100),
-            'latest_finding': latest_str
+            'latest_finding': latest_str,
+            'parent_folder': sanitize_input(parent_folder, 300)
         })
     
     return table_data, secret_type_options
@@ -2931,6 +3516,9 @@ def create_layout():
                 ], className="scanner-status-grid")
             ], className="scanner-status"),
 
+            # Global Stores
+            dcc.Store(id="finding-detail-store", data={}),
+            
             # Custom Scan Modal
             html.Div([
                 dcc.Store(id="scan-modal-open", data=False),
@@ -3258,6 +3846,7 @@ def create_layout():
                         dash_table.DataTable(
                             id='file-grouped-table',
                             columns=[
+                                {"name": "📁 Folder", "id": "parent_folder"},
                                 {"name": "File Path", "id": "file_path"},
                                 {"name": "Findings", "id": "finding_count"},
                                 {"name": "Max Severity", "id": "max_severity"},
@@ -3285,14 +3874,16 @@ def create_layout():
                         'fontFamily': 'Monaco, Consolas, monospace'
                     },
                     style_cell_conditional=[
-                        {'if': {'column_id': 'file_path'}, 'width': '40%', 'maxWidth': '400px', 
+                        {'if': {'column_id': 'parent_folder'}, 'width': '180px', 'maxWidth': '200px',
+                         'overflow': 'hidden', 'textOverflow': 'ellipsis', 'color': '#9ca3af', 'fontSize': '11px'},
+                        {'if': {'column_id': 'file_path'}, 'width': '35%', 'maxWidth': '350px', 
                          'overflow': 'hidden', 'textOverflow': 'ellipsis'},
                         {'if': {'column_id': 'finding_count'}, 'width': '80px', 'textAlign': 'center', 
                          'fontWeight': 'bold'},
                         {'if': {'column_id': 'max_severity'}, 'width': '100px', 'textAlign': 'center'},
-                        {'if': {'column_id': 'tools_display'}, 'width': '150px', 'textAlign': 'center'},
-                        {'if': {'column_id': 'types_display'}, 'width': '200px'},
-                        {'if': {'column_id': 'latest_finding'}, 'width': '120px', 'textAlign': 'center'},
+                        {'if': {'column_id': 'tools_display'}, 'width': '120px', 'textAlign': 'center'},
+                        {'if': {'column_id': 'types_display'}, 'width': '150px'},
+                        {'if': {'column_id': 'latest_finding'}, 'width': '100px', 'textAlign': 'center'},
                     ],
                     style_data_conditional=[
                         {'if': {'filter_query': '{max_severity} = "Critical"'},
@@ -3329,6 +3920,42 @@ def create_layout():
                             title="Mark all findings in selected files as false positives",
                             style={
                                 'backgroundColor': '#dc2626', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "✅ Mark Files as Clean", 
+                            id='btn-mark-file-clean',
+                            n_clicks=0,
+                            title="Mark all findings in selected files as reviewed and clean",
+                            style={
+                                'backgroundColor': '#22c55e', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "🏷️ Categorize Files", 
+                            id='btn-categorize-files',
+                            n_clicks=0,
+                            title="Categorize all findings in selected files",
+                            style={
+                                'backgroundColor': '#f59e0b', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "📧 Email File Owners", 
+                            id='btn-email-file-owners',
+                            n_clicks=0,
+                            title="Send email notifications to owners of selected files",
+                            style={
+                                'backgroundColor': '#3b82f6', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
                                 'marginRight': '10px', 'fontWeight': 'bold'
@@ -3442,11 +4069,55 @@ def create_layout():
                             }
                         ),
                         html.Button(
+                            "🏷️ Categorize", 
+                            id='btn-open-category',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#f59e0b', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "⚡ Adjust Severity", 
+                            id='btn-open-severity',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#ef4444', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "📧 Email Owner", 
+                            id='btn-open-send-email',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#3b82f6', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
                             "⚙️ Jira Settings", 
                             id='btn-jira-settings',
                             n_clicks=0,
                             style={
                                 'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold', 'marginRight': '10px'
+                            }
+                        ),
+                        html.Button(
+                            "📧 Email Settings", 
+                            id='btn-email-settings',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#3b82f6', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
                                 'fontWeight': 'bold'
@@ -4083,6 +4754,321 @@ def create_layout():
                     ], className="modal-footer")
                 ], className="modal-content detail-modal-content")
             ], id="finding-detail-modal", className="modal-container"),
+
+            # Email Settings Modal
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("📧 Email Notification Settings", style={'margin': '0', 'color': '#60a5fa'}),
+                        html.Button("✕", id='close-email-settings-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Configure SMTP settings for email notifications to file owners.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    # SMTP Settings
+                    html.Div([
+                        html.Div([
+                            html.Label("SMTP Host:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-smtp-host', type='text', placeholder='smtp.example.com',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Div([
+                                html.Label("SMTP Port:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                                dcc.Input(id='email-smtp-port', type='number', value=587,
+                                          style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                                 'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                            ], style={'flex': '1', 'marginRight': '15px'}),
+                            html.Div([
+                                html.Label("Security:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                                dcc.Dropdown(id='email-security', options=[
+                                    {'label': 'TLS (Recommended)', 'value': 'tls'},
+                                    {'label': 'SSL', 'value': 'ssl'},
+                                    {'label': 'None', 'value': 'none'}
+                                ], value='tls', clearable=False, style={'backgroundColor': '#1e1e1e'})
+                            ], style={'flex': '1'}),
+                        ], style={'display': 'flex', 'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("Username:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-username', type='text', placeholder='your-email@example.com',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("Password:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-password', type='password', placeholder='SMTP password or app password',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("From Email:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-from-address', type='email', placeholder='security@yourcompany.com',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("From Name:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-from-name', type='text', value='SecretSnipe Security',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("Escalation Days:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-escalation-days', type='number', value=7, min=1, max=30,
+                                      style={'width': '150px', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                            html.Span(" days before escalating unresolved findings", style={'color': '#9ca3af', 'marginLeft': '10px'}),
+                        ], style={'marginBottom': '20px'}),
+                    ], style={'backgroundColor': '#1f2937', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px'}),
+                    
+                    html.Div(id='email-test-result', style={'marginBottom': '15px'}),
+                    html.Div(id='email-save-result', style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Button("🔗 Test Connection", id='btn-test-email', n_clicks=0, style={
+                            'backgroundColor': '#3b82f6', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("💾 Save Settings", id='btn-save-email', n_clicks=0, style={
+                            'backgroundColor': '#22c55e', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '600px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='email-settings-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+                'zIndex': '9999', 'paddingTop': '30px', 'overflowY': 'auto'
+            }),
+
+            # Category Assignment Modal
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("🏷️ Categorize Findings", style={'margin': '0', 'color': '#f59e0b'}),
+                        html.Button("✕", id='close-category-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Assign a category to selected findings for better organization.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    html.Div([
+                        html.Label("Finding Category:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Dropdown(id='category-selector', options=[
+                            {'label': '🔑 Real Password', 'value': 'real_password'},
+                            {'label': '🔐 Real API Key', 'value': 'real_api_key'},
+                            {'label': '💰 Financial Data', 'value': 'finance_data'},
+                            {'label': '🗄️ Database Credential', 'value': 'database_credential'},
+                            {'label': '☁️ Cloud Credential', 'value': 'cloud_credential'},
+                            {'label': '🔏 Private Key', 'value': 'private_key'},
+                            {'label': '📝 Placeholder/Example', 'value': 'placeholder'},
+                            {'label': '🧪 Test Data', 'value': 'test_data'},
+                            {'label': '📖 Sample/Demo Key', 'value': 'sample_key'},
+                            {'label': '💬 Commented Out', 'value': 'commented_out'},
+                            {'label': '🔢 Encoded/Encrypted', 'value': 'encoded_data'},
+                            {'label': '🌐 Environment Variable', 'value': 'environment_variable'},
+                            {'label': '⚠️ Hardcoded Secret', 'value': 'hardcoded'},
+                            {'label': '⚙️ Config File Secret', 'value': 'config_file'},
+                            {'label': '❓ Uncategorized', 'value': 'uncategorized'},
+                        ], value=None, placeholder='Select a category...', style={'backgroundColor': '#1e1e1e'})
+                    ], style={'marginBottom': '20px'}),
+                    
+                    dcc.Store(id='selected-findings-for-category', data=[]),
+                    html.Div(id='category-result', style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Button("✅ Apply Category", id='btn-apply-category', n_clicks=0, style={
+                            'backgroundColor': '#f59e0b', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("Cancel", id='btn-cancel-category', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '500px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='category-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '1000', 'paddingTop': '100px'
+            }),
+
+            # Severity Adjustment Modal
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("⚡ Adjust Severity", style={'margin': '0', 'color': '#ef4444'}),
+                        html.Button("✕", id='close-severity-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Adjust the severity of selected findings based on your investigation.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    html.Div([
+                        html.Label("New Severity:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Dropdown(id='severity-selector', options=[
+                            {'label': '🔴 Critical', 'value': 'Critical'},
+                            {'label': '🟠 High', 'value': 'High'},
+                            {'label': '🟡 Medium', 'value': 'Medium'},
+                            {'label': '🟢 Low', 'value': 'Low'},
+                        ], value=None, placeholder='Select new severity...', style={'backgroundColor': '#1e1e1e'})
+                    ], style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Label("Reason for adjustment:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Textarea(id='severity-reason', placeholder='e.g., After investigation, found this is an internal-only credential...',
+                                     style={'width': '100%', 'height': '80px', 'backgroundColor': '#1e1e1e',
+                                            'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px', 'padding': '10px'})
+                    ], style={'marginBottom': '20px'}),
+                    
+                    dcc.Store(id='selected-findings-for-severity', data=[]),
+                    html.Div(id='severity-result', style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Button("✅ Apply Severity", id='btn-apply-severity', n_clicks=0, style={
+                            'backgroundColor': '#ef4444', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("Cancel", id='btn-cancel-severity', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '500px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='severity-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '1000', 'paddingTop': '100px'
+            }),
+
+            # Send Email Notification Modal
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("📧 Send Notification", style={'margin': '0', 'color': '#3b82f6'}),
+                        html.Button("✕", id='close-send-email-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Send an email notification to the file owner about selected findings.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    html.Div([
+                        html.Label("Owner Name:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(id='notify-owner-name', type='text', placeholder='John Smith',
+                                  style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                    ], style={'marginBottom': '15px'}),
+                    html.Div([
+                        html.Label("Owner Email:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(id='notify-owner-email', type='email', placeholder='jsmith@company.com',
+                                  style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                    ], style={'marginBottom': '15px'}),
+                    html.Div([
+                        html.Label("Escalation Timeline:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Dropdown(id='notify-escalation-days', options=[
+                            {'label': '3 days', 'value': 3},
+                            {'label': '5 days', 'value': 5},
+                            {'label': '7 days (Default)', 'value': 7},
+                            {'label': '14 days', 'value': 14},
+                            {'label': '30 days', 'value': 30},
+                        ], value=7, clearable=False, style={'backgroundColor': '#1e1e1e'})
+                    ], style={'marginBottom': '20px'}),
+                    
+                    dcc.Store(id='selected-findings-for-email', data=[]),
+                    html.Div(id='send-email-result', style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Button("📧 Send Notification", id='btn-send-notification', n_clicks=0, style={
+                            'backgroundColor': '#3b82f6', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("Cancel", id='btn-cancel-send-email', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '500px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='send-email-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '1000', 'paddingTop': '100px'
+            }),
+
+            # Proof Viewer Modal - Full context viewer
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("📄 Full Proof Context", style={'margin': '0', 'color': '#22c55e'}),
+                        html.Button("✕", id='close-proof-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.Div(id='proof-file-path', style={'color': '#60a5fa', 'marginBottom': '10px', 'fontFamily': 'monospace'}),
+                    html.Div(id='proof-finding-info', style={'color': '#9ca3af', 'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Pre(id='proof-content-display', style={
+                            'backgroundColor': '#1a1a1a', 'color': '#e0e0e0', 'padding': '20px',
+                            'borderRadius': '8px', 'overflow': 'auto', 'maxHeight': '500px',
+                            'fontFamily': 'Monaco, Consolas, monospace', 'fontSize': '13px',
+                            'border': '1px solid #444', 'whiteSpace': 'pre-wrap', 'wordWrap': 'break-word'
+                        })
+                    ], style={'marginBottom': '20px'}),
+                    
+                    html.Div([
+                        html.Button("📋 Copy to Clipboard", id='btn-copy-proof', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("Close", id='btn-close-proof', n_clicks=0, style={
+                            'backgroundColor': '#374151', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '1000px', 'width': '90%', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='proof-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+            }),
 
             # Custom Report Export Section
             html.Div([

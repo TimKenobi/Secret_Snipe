@@ -218,6 +218,51 @@ class SecurityConfig:
     encryption_key: Optional[str] = None
     audit_log_enabled: bool = True
 
+
+@dataclass
+class EmailConfig:
+    """Email/SMTP configuration for notifications"""
+    enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    from_email: str = ""
+    from_name: str = "SecretSnipe Security"
+    reply_to_email: str = ""
+    escalation_days: int = 7  # Days before escalating unresolved findings
+    reminder_days: int = 3    # Days before escalation to send reminder
+    
+    def __post_init__(self):
+        # Load from environment variables
+        if os.getenv('SMTP_HOST'):
+            self.smtp_host = os.getenv('SMTP_HOST')
+            self.enabled = True
+        if os.getenv('SMTP_PORT'):
+            try:
+                self.smtp_port = int(os.getenv('SMTP_PORT'))
+            except ValueError:
+                pass
+        if os.getenv('SMTP_USERNAME'):
+            self.smtp_username = os.getenv('SMTP_USERNAME')
+        if os.getenv('SMTP_PASSWORD'):
+            self.smtp_password = os.getenv('SMTP_PASSWORD')
+        if os.getenv('SMTP_FROM_EMAIL'):
+            self.from_email = os.getenv('SMTP_FROM_EMAIL')
+        if os.getenv('SMTP_FROM_NAME'):
+            self.from_name = os.getenv('SMTP_FROM_NAME')
+        if os.getenv('SMTP_USE_TLS'):
+            self.smtp_use_tls = os.getenv('SMTP_USE_TLS').lower() in ('true', '1', 'yes')
+        if os.getenv('SMTP_USE_SSL'):
+            self.smtp_use_ssl = os.getenv('SMTP_USE_SSL').lower() in ('true', '1', 'yes')
+        if os.getenv('ESCALATION_DAYS'):
+            try:
+                self.escalation_days = int(os.getenv('ESCALATION_DAYS'))
+            except ValueError:
+                pass
+
 @dataclass
 class JiraConfig:
     """Jira integration configuration"""
@@ -311,6 +356,7 @@ class AppConfig:
     security: SecurityConfig = None
     dashboard: DashboardConfig = None
     jira: JiraConfig = None
+    email: EmailConfig = None
 
     def __post_init__(self):
         if self.database is None:
@@ -331,6 +377,8 @@ class AppConfig:
             self.dashboard = DashboardConfig()
         if self.jira is None:
             self.jira = JiraConfig()
+        if self.email is None:
+            self.email = EmailConfig()
 
 class ConfigManager:
     """Configuration manager with environment variable and file support"""

@@ -165,6 +165,14 @@ services:
       DASHBOARD_PORT: 8050
       DASHBOARD_DEBUG: "false"
       DASHBOARD_RATE_LIMIT: "true"
+      # Email Configuration (optional - can also be set via GUI)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-SecretSnipe Security}
+      EMAIL_ESCALATION_DAYS: ${EMAIL_ESCALATION_DAYS:-7}
       # Application
       LOG_LEVEL: INFO
       DEBUG: "false"
@@ -176,11 +184,15 @@ services:
       - ./logs:/app/logs
       - ./dashboard_audit.log:/app/dashboard_audit.log
       - ./jira_config:/app/jira_config  # Persist Jira settings (host directory)
+      - ./assets:/app/assets:ro  # Dashboard CSS and JS assets
       # Mount Python files for live development
       - ./unified_visualizer_pg.py:/app/unified_visualizer_pg.py:ro
       - ./database_manager.py:/app/database_manager.py:ro
       - ./redis_manager.py:/app/redis_manager.py:ro
       - ./config.py:/app/config.py:ro
+      - ./jira_manager.py:/app/jira_manager.py:ro
+      - ./email_manager.py:/app/email_manager.py:ro
+      - ./project_manager.py:/app/project_manager.py:ro
     networks:
       - stahlsitsec_web
       - secretsnipe-network

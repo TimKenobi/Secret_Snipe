@@ -1440,6 +1440,98 @@ input.column-header-filter {
     background: #667eea !important;
 }
 
+/* ==========================================================================
+   Modal and Input Field Fixes
+   ========================================================================== */
+
+/* Ensure all inputs use border-box to prevent overflow */
+input, textarea, select, .Select-control, .Select-input {
+    box-sizing: border-box !important;
+}
+
+/* Fix Dash dcc.Input components */
+.dash-input {
+    box-sizing: border-box !important;
+    max-width: 100% !important;
+}
+
+/* Modal input fields fix */
+#email-settings-modal input,
+#email-settings-modal textarea,
+#jira-settings-modal input,
+#jira-settings-modal textarea,
+#category-modal input,
+#status-modal input,
+#status-modal textarea,
+#severity-modal input,
+#severity-modal textarea,
+#send-email-modal input,
+#send-email-modal textarea {
+    box-sizing: border-box !important;
+    max-width: 100% !important;
+}
+
+/* Fix dropdown selects in modals */
+#email-settings-modal .Select,
+#jira-settings-modal .Select,
+#category-modal .Select,
+#status-modal .Select,
+#severity-modal .Select {
+    max-width: 100% !important;
+}
+
+/* Modal overlay z-index hierarchy */
+#jira-settings-modal,
+#email-settings-modal,
+#category-modal,
+#manage-categories-modal,
+#severity-modal,
+#status-modal,
+#send-email-modal,
+#proof-modal,
+#fp-reason-modal,
+#fp-viewer-modal,
+#project-manager-modal,
+#file-detail-modal,
+#finding-detail-modal {
+    z-index: 10000 !important;
+}
+
+/* Ensure modal content is scrollable and properly sized */
+#email-settings-modal > div,
+#jira-settings-modal > div {
+    max-height: 90vh;
+    overflow-y: auto;
+    margin: 20px auto;
+}
+
+/* Fix modal appearing behind other elements */
+.modal-overlay {
+    z-index: 10000 !important;
+}
+
+/* Improve button responsiveness */
+button {
+    transition: all 0.15s ease-in-out;
+    cursor: pointer;
+}
+
+button:hover {
+    opacity: 0.9;
+    transform: translateY(-1px);
+}
+
+button:active {
+    transform: translateY(0);
+}
+
+/* Prevent double-click issues */
+button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
 @media (max-width: 600px) {
     .detail-metadata-row {
         grid-template-columns: 1fr;
@@ -1448,5 +1540,12 @@ input.column-header-filter {
     .detail-modal-content {
         width: 95% !important;
         max-height: 90vh !important;
+    }
+    
+    /* Mobile modal fixes */
+    #email-settings-modal > div,
+    #jira-settings-modal > div {
+        max-width: 95% !important;
+        padding: 15px !important;
     }
 }

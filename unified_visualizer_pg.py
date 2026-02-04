@@ -1648,7 +1648,8 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
      Input("btn-cancel-fp", "n_clicks"),
      Input("btn-confirm-fp", "n_clicks")],
     [State("findings-table", "selected_rows"),
-     State("findings-table", "data")]
+     State("findings-table", "data")],
+    prevent_initial_call=True
 )
 def toggle_fp_modal(mark_clicks, cancel_clicks, confirm_clicks, selected_rows, table_data):
     """Toggle the false positive reason modal"""
@@ -1666,7 +1667,7 @@ def toggle_fp_modal(mark_clicks, cancel_clicks, confirm_clicks, selected_rows, t
                 return {
                     'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '1000', 'paddingTop': '100px'
+                    'zIndex': '10000', 'paddingTop': '100px'
                 }, selected_ids
         return {'display': 'none'}, []
     
@@ -1894,7 +1895,7 @@ def open_category_modal_for_files(n_clicks, selected_rows, table_data):
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '100px'
+        'zIndex': '10000', 'paddingTop': '100px'
     }
     
     try:
@@ -1943,7 +1944,7 @@ def open_email_modal_for_files(n_clicks, selected_rows, table_data):
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '100px'
+        'zIndex': '10000', 'paddingTop': '100px'
     }
     
     try:
@@ -2156,7 +2157,8 @@ except ImportError:
     [Input("btn-project-manager", "n_clicks"),
      Input("close-project-modal-btn", "n_clicks"),
      Input("btn-add-directory", "n_clicks"),
-     Input("btn-trigger-scan", "n_clicks")]
+     Input("btn-trigger-scan", "n_clicks")],
+    prevent_initial_call=True
 )
 def update_project_modal_data(open_clicks, close_clicks, add_clicks, scan_clicks):
     """Update project management modal data and toggle visibility"""
@@ -2164,7 +2166,7 @@ def update_project_modal_data(open_clicks, close_clicks, add_clicks, scan_clicks
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-        'zIndex': '9999', 'paddingTop': '30px'
+        'zIndex': '10000', 'paddingTop': '30px'
     }
     
     empty_list = html.P("No directories configured yet.", style={'color': '#9ca3af', 'fontStyle': 'italic'})
@@ -2327,7 +2329,8 @@ def trigger_manual_scan(n_clicks, directory_id, scan_type):
     [Input("btn-jira-settings", "n_clicks"),
      Input("btn-jira-settings-file", "n_clicks"),
      Input("btn-close-jira-settings", "n_clicks"),
-     Input("btn-save-jira", "n_clicks")]
+     Input("btn-save-jira", "n_clicks")],
+    prevent_initial_call=True
 )
 def toggle_jira_settings_modal(open_clicks, file_open_clicks, close_clicks, save_clicks):
     """Toggle the Jira settings modal and populate with saved values"""
@@ -2336,7 +2339,7 @@ def toggle_jira_settings_modal(open_clicks, file_open_clicks, close_clicks, save
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '50px'
+        'zIndex': '10000', 'paddingTop': '50px'
     }
     
     # Default values (empty or no update)
@@ -2563,7 +2566,8 @@ def create_jira_tickets(n_clicks, selected_rows, table_data):
     [Input("btn-email-settings", "n_clicks"),
      Input("btn-email-settings-file", "n_clicks"),
      Input("close-email-settings-btn", "n_clicks"),
-     Input("btn-save-email", "n_clicks")]
+     Input("btn-save-email", "n_clicks")],
+    prevent_initial_call=True
 )
 def toggle_email_settings_modal(open_clicks, file_open_clicks, close_clicks, save_clicks):
     """Toggle the email settings modal and load saved values"""
@@ -2572,7 +2576,7 @@ def toggle_email_settings_modal(open_clicks, file_open_clicks, close_clicks, sav
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-        'zIndex': '9999', 'paddingTop': '30px', 'overflowY': 'auto'
+        'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
     }
     
     # Default email template
@@ -2764,7 +2768,8 @@ def save_email_settings(n_clicks, host, port, security, username, password, from
      Input("btn-cancel-category", "n_clicks"),
      Input("btn-apply-category", "n_clicks")],
     [State("findings-table", "selected_rows"),
-     State("findings-table", "data")]
+     State("findings-table", "data")],
+    prevent_initial_call=True
 )
 def toggle_category_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks, selected_rows, table_data):
     """Toggle the category assignment modal and load categories from DB"""
@@ -2773,7 +2778,7 @@ def toggle_category_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '100px'
+        'zIndex': '10000', 'paddingTop': '100px'
     }
     
     # Get current categories from DB
@@ -2820,7 +2825,8 @@ def apply_category(n_clicks, category, finding_ids):
     [Input("btn-manage-categories", "n_clicks"),
      Input("close-manage-categories-btn", "n_clicks"),
      Input("btn-close-manage-categories", "n_clicks"),
-     Input("btn-add-category", "n_clicks")]
+     Input("btn-add-category", "n_clicks")],
+    prevent_initial_call=True
 )
 def toggle_manage_categories_modal(open_clicks, close_clicks, close2_clicks, add_clicks):
     """Toggle the manage categories modal and load existing categories"""
@@ -2829,7 +2835,7 @@ def toggle_manage_categories_modal(open_clicks, close_clicks, close2_clicks, add
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-        'zIndex': '1001', 'paddingTop': '30px', 'overflowY': 'auto'
+        'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
     }
     
     # Build categories list
@@ -2936,7 +2942,8 @@ def add_custom_category(n_clicks, key, name, description, icon, color, weight):
     [State("findings-table", "selected_rows"),
      State("findings-table", "data"),
      State("file-grouped-table", "selected_rows"),
-     State("file-grouped-table", "data")]
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
 )
 def toggle_severity_modal(open_clicks, file_open_clicks, close_clicks, cancel_clicks, apply_clicks, 
                           selected_rows, table_data, file_selected_rows, file_table_data):
@@ -2946,7 +2953,7 @@ def toggle_severity_modal(open_clicks, file_open_clicks, close_clicks, cancel_cl
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '100px'
+        'zIndex': '10000', 'paddingTop': '100px'
     }
     
     if not ctx.triggered:
@@ -3015,7 +3022,8 @@ def apply_severity(n_clicks, severity, reason, finding_ids):
     [State("findings-table", "selected_rows"),
      State("findings-table", "data"),
      State("file-grouped-table", "selected_rows"),
-     State("file-grouped-table", "data")]
+     State("file-grouped-table", "data")],
+    prevent_initial_call=True
 )
 def toggle_status_modal(open_clicks, file_open_clicks, close_clicks, cancel_clicks, apply_clicks, 
                         selected_rows, table_data, file_selected_rows, file_table_data):
@@ -3025,7 +3033,7 @@ def toggle_status_modal(open_clicks, file_open_clicks, close_clicks, cancel_clic
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '50px', 'overflowY': 'auto'
+        'zIndex': '10000', 'paddingTop': '50px', 'overflowY': 'auto'
     }
     
     if not ctx.triggered:
@@ -3109,7 +3117,8 @@ def apply_resolution_status(n_clicks, status, reason, finding_ids):
      Input("btn-cancel-send-email", "n_clicks"),
      Input("btn-send-notification", "n_clicks")],
     [State("findings-table", "selected_rows"),
-     State("findings-table", "data")]
+     State("findings-table", "data")],
+    prevent_initial_call=True
 )
 def toggle_send_email_modal(open_clicks, close_clicks, cancel_clicks, send_clicks, selected_rows, table_data):
     """Toggle the send email notification modal"""
@@ -3118,7 +3127,7 @@ def toggle_send_email_modal(open_clicks, close_clicks, cancel_clicks, send_click
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-        'zIndex': '1000', 'paddingTop': '100px'
+        'zIndex': '10000', 'paddingTop': '100px'
     }
     
     if not ctx.triggered:
@@ -3212,7 +3221,8 @@ BINARY_EXTENSIONS = {
     [Input("btn-view-proof", "n_clicks"),
      Input("close-proof-modal-btn", "n_clicks"),
      Input("btn-close-proof", "n_clicks")],
-    [State("finding-detail-store", "data")]
+    [State("finding-detail-store", "data")],
+    prevent_initial_call=True
 )
 def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
     """Toggle the proof viewer modal and load full context"""
@@ -3222,7 +3232,7 @@ def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-        'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+        'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
     }
     
     if not ctx.triggered:
@@ -3647,19 +3657,20 @@ def toggle_view_mode(view_mode):
 @secure_callback
 def update_file_grouped_table(tool_tab, severity_filter, project_filter, refresh_clicks, n_intervals, 
                                file_search, file_tool_filter, file_severity_filter, file_secret_type_filter):
-    """Update the file-grouped table based on filters"""
-    # Check what triggered the callback - skip full refresh on just tab switches
+    """Update the file-grouped table based on filters and tool tabs"""
+    # Check what triggered the callback
     ctx = dash.callback_context
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
     
-    # If just switching tool-tabs with no filter changes, return no_update
+    # Use tool tab value directly if triggered by tab switch, otherwise use local filter
     if trigger_id == 'tool-tabs':
-        raise PreventUpdate
+        tool_filter = 'all' if tool_tab == 'all-tools' else tool_tab
+    else:
+        # Use local file filters if set, otherwise use tool tab value
+        tool_filter = file_tool_filter if file_tool_filter and file_tool_filter != 'all' else (
+            'all' if tool_tab == 'all-tools' else tool_tab
+        )
     
-    # Use local file filters if set, otherwise use global filters
-    tool_filter = file_tool_filter if file_tool_filter and file_tool_filter != 'all' else (
-        'all' if tool_tab == 'all-tools' else tool_tab
-    )
     sev_filter = file_severity_filter if file_severity_filter and file_severity_filter != 'all' else severity_filter
     secret_type_filter = file_secret_type_filter if file_secret_type_filter and file_secret_type_filter != 'all' else 'all'
     
@@ -3933,7 +3944,8 @@ def update_tool_panel(selected_tool, refresh_clicks, n_intervals):
     [Input('file-grouped-table', 'active_cell'),
      Input('close-file-detail-btn', 'n_clicks')],
     [State('file-grouped-table', 'data'),
-     State('file-detail-modal', 'style')]
+     State('file-detail-modal', 'style')],
+    prevent_initial_call=True
 )
 @secure_callback
 def handle_file_detail_modal(active_cell, close_clicks, table_data, current_style):
@@ -4020,7 +4032,7 @@ def handle_file_detail_modal(active_cell, close_clicks, table_data, current_styl
             modal_style = {
                 'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.8)',
-                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }
             
             return modal_style, title, stats_div, findings_children
@@ -4046,7 +4058,7 @@ def create_layout():
             html.Div(id="scan-result-notification", className="notification-area"),
             html.Div(id="cleanup-result-notification", className="notification-area"),
         ], id="notification-container", style={
-            'position': 'fixed', 'top': '10px', 'right': '10px', 'zIndex': '9999',
+            'position': 'fixed', 'top': '10px', 'right': '10px', 'zIndex': '10000',
             'maxWidth': '400px'
         }),
 
@@ -4631,7 +4643,7 @@ def create_layout():
             ], id='file-detail-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.8)',
-                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Data Table (original - shown when view-mode is 'all-findings')
@@ -4823,7 +4835,7 @@ def create_layout():
                 ], id='fp-reason-modal', style={
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '1000', 'paddingTop': '100px'
+                    'zIndex': '10000', 'paddingTop': '100px'
                 }),
                 
                 # Jira Settings Modal
@@ -4958,7 +4970,7 @@ def create_layout():
                 ], id='jira-settings-modal', style={
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '1000', 'paddingTop': '50px'
+                    'zIndex': '10000', 'paddingTop': '50px'
                 }),
                 
                 # Project Management Modal
@@ -5133,7 +5145,7 @@ def create_layout():
                 ], id='project-manager-modal', style={
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-                    'zIndex': '9999', 'paddingTop': '30px'
+                    'zIndex': '10000', 'paddingTop': '30px'
                 }),
                 
                 # False Positives Viewer Modal
@@ -5177,7 +5189,7 @@ def create_layout():
                 ], id='fp-viewer-modal', style={
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+                    'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
                 }),
                 
                 # Jira Action Result Message
@@ -5532,7 +5544,7 @@ SecretSnipe Security Team''',
             ], id='email-settings-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-                'zIndex': '9999', 'paddingTop': '30px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Category Assignment Modal
@@ -5586,7 +5598,7 @@ SecretSnipe Security Team''',
             ], id='category-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                'zIndex': '1000', 'paddingTop': '100px'
+                'zIndex': '10000', 'paddingTop': '100px'
             }),
 
             # Manage Categories Modal - Create/Edit custom categories
@@ -5678,7 +5690,7 @@ SecretSnipe Security Team''',
             ], id='manage-categories-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-                'zIndex': '1001', 'paddingTop': '30px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Severity Adjustment Modal
@@ -5733,7 +5745,7 @@ SecretSnipe Security Team''',
             ], id='severity-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                'zIndex': '1000', 'paddingTop': '100px'
+                'zIndex': '10000', 'paddingTop': '100px'
             }),
 
             # Resolution Status Modal - For proper status workflow
@@ -5813,7 +5825,7 @@ SecretSnipe Security Team''',
             ], id='status-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                'zIndex': '1000', 'paddingTop': '50px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '50px', 'overflowY': 'auto'
             }),
 
             # Send Email Notification Modal
@@ -5874,7 +5886,7 @@ SecretSnipe Security Team''',
             ], id='send-email-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                'zIndex': '1000', 'paddingTop': '100px'
+                'zIndex': '10000', 'paddingTop': '100px'
             }),
 
             # Proof Viewer Modal - Full context viewer
@@ -5932,7 +5944,7 @@ SecretSnipe Security Team''',
             ], id='proof-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-                'zIndex': '1000', 'paddingTop': '30px', 'overflowY': 'auto'
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Custom Report Export Section

@@ -1505,32 +1505,93 @@ input, textarea, select, .Select-control, .Select-input {
     margin: 20px auto;
 }
 
-/* Fix input text cutoff - ensure proper padding and line height */
+/* Fix input text cutoff - ensure proper padding, line height, and visible text */
 #jira-settings-modal input,
 #email-settings-modal input,
 #project-manager-modal input,
 #category-modal input,
-#manage-categories-modal input {
-    padding: 10px 12px !important;
-    line-height: 1.5 !important;
-    min-height: 40px !important;
+#manage-categories-modal input,
+#fp-reason-modal input,
+#send-email-modal input {
+    padding: 14px 14px !important;
+    line-height: 1.4 !important;
+    min-height: 48px !important;
     font-size: 14px !important;
+    box-sizing: border-box !important;
+    vertical-align: middle !important;
+    /* Critical fixes for text visibility */
+    height: auto !important;
+    overflow: visible !important;
+}
+
+/* Dash-specific input fixes - dcc.Input uses this class */
+.dash-input,
+input.dash-input {
+    padding: 14px !important;
+    line-height: 1.4 !important;
+    height: auto !important;
+    min-height: 48px !important;
+    font-size: 14px !important;
+    box-sizing: border-box !important;
+}
+
+/* Input wrapper fixes - Dash wraps inputs in divs */
+[id$="-modal"] input[type="text"],
+[id$="-modal"] input[type="password"],
+[id$="-modal"] input[type="email"],
+[id$="-modal"] input[type="number"] {
+    padding: 14px !important;
+    height: auto !important;
+    min-height: 48px !important;
+    line-height: 1.4 !important;
+    font-size: 14px !important;
+    box-sizing: border-box !important;
+    /* Force proper text rendering */
+    -webkit-appearance: none !important;
+    -moz-appearance: none !important;
+    appearance: none !important;
+}
+
+/* Target the actual input container within Dash components */
+.dash-input-container input,
+div[class*="Input"] input {
+    padding: 14px !important;
+    min-height: 48px !important;
+    line-height: 1.4 !important;
 }
 
 #jira-settings-modal textarea,
-#email-settings-modal textarea {
-    padding: 10px 12px !important;
+#email-settings-modal textarea,
+#fp-reason-modal textarea,
+#send-email-modal textarea {
+    padding: 14px !important;
     line-height: 1.5 !important;
-    min-height: 80px !important;
+    min-height: 100px !important;
     font-size: 14px !important;
+    box-sizing: border-box !important;
+    resize: vertical !important;
 }
 
 /* Fix dropdown inputs in modals */
 #category-modal .Select-input input,
 #jira-settings-modal .Select-input input,
 #email-settings-modal .Select-input input {
-    padding: 8px 0 !important;
+    padding: 10px 0 !important;
     height: auto !important;
+    min-height: 36px !important;
+}
+
+/* Fix Dash dcc.Input component text visibility */
+.dash-input::placeholder {
+    line-height: 1.4 !important;
+    vertical-align: middle !important;
+}
+
+/* Ensure text doesn't get cut off at bottom */
+[id$="-modal"] .dash-input,
+[id$="-modal"] input {
+    overflow: visible !important;
+    text-overflow: ellipsis !important;
 }
 
 /* Fix modal appearing behind other elements */

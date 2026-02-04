@@ -810,6 +810,176 @@ def get_distinct_secret_types() -> list:
         return []
 
 
+def get_email_notifications_data(start_date=None, end_date=None, status=None) -> pd.DataFrame:
+    """Get email notification history for export reports.
+    
+    Returns DataFrame with email notification logs including finding details.
+    """
+    try:
+        conditions = []
+        params = []
+        
+        if start_date:
+            conditions.append("en.created_at >= %s")
+            params.append(start_date)
+        if end_date:
+            conditions.append("en.created_at <= %s")
+            params.append(end_date)
+        if status and status != 'all':
+            conditions.append("en.status = %s")
+            params.append(status)
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        query = f"""
+            SELECT 
+                en.id as notification_id,
+                en.recipient_email,
+                en.recipient_name,
+                en.subject,
+                en.status as notification_status,
+                en.sent_at,
+                en.error_message,
+                en.created_at as notification_created,
+                f.file_path,
+                f.secret_type,
+                f.severity,
+                f.finding_category,
+                f.resolution_status
+            FROM email_notifications en
+            LEFT JOIN findings f ON en.finding_id = f.id
+            WHERE {where_clause}
+            ORDER BY en.created_at DESC
+        """
+        
+        results = db_manager.execute_query(query, params if params else None)
+        return pd.DataFrame(results) if results else pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error fetching email notifications: {e}")
+        return pd.DataFrame()
+
+
+def get_activity_log_data(start_date=None, end_date=None, action_type=None) -> pd.DataFrame:
+    """Get activity/audit log data for export reports.
+    
+    Returns DataFrame with activity logs including user actions.
+    """
+    try:
+        conditions = []
+        params = []
+        
+        if start_date:
+            conditions.append("fh.changed_at >= %s")
+            params.append(start_date)
+        if end_date:
+            conditions.append("fh.changed_at <= %s")
+            params.append(end_date)
+        if action_type and action_type != 'all':
+            conditions.append("fh.field_changed = %s")
+            params.append(action_type)
+        
+        where_clause = " AND ".join(conditions) if conditions else "1=1"
+        
+        query = f"""
+            SELECT 
+                fh.id as activity_id,
+                fh.field_changed as action_type,
+                fh.old_value,
+                fh.new_value,
+                fh.changed_by as user,
+                fh.changed_at as timestamp,
+                f.file_path,
+                f.secret_type,
+                f.severity,
+                f.finding_category
+            FROM finding_history fh
+            LEFT JOIN findings f ON fh.finding_id = f.id
+            WHERE {where_clause}
+            ORDER BY fh.changed_at DESC
+        """
+        
+        results = db_manager.execute_query(query, params if params else None)
+        return pd.DataFrame(results) if results else pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error fetching activity log: {e}")
+        return pd.DataFrame()
+
+
+def get_jira_tickets_data(start_date=None, end_date=None) -> pd.DataFrame:
+    """Get findings with Jira ticket information for export.
+    
+    Returns DataFrame with findings that have Jira tickets created.
+    """
+    try:
+        conditions = ["f.metadata->>'jira_ticket_key' IS NOT NULL"]
+        params = []
+        
+        if start_date:
+            conditions.append("f.updated_at >= %s")
+            params.append(start_date)
+        if end_date:
+            conditions.append("f.updated_at <= %s")
+            params.append(end_date)
+        
+        where_clause = " AND ".join(conditions)
+        
+        query = f"""
+            SELECT 
+                f.id as finding_id,
+                f.file_path,
+                f.secret_type,
+                f.severity,
+                f.finding_category,
+                f.resolution_status,
+                f.assigned_owner,
+                f.owner_email,
+                f.metadata->>'jira_ticket_key' as jira_ticket_key,
+                f.metadata->>'jira_ticket_url' as jira_ticket_url,
+                f.metadata->>'jira_created_at' as jira_created_at,
+                f.updated_at
+            FROM findings f
+            WHERE {where_clause}
+            ORDER BY f.updated_at DESC
+        """
+        
+        results = db_manager.execute_query(query, params if params else None)
+        return pd.DataFrame(results) if results else pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error fetching Jira tickets data: {e}")
+        return pd.DataFrame()
+
+
+def get_category_summary_data() -> pd.DataFrame:
+    """Get summary of findings by category for export.
+    
+    Returns DataFrame with category breakdown statistics.
+    """
+    try:
+        query = """
+            SELECT 
+                COALESCE(f.finding_category, 'uncategorized') as category,
+                f.severity,
+                f.resolution_status,
+                f.tool_source,
+                COUNT(*) as count,
+                MIN(f.first_seen) as earliest,
+                MAX(f.first_seen) as latest
+            FROM findings f
+            GROUP BY f.finding_category, f.severity, f.resolution_status, f.tool_source
+            ORDER BY count DESC
+        """
+        
+        results = db_manager.execute_query(query)
+        return pd.DataFrame(results) if results else pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error fetching category summary: {e}")
+        return pd.DataFrame()
+
+
 def get_category_options():
     """Load categories from database for dropdown - defined early for update_dashboard"""
     try:
@@ -1474,45 +1644,90 @@ def update_date_range(last_7, last_30, all_time):
     [Input("export-csv-btn", "n_clicks"),
      Input("export-json-btn", "n_clicks"),
      Input("export-pdf-btn", "n_clicks")],
-    [State("report-severity-filter", "value"),
+    [State("report-type-selector", "value"),
+     State("report-severity-filter", "value"),
      State("report-date-range", "start_date"),
      State("report-date-range", "end_date"),
      State("report-tool-filter", "value"),
+     State("report-status-filter", "value"),
+     State("report-category-filter", "value"),
      State("severity-filter", "value"),
-     State("tool-filter", "value")]
+     State("tool-filter", "value")],
+    prevent_initial_call=True
 )
 @secure_callback
-def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_date, end_date, report_tool, severity_filter, tool_filter):
-    """Export customized reports with enhanced filtering and formatting"""
+def export_report(csv_clicks, json_clicks, pdf_clicks, report_type, report_severities, 
+                  start_date, end_date, report_tool, report_status, report_category,
+                  severity_filter, tool_filter):
+    """Export customized reports with enhanced filtering and multiple report types.
+    
+    Supports: findings, emails, jira tickets, categories, activity log
+    """
     ctx = dash.callback_context
     if not ctx.triggered:
         return no_update
 
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    report_type = report_type or 'findings'
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     try:
-        # Get filtered data with enhanced filtering
-        df = get_findings_data()
+        # Get data based on report type
+        if report_type == 'findings':
+            df = get_findings_data()
+            if df.empty:
+                return no_update
+            
+            # Apply filters for findings report
+            if report_severities and "all" not in report_severities:
+                df = df[df['severity'].isin(report_severities)]
+            elif severity_filter and severity_filter != "all":
+                df = df[df['severity'] == severity_filter]
+            
+            if report_tool and report_tool != "all":
+                df = df[df['tool_source'] == report_tool]
+            elif tool_filter and tool_filter != "all":
+                df = df[df['tool_source'] == tool_filter]
+            
+            if report_status and report_status != "all":
+                df = df[df['resolution_status'] == report_status]
+            
+            if report_category and report_category != "all":
+                df = df[df['finding_category'] == report_category]
+                
+            if start_date:
+                df = df[df['first_seen'] >= start_date]
+            if end_date:
+                df = df[df['first_seen'] <= end_date]
+            
+            report_title = "SecretSnipe Findings Report"
+            filename_prefix = "findings"
+            
+        elif report_type == 'emails':
+            df = get_email_notifications_data(start_date, end_date)
+            report_title = "Email Notifications Log"
+            filename_prefix = "email_notifications"
+            
+        elif report_type == 'jira':
+            df = get_jira_tickets_data(start_date, end_date)
+            report_title = "Jira Tickets Report"
+            filename_prefix = "jira_tickets"
+            
+        elif report_type == 'categories':
+            df = get_category_summary_data()
+            report_title = "Category Summary Report"
+            filename_prefix = "category_summary"
+            
+        elif report_type == 'activity':
+            df = get_activity_log_data(start_date, end_date)
+            report_title = "Activity Log Report"
+            filename_prefix = "activity_log"
+        else:
+            return no_update
         
         if df.empty:
+            logger.warning(f"No data found for {report_type} report")
             return no_update
-            
-        # Apply report-specific filters
-        if report_severities and "all" not in report_severities:
-            df = df[df['severity'].isin(report_severities)]
-        elif severity_filter and severity_filter != "all":
-            df = df[df['severity'] == severity_filter]
-        
-        # Apply report tool filter (takes priority over global filter)
-        if report_tool and report_tool != "all":
-            df = df[df['tool_source'] == report_tool]
-        elif tool_filter and tool_filter != "all":
-            df = df[df['tool_source'] == tool_filter]
-            
-        if start_date:
-            df = df[df['first_seen'] >= start_date]
-        if end_date:
-            df = df[df['first_seen'] <= end_date]
 
         # Sanitize data for export
         export_df = df.copy()
@@ -1520,46 +1735,56 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
             if export_df[col].dtype == 'object':
                 export_df[col] = export_df[col].astype(str).apply(lambda x: sanitize_input(x, 1000))
 
+        # Export based on format
         if trigger_id == "export-csv-btn":
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             return dcc.send_data_frame(
                 export_df.to_csv, 
-                f"secretsnipe_report_{timestamp}.csv",
+                f"secretsnipe_{filename_prefix}_{timestamp}.csv",
                 index=False
             )
 
         elif trigger_id == "export-json-btn":
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             # Create enhanced JSON with metadata
             report_data = {
                 "metadata": {
+                    "report_type": report_type,
+                    "report_title": report_title,
                     "generated_at": datetime.now().isoformat(),
-                    "total_findings": len(export_df),
-                    "severity_breakdown": export_df['severity'].value_counts().to_dict(),
-                    "tool_breakdown": export_df['tool_source'].value_counts().to_dict(),
+                    "total_records": len(export_df),
                     "date_range": {
                         "start": start_date,
                         "end": end_date
                     },
                     "filters_applied": {
                         "severities": report_severities,
-                        "severity_filter": severity_filter,
-                        "tool_filter": tool_filter
+                        "tool": report_tool,
+                        "status": report_status,
+                        "category": report_category
                     }
                 },
-                "findings": export_df.to_dict(orient="records")
+                "data": export_df.to_dict(orient="records")
             }
+            
+            # Add type-specific summaries
+            if report_type == 'findings' and 'severity' in export_df.columns:
+                report_data["metadata"]["severity_breakdown"] = export_df['severity'].value_counts().to_dict()
+                if 'tool_source' in export_df.columns:
+                    report_data["metadata"]["tool_breakdown"] = export_df['tool_source'].value_counts().to_dict()
+                if 'finding_category' in export_df.columns:
+                    report_data["metadata"]["category_breakdown"] = export_df['finding_category'].value_counts().to_dict()
+            elif report_type == 'emails' and 'notification_status' in export_df.columns:
+                report_data["metadata"]["status_breakdown"] = export_df['notification_status'].value_counts().to_dict()
+            elif report_type == 'categories' and 'category' in export_df.columns:
+                report_data["metadata"]["total_categories"] = export_df['category'].nunique()
+            
             import json
             return dcc.send_string(
                 json.dumps(report_data, indent=2, default=str),
-                f"secretsnipe_report_{timestamp}.json"
+                f"secretsnipe_{filename_prefix}_{timestamp}.json"
             )
 
         elif trigger_id == "export-pdf-btn":
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             buffer = BytesIO()
-            
-            # Create PDF document
             doc = SimpleDocTemplate(buffer, pagesize=A4)
             styles = getSampleStyleSheet()
             story = []
@@ -1572,57 +1797,164 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
                 spaceAfter=30,
                 textColor=colors.darkblue
             )
-            story.append(Paragraph("SecretSnipe Security Report", title_style))
+            story.append(Paragraph(report_title, title_style))
             story.append(Spacer(1, 12))
             
             # Metadata
             story.append(Paragraph(f"<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
-            story.append(Paragraph(f"<b>Total Findings:</b> {len(export_df)}", styles['Normal']))
+            story.append(Paragraph(f"<b>Total Records:</b> {len(export_df)}", styles['Normal']))
+            if start_date or end_date:
+                story.append(Paragraph(f"<b>Date Range:</b> {start_date or 'Beginning'} to {end_date or 'Now'}", styles['Normal']))
             story.append(Spacer(1, 12))
             
-            # Severity breakdown
-            severity_counts = export_df['severity'].value_counts()
-            story.append(Paragraph("<b>Severity Breakdown:</b>", styles['Heading2']))
-            for severity, count in severity_counts.items():
-                story.append(Paragraph(f"• {severity}: {count}", styles['Normal']))
-            story.append(Spacer(1, 12))
-            
-            # Tool breakdown
-            tool_counts = export_df['tool_source'].value_counts()
-            story.append(Paragraph("<b>Tool Source Breakdown:</b>", styles['Heading2']))
-            for tool, count in tool_counts.items():
-                story.append(Paragraph(f"• {tool}: {count}", styles['Normal']))
-            story.append(Spacer(1, 20))
-            
-            # Findings table (top 50 for space)
-            if len(export_df) > 0:
-                story.append(Paragraph("<b>Findings Summary (Top 50):</b>", styles['Heading2']))
+            # Type-specific content
+            if report_type == 'findings' and 'severity' in export_df.columns:
+                severity_counts = export_df['severity'].value_counts()
+                story.append(Paragraph("<b>Severity Breakdown:</b>", styles['Heading2']))
+                for severity, count in severity_counts.items():
+                    story.append(Paragraph(f"• {severity}: {count}", styles['Normal']))
+                story.append(Spacer(1, 12))
                 
-                # Prepare table data
-                table_data = [['File Path', 'Secret Type', 'Severity', 'Tool', 'Confidence']]
-                for _, row in export_df.head(50).iterrows():
-                    table_data.append([
-                        str(row.get('file_path', ''))[:40] + '...' if len(str(row.get('file_path', ''))) > 40 else str(row.get('file_path', '')),
-                        str(row.get('secret_type', ''))[:20],
-                        str(row.get('severity', '')),
-                        str(row.get('tool_source', '')),
-                        f"{float(row.get('confidence_score', 0)):.2%}" if row.get('confidence_score') else 'N/A'
-                    ])
+                if 'tool_source' in export_df.columns:
+                    tool_counts = export_df['tool_source'].value_counts()
+                    story.append(Paragraph("<b>Tool Source Breakdown:</b>", styles['Heading2']))
+                    for tool, count in tool_counts.items():
+                        story.append(Paragraph(f"• {tool}: {count}", styles['Normal']))
+                    story.append(Spacer(1, 12))
                 
-                # Create table
-                table = Table(table_data, colWidths=[2.5*inch, 1.5*inch, 0.8*inch, 1*inch, 0.8*inch])
-                table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('FONTSIZE', (0, 1), (-1, -1), 8),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
-                story.append(table)
+                if 'finding_category' in export_df.columns:
+                    cat_counts = export_df['finding_category'].value_counts().head(10)
+                    story.append(Paragraph("<b>Top Categories:</b>", styles['Heading2']))
+                    for cat, count in cat_counts.items():
+                        story.append(Paragraph(f"• {cat}: {count}", styles['Normal']))
+                    story.append(Spacer(1, 20))
+                
+                # Findings table (top 50)
+                if len(export_df) > 0:
+                    story.append(Paragraph("<b>Findings (Top 50):</b>", styles['Heading2']))
+                    table_data = [['File Path', 'Secret Type', 'Severity', 'Category', 'Status']]
+                    for _, row in export_df.head(50).iterrows():
+                        table_data.append([
+                            str(row.get('file_path', ''))[:35] + '...' if len(str(row.get('file_path', ''))) > 35 else str(row.get('file_path', '')),
+                            str(row.get('secret_type', ''))[:18],
+                            str(row.get('severity', '')),
+                            str(row.get('finding_category', ''))[:15],
+                            str(row.get('resolution_status', ''))[:12]
+                        ])
+                    table = Table(table_data, colWidths=[2.2*inch, 1.3*inch, 0.7*inch, 1.1*inch, 0.9*inch])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                        ('FONTSIZE', (0, 1), (-1, -1), 7),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    story.append(table)
+                    
+            elif report_type == 'emails':
+                if 'notification_status' in export_df.columns:
+                    status_counts = export_df['notification_status'].value_counts()
+                    story.append(Paragraph("<b>Email Status Summary:</b>", styles['Heading2']))
+                    for status, count in status_counts.items():
+                        story.append(Paragraph(f"• {status}: {count}", styles['Normal']))
+                    story.append(Spacer(1, 20))
+                
+                # Email log table
+                if len(export_df) > 0:
+                    story.append(Paragraph("<b>Email Log (Top 50):</b>", styles['Heading2']))
+                    table_data = [['Recipient', 'Subject', 'Status', 'Sent At']]
+                    for _, row in export_df.head(50).iterrows():
+                        table_data.append([
+                            str(row.get('recipient_email', ''))[:25],
+                            str(row.get('subject', ''))[:30] + '...' if len(str(row.get('subject', ''))) > 30 else str(row.get('subject', '')),
+                            str(row.get('notification_status', '')),
+                            str(row.get('sent_at', ''))[:19] if row.get('sent_at') else 'N/A'
+                        ])
+                    table = Table(table_data, colWidths=[1.8*inch, 2.5*inch, 0.8*inch, 1.4*inch])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#3b82f6')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#e0f2fe')),
+                        ('FONTSIZE', (0, 1), (-1, -1), 7),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    story.append(table)
+                    
+            elif report_type == 'jira':
+                if len(export_df) > 0:
+                    story.append(Paragraph("<b>Jira Tickets (Top 50):</b>", styles['Heading2']))
+                    table_data = [['Ticket Key', 'File', 'Severity', 'Owner', 'Created']]
+                    for _, row in export_df.head(50).iterrows():
+                        table_data.append([
+                            str(row.get('jira_ticket_key', ''))[:15],
+                            str(row.get('file_path', ''))[:30] + '...' if len(str(row.get('file_path', ''))) > 30 else str(row.get('file_path', '')),
+                            str(row.get('severity', '')),
+                            str(row.get('assigned_owner', ''))[:15] if row.get('assigned_owner') else 'N/A',
+                            str(row.get('jira_created_at', ''))[:10] if row.get('jira_created_at') else 'N/A'
+                        ])
+                    table = Table(table_data, colWidths=[1.1*inch, 2.4*inch, 0.7*inch, 1.2*inch, 1.0*inch])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#8b5cf6')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f3e8ff')),
+                        ('FONTSIZE', (0, 1), (-1, -1), 7),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    story.append(table)
+                    
+            elif report_type == 'categories':
+                if 'category' in export_df.columns:
+                    story.append(Paragraph("<b>Category Distribution:</b>", styles['Heading2']))
+                    cat_summary = export_df.groupby('category')['count'].sum().sort_values(ascending=False)
+                    for cat, count in cat_summary.head(15).items():
+                        story.append(Paragraph(f"• {cat}: {count} findings", styles['Normal']))
+                    story.append(Spacer(1, 20))
+                    
+            elif report_type == 'activity':
+                if 'action_type' in export_df.columns:
+                    action_counts = export_df['action_type'].value_counts()
+                    story.append(Paragraph("<b>Activity Summary:</b>", styles['Heading2']))
+                    for action, count in action_counts.items():
+                        story.append(Paragraph(f"• {action}: {count}", styles['Normal']))
+                    story.append(Spacer(1, 20))
+                
+                # Activity log table
+                if len(export_df) > 0:
+                    story.append(Paragraph("<b>Activity Log (Top 50):</b>", styles['Heading2']))
+                    table_data = [['Action', 'User', 'Old Value', 'New Value', 'Timestamp']]
+                    for _, row in export_df.head(50).iterrows():
+                        table_data.append([
+                            str(row.get('action_type', ''))[:15],
+                            str(row.get('user', ''))[:12] if row.get('user') else 'System',
+                            str(row.get('old_value', ''))[:15] + '...' if len(str(row.get('old_value', ''))) > 15 else str(row.get('old_value', '')),
+                            str(row.get('new_value', ''))[:15] + '...' if len(str(row.get('new_value', ''))) > 15 else str(row.get('new_value', '')),
+                            str(row.get('timestamp', ''))[:19] if row.get('timestamp') else 'N/A'
+                        ])
+                    table = Table(table_data, colWidths=[1.1*inch, 0.9*inch, 1.3*inch, 1.3*inch, 1.5*inch])
+                    table.setStyle(TableStyle([
+                        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#22c55e')),
+                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0, 0), (-1, 0), 9),
+                        ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+                        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#dcfce7')),
+                        ('FONTSIZE', (0, 1), (-1, -1), 7),
+                        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                    ]))
+                    story.append(table)
             
             # Build PDF
             doc.build(story)
@@ -1630,14 +1962,81 @@ def export_report(csv_clicks, json_clicks, pdf_clicks, report_severities, start_
             
             return dcc.send_bytes(
                 buffer.getvalue(), 
-                f"secretsnipe_report_{timestamp}.pdf"
+                f"secretsnipe_{filename_prefix}_{timestamp}.pdf"
             )
 
     except Exception as e:
-        logger.error(f"Error exporting report: {e}")
+        logger.error(f"Error exporting {report_type} report: {e}")
         return no_update
 
     return no_update
+
+
+# Callback to update report category filter options
+@app.callback(
+    Output("report-category-filter", "options"),
+    [Input("report-type-selector", "value")],
+    prevent_initial_call=False
+)
+def update_report_category_options(report_type):
+    """Update category filter options for export reports"""
+    if report_type != 'findings':
+        return [{"label": "N/A", "value": "all"}]
+    
+    try:
+        options = [{"label": "All Categories", "value": "all"}]
+        categories = findings_manager.get_finding_categories() if findings_manager else []
+        for cat in categories:
+            options.append({
+                "label": f"{cat.get('icon', '📁')} {cat.get('display_name', cat.get('category_key', 'Unknown'))}",
+                "value": cat.get('category_key', '')
+            })
+        return options
+    except Exception as e:
+        logger.error(f"Error loading report categories: {e}")
+        return [{"label": "All Categories", "value": "all"}]
+
+
+# Callback to show/hide findings-specific filters
+@app.callback(
+    Output("findings-filters-container", "style"),
+    [Input("report-type-selector", "value")],
+    prevent_initial_call=False
+)
+def toggle_findings_filters(report_type):
+    """Show findings filters only for findings report type"""
+    if report_type == 'findings':
+        return {'display': 'block'}
+    return {'display': 'none'}
+
+
+# Callback to update export preview
+@app.callback(
+    Output("export-preview", "children"),
+    [Input("report-type-selector", "value"),
+     Input("report-date-range", "start_date"),
+     Input("report-date-range", "end_date")],
+    prevent_initial_call=False
+)
+def update_export_preview(report_type, start_date, end_date):
+    """Show a preview of what will be exported"""
+    report_descriptions = {
+        'findings': '🔍 Export all security findings with file paths, severities, categories, and status.',
+        'emails': '📧 Export email notification history showing who was notified and when.',
+        'jira': '🎫 Export Jira tickets created for findings with ticket keys and URLs.',
+        'categories': '📁 Export category summary with counts and distribution by severity.',
+        'activity': '📜 Export activity log showing all changes, user actions, and timestamps.'
+    }
+    
+    description = report_descriptions.get(report_type, 'Select a report type to see preview.')
+    date_info = ""
+    if start_date or end_date:
+        date_info = f" | Date range: {start_date or 'Start'} to {end_date or 'Now'}"
+    
+    return html.Div([
+        html.Span(description, style={'color': '#e0e0e0'}),
+        html.Span(date_info, style={'color': '#6b7280', 'fontSize': '12px'})
+    ])
 
 
 # False Positive Management Callbacks
@@ -1881,7 +2280,8 @@ def create_jira_tickets_for_files(n_clicks, selected_rows, table_data):
 # File-based Categorization Callback - Opens Category Modal with file findings
 @app.callback(
     [Output("category-modal", "style", allow_duplicate=True),
-     Output("selected-findings-for-category", "data", allow_duplicate=True)],
+     Output("selected-findings-for-category", "data", allow_duplicate=True),
+     Output("category-selector", "options", allow_duplicate=True)],
     [Input("btn-categorize-files", "n_clicks")],
     [State("file-grouped-table", "selected_rows"),
      State("file-grouped-table", "data")],
@@ -1889,8 +2289,11 @@ def create_jira_tickets_for_files(n_clicks, selected_rows, table_data):
 )
 def open_category_modal_for_files(n_clicks, selected_rows, table_data):
     """Open category modal with findings from selected files"""
+    # Get category options - needed for both success and failure paths
+    category_options = get_category_options()
+    
     if not n_clicks or not selected_rows or not table_data:
-        return {'display': 'none'}, []
+        return {'display': 'none'}, [], category_options
     
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
@@ -1907,7 +2310,7 @@ def open_category_modal_for_files(n_clicks, selected_rows, table_data):
                     selected_files.append(file_path)
         
         if not selected_files:
-            return {'display': 'none'}, []
+            return {'display': 'none'}, [], category_options
         
         # Get all finding IDs for these files
         all_finding_ids = []
@@ -1920,11 +2323,11 @@ def open_category_modal_for_files(n_clicks, selected_rows, table_data):
             results = db_manager.execute_query(query, (file_path,))
             all_finding_ids.extend([row['id'] for row in results])
         
-        return visible_style, all_finding_ids
+        return visible_style, all_finding_ids, category_options
     
     except Exception as e:
         logger.error(f"Error opening category modal for files: {e}")
-        return {'display': 'none'}, []
+        return {'display': 'none'}, [], category_options
 
 
 # File-based Email Owner Callback - Opens Email Modal with file findings
@@ -2827,16 +3230,35 @@ def update_category_preview(options):
     if not options or len(options) == 0:
         return "No categories available. Click 'Manage Categories' to create one."
     
-    # Filter out the "Select a category" placeholder if present
-    category_names = [opt.get('label', '') for opt in options if opt.get('value')]
+    # Filter out "all" and placeholder entries, get actual category names
+    category_names = [
+        opt.get('label', '').split(' ', 1)[-1] if ' ' in opt.get('label', '') else opt.get('label', '')
+        for opt in options 
+        if opt.get('value') and opt.get('value') != 'all' and opt.get('value') != 'uncategorized'
+    ]
     
     if not category_names:
-        return "No categories available. Click 'Manage Categories' to create one."
+        return html.Div([
+            html.Span("No custom categories yet. ", style={'color': '#9ca3af'}),
+            html.Span("Click 'Manage Categories' to create one.", style={'color': '#60a5fa', 'cursor': 'pointer'})
+        ])
+    
+    # Create clickable category badges
+    category_badges = []
+    for i, name in enumerate(category_names[:8]):
+        category_badges.append(
+            html.Span(name, style={
+                'backgroundColor': '#374151', 'padding': '2px 8px', 'borderRadius': '12px',
+                'marginRight': '5px', 'marginBottom': '5px', 'display': 'inline-block',
+                'fontSize': '11px', 'color': '#e0e0e0'
+            })
+        )
     
     return html.Div([
-        html.Span("Available categories: ", style={'fontWeight': 'bold'}),
-        html.Span(", ".join(category_names[:10])),  # Show first 10
-        html.Span(f" (+{len(category_names) - 10} more)" if len(category_names) > 10 else "")
+        html.Div("Available categories:", style={'fontWeight': 'bold', 'marginBottom': '8px', 'color': '#9ca3af'}),
+        html.Div(category_badges, style={'lineHeight': '2'}),
+        html.Span(f"(+{len(category_names) - 8} more)" if len(category_names) > 8 else "", 
+                  style={'fontSize': '11px', 'color': '#6b7280'})
     ])
 
 
@@ -5979,41 +6401,93 @@ SecretSnipe Security Team''',
 
             # Custom Report Export Section
             html.Div([
-                html.H3("📄 Custom Report Export", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
+                html.H3("📄 Advanced Report Export", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
+                
+                # Report Type Selection
+                html.Div([
+                    html.Label("📊 Report Type:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                    dcc.RadioItems(
+                        id="report-type-selector",
+                        options=[
+                            {"label": " 🔍 Findings Report", "value": "findings"},
+                            {"label": " 📧 Email Notifications Log", "value": "emails"},
+                            {"label": " 🎫 Jira Tickets Report", "value": "jira"},
+                            {"label": " 📁 Category Summary", "value": "categories"},
+                            {"label": " 📜 Activity Log", "value": "activity"},
+                        ],
+                        value="findings",
+                        inline=True,
+                        style={'display': 'flex', 'gap': '20px', 'flexWrap': 'wrap'},
+                        labelStyle={'cursor': 'pointer', 'color': '#e0e0e0', 'padding': '5px 10px', 
+                                   'backgroundColor': '#374151', 'borderRadius': '4px'}
+                    )
+                ], style={'marginBottom': '20px', 'padding': '15px', 'backgroundColor': '#1f2937', 'borderRadius': '8px'}),
+                
+                # Findings Filters (shown for findings report)
                 html.Div([
                     html.Div([
-                        html.Label("Select Severity:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
-                        dcc.Dropdown(
-                            id="report-severity-filter",
-                            options=[
-                                {"label": "All Severities", "value": "all"},
-                                {"label": "Critical", "value": "Critical"},
-                                {"label": "High", "value": "High"},
-                                {"label": "Medium", "value": "Medium"},
-                                {"label": "Low", "value": "Low"}
-                            ],
-                            value=["all"],
-                            multi=True,
-                            style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
-                            className="dark-dropdown"
-                        ),
-                    ], className="filter-item", style={'flex': '1', 'minWidth': '200px'}),
-                    html.Div([
-                        html.Label("Select Tool:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
-                        dcc.Dropdown(
-                            id="report-tool-filter",
-                            options=[
-                                {"label": "All Tools", "value": "all"},
-                                {"label": "Custom Scanner", "value": "custom"},
-                                {"label": "TruffleHog", "value": "trufflehog"},
-                                {"label": "Gitleaks", "value": "gitleaks"}
-                            ],
-                            value="all",
-                            style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
-                            className="dark-dropdown"
-                        ),
-                    ], className="filter-item", style={'flex': '1', 'minWidth': '200px'}),
-                ], style={'display': 'flex', 'gap': '20px', 'marginBottom': '15px', 'flexWrap': 'wrap'}),
+                        html.Div([
+                            html.Label("Severity:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                            dcc.Dropdown(
+                                id="report-severity-filter",
+                                options=[
+                                    {"label": "All Severities", "value": "all"},
+                                    {"label": "Critical", "value": "Critical"},
+                                    {"label": "High", "value": "High"},
+                                    {"label": "Medium", "value": "Medium"},
+                                    {"label": "Low", "value": "Low"}
+                                ],
+                                value=["all"],
+                                multi=True,
+                                style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                                className="dark-dropdown"
+                            ),
+                        ], className="filter-item", style={'flex': '1', 'minWidth': '150px'}),
+                        html.Div([
+                            html.Label("Tool:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                            dcc.Dropdown(
+                                id="report-tool-filter",
+                                options=[
+                                    {"label": "All Tools", "value": "all"},
+                                    {"label": "Custom Scanner", "value": "custom"},
+                                    {"label": "TruffleHog", "value": "trufflehog"},
+                                    {"label": "Gitleaks", "value": "gitleaks"}
+                                ],
+                                value="all",
+                                style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                                className="dark-dropdown"
+                            ),
+                        ], className="filter-item", style={'flex': '1', 'minWidth': '150px'}),
+                        html.Div([
+                            html.Label("Status:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                            dcc.Dropdown(
+                                id="report-status-filter",
+                                options=[
+                                    {"label": "All Statuses", "value": "all"},
+                                    {"label": "Open", "value": "open"},
+                                    {"label": "Resolved", "value": "resolved"},
+                                    {"label": "False Positive", "value": "false_positive"},
+                                    {"label": "Accepted Risk", "value": "accepted_risk"}
+                                ],
+                                value="all",
+                                style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                                className="dark-dropdown"
+                            ),
+                        ], className="filter-item", style={'flex': '1', 'minWidth': '150px'}),
+                        html.Div([
+                            html.Label("Category:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
+                            dcc.Dropdown(
+                                id="report-category-filter",
+                                options=[{"label": "All Categories", "value": "all"}],  # Populated dynamically
+                                value="all",
+                                style={'backgroundColor': '#3d3d3d', 'color': '#e0e0e0'},
+                                className="dark-dropdown"
+                            ),
+                        ], className="filter-item", style={'flex': '1', 'minWidth': '150px'}),
+                    ], style={'display': 'flex', 'gap': '15px', 'marginBottom': '15px', 'flexWrap': 'wrap'}),
+                ], id="findings-filters-container"),
+                
+                # Date Range (common to all report types)
                 html.Div([
                     html.Label("Date Range:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px', 'display': 'block'}),
                     html.Div([
@@ -6043,11 +6517,28 @@ SecretSnipe Security Team''',
                                            'padding': '6px 12px', 'borderRadius': '4px', 'margin': '0 5px', 'cursor': 'pointer'}),
                     ], style={'display': 'inline-block', 'marginLeft': '15px'}),
                 ], className="filter-item", style={'marginBottom': '20px'}),
+                
+                # Export Buttons
                 html.Div([
-                    html.Button("Export CSV", id="export-csv-btn", className="export-btn"),
-                    html.Button("Export JSON", id="export-json-btn", className="export-btn"),
-                    html.Button("Export PDF", id="export-pdf-btn", className="export-btn"),
+                    html.Button("📊 Export CSV", id="export-csv-btn", className="export-btn", 
+                                style={'backgroundColor': '#22c55e', 'color': 'white', 'border': 'none',
+                                       'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer', 
+                                       'fontWeight': 'bold', 'marginRight': '10px'}),
+                    html.Button("📋 Export JSON", id="export-json-btn", className="export-btn",
+                                style={'backgroundColor': '#3b82f6', 'color': 'white', 'border': 'none',
+                                       'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer', 
+                                       'fontWeight': 'bold', 'marginRight': '10px'}),
+                    html.Button("📄 Export PDF", id="export-pdf-btn", className="export-btn",
+                                style={'backgroundColor': '#8b5cf6', 'color': 'white', 'border': 'none',
+                                       'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer', 
+                                       'fontWeight': 'bold'}),
                 ], style={'marginTop': '15px'}),
+                
+                # Export status/preview
+                html.Div(id="export-preview", style={'marginTop': '15px', 'padding': '10px', 
+                                                     'backgroundColor': '#1f2937', 'borderRadius': '6px',
+                                                     'color': '#9ca3af', 'fontSize': '13px'}),
+                
                 dcc.Download(id="report-download")
             ], className="report-section"),
 

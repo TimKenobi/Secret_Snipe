@@ -4812,274 +4812,8 @@ def create_layout():
                     'borderRadius': '6px', 'display': 'none'
                 }),
                 
-                # FP Reason Input Modal
+                # Stores for FP selections (moved outside modal)
                 dcc.Store(id='selected-rows-for-fp', data=[]),
-                html.Div([
-                    html.Div([
-                        html.H4("Mark as False Positive", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
-                        html.Label("Reason (optional):", style={'color': '#b0b0b0', 'marginBottom': '8px', 'display': 'block'}),
-                        dcc.Textarea(
-                            id='fp-reason-input',
-                            placeholder='e.g., Test data, Sample key, Not a real secret...',
-                            style={
-                                'width': '100%', 'height': '80px',
-                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
-                                'border': '1px solid #555', 'borderRadius': '4px',
-                                'padding': '10px', 'marginBottom': '15px'
-                            }
-                        ),
-                        html.Div([
-                            html.Button(
-                                "Confirm Mark as FP", 
-                                id='btn-confirm-fp',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#dc2626', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer',
-                                    'marginRight': '10px', 'fontWeight': 'bold'
-                                }
-                            ),
-                            html.Button(
-                                "Cancel", 
-                                id='btn-cancel-fp',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#6b7280', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer'
-                                }
-                            ),
-                        ], style={'textAlign': 'right'})
-                    ], style={
-                        'backgroundColor': '#2d3748', 'padding': '20px',
-                        'borderRadius': '8px', 'maxWidth': '500px',
-                        'margin': '0 auto', 'border': '1px solid #555'
-                    })
-                ], id='fp-reason-modal', style={
-                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '10000', 'paddingTop': '100px'
-                }),
-                
-                # Project Management Modal
-                html.Div([
-                    html.Div([
-                        html.Div([
-                            html.H2("📂 Project & Directory Management", style={'margin': '0', 'color': '#60a5fa'}),
-                            html.Button("✕", id='close-project-modal-btn', n_clicks=0, style={
-                                'background': 'none', 'border': 'none', 'color': '#aaa',
-                                'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
-                            })
-                        ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
-                        
-                        html.P("Manage multiple scan directories and trigger custom scans.", 
-                               style={'color': '#9ca3af', 'marginBottom': '20px'}),
-                        
-                        # Directory List Section
-                        html.Div([
-                            html.H4("📁 Scan Directories", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
-                            html.Div(id='project-directory-list', style={
-                                'maxHeight': '200px', 'overflowY': 'auto', 'marginBottom': '15px',
-                                'border': '1px solid #444', 'borderRadius': '6px', 'padding': '10px'
-                            }),
-                        ]),
-                        
-                        # Add New Directory Section
-                        html.Div([
-                            html.H4("➕ Add New Directory", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
-                            html.Div([
-                                html.Label("Directory Path:", style={'color': '#e0e0e0'}),
-                                dcc.Input(
-                                    id='new-dir-path',
-                                    type='text',
-                                    placeholder='/path/to/scan (e.g., /scan/newproject)',
-                                    style={
-                                        'width': '100%', 'padding': '8px', 'marginBottom': '10px',
-                                        'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
-                                        'border': '1px solid #555', 'borderRadius': '4px'
-                                    }
-                                ),
-                            ]),
-                            html.Div([
-                                html.Label("Display Name:", style={'color': '#e0e0e0'}),
-                                dcc.Input(
-                                    id='new-dir-name',
-                                    type='text',
-                                    placeholder='My Project Name',
-                                    style={
-                                        'width': '100%', 'padding': '8px', 'marginBottom': '10px',
-                                        'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
-                                        'border': '1px solid #555', 'borderRadius': '4px'
-                                    }
-                                ),
-                            ]),
-                            html.Div([
-                                html.Div([
-                                    html.Label("Scan Schedule:", style={'color': '#e0e0e0'}),
-                                    dcc.Dropdown(
-                                        id='new-dir-schedule',
-                                        options=[
-                                            {'label': 'Manual Only', 'value': 'manual'},
-                                            {'label': 'Hourly', 'value': 'hourly'},
-                                            {'label': 'Daily', 'value': 'daily'},
-                                            {'label': 'Weekly', 'value': 'weekly'}
-                                        ],
-                                        value='daily',
-                                        clearable=False,
-                                        style={'width': '150px'},
-                                        className="dark-dropdown"
-                                    ),
-                                ], style={'display': 'inline-block', 'marginRight': '20px'}),
-                                html.Div([
-                                    html.Label("Priority:", style={'color': '#e0e0e0'}),
-                                    dcc.Dropdown(
-                                        id='new-dir-priority',
-                                        options=[
-                                            {'label': '1 (Highest)', 'value': 1},
-                                            {'label': '2', 'value': 2},
-                                            {'label': '3', 'value': 3},
-                                            {'label': '4', 'value': 4},
-                                            {'label': '5 (Normal)', 'value': 5},
-                                            {'label': '6', 'value': 6},
-                                            {'label': '7', 'value': 7},
-                                            {'label': '8', 'value': 8},
-                                            {'label': '9', 'value': 9},
-                                            {'label': '10 (Lowest)', 'value': 10}
-                                        ],
-                                        value=5,
-                                        clearable=False,
-                                        style={'width': '130px'},
-                                        className="dark-dropdown"
-                                    ),
-                                ], style={'display': 'inline-block'}),
-                            ], style={'marginBottom': '15px'}),
-                            html.Button(
-                                "➕ Add Directory",
-                                id='btn-add-directory',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#22c55e', 'color': 'white',
-                                    'border': 'none', 'padding': '8px 16px',
-                                    'borderRadius': '6px', 'cursor': 'pointer',
-                                    'fontWeight': 'bold'
-                                }
-                            ),
-                            html.Div(id='add-dir-result', style={'marginTop': '10px'})
-                        ], style={
-                            'backgroundColor': '#1f2937', 'padding': '15px',
-                            'borderRadius': '8px', 'marginBottom': '20px'
-                        }),
-                        
-                        # Scan Controls Section
-                        html.Div([
-                            html.H4("🔍 Trigger Manual Scan", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
-                            html.Div([
-                                dcc.Dropdown(
-                                    id='scan-dir-selector',
-                                    options=[],
-                                    placeholder='Select directory to scan...',
-                                    style={'width': '250px', 'display': 'inline-block', 'marginRight': '10px'},
-                                    className="dark-dropdown"
-                                ),
-                                dcc.Dropdown(
-                                    id='scan-type-selector',
-                                    options=[
-                                        {'label': '🔄 Full Scan (All Tools)', 'value': 'full'},
-                                        {'label': '📝 Incremental', 'value': 'incremental'},
-                                        {'label': '🔍 Custom Scanner Only', 'value': 'custom_only'},
-                                        {'label': '🐷 TruffleHog Only', 'value': 'trufflehog_only'},
-                                        {'label': '🔐 Gitleaks Only', 'value': 'gitleaks_only'}
-                                    ],
-                                    value='full',
-                                    clearable=False,
-                                    style={'width': '180px', 'display': 'inline-block', 'marginRight': '10px'},
-                                    className="dark-dropdown"
-                                ),
-                                html.Button(
-                                    "▶️ Start Scan",
-                                    id='btn-trigger-scan',
-                                    n_clicks=0,
-                                    style={
-                                        'backgroundColor': '#3b82f6', 'color': 'white',
-                                        'border': 'none', 'padding': '8px 16px',
-                                        'borderRadius': '6px', 'cursor': 'pointer',
-                                        'fontWeight': 'bold'
-                                    }
-                                ),
-                            ], style={'marginBottom': '10px'}),
-                            html.Div(id='trigger-scan-result', style={'marginTop': '10px'})
-                        ], style={
-                            'backgroundColor': '#1f2937', 'padding': '15px',
-                            'borderRadius': '8px', 'marginBottom': '20px'
-                        }),
-                        
-                        # Pending Scans Section
-                        html.Div([
-                            html.H4("⏳ Pending/Running Scans", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
-                            html.Div(id='pending-scans-list', style={
-                                'maxHeight': '150px', 'overflowY': 'auto'
-                            })
-                        ], style={
-                            'backgroundColor': '#1f2937', 'padding': '15px',
-                            'borderRadius': '8px'
-                        }),
-                        
-                    ], style={
-                        'backgroundColor': '#2d3748', 'padding': '25px',
-                        'borderRadius': '8px', 'maxWidth': '700px',
-                        'margin': '0 auto', 'border': '1px solid #555',
-                        'maxHeight': '85vh', 'overflowY': 'auto'
-                    })
-                ], id='project-manager-modal', style={
-                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
-                    'zIndex': '10000', 'paddingTop': '30px'
-                }),
-                
-                # False Positives Viewer Modal
-                html.Div([
-                    html.Div([
-                        html.Div([
-                            html.H2("🚫 False Positives", style={'margin': '0', 'color': '#f59e0b'}),
-                            html.Button("✕", id='close-fp-viewer-btn', n_clicks=0, style={
-                                'background': 'none', 'border': 'none', 'color': '#aaa',
-                                'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
-                            })
-                        ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
-                        
-                        html.P("Items marked as false positives with their reasons:", style={'color': '#9ca3af', 'marginBottom': '15px'}),
-                        
-                        # FP Table
-                        html.Div(id='fp-viewer-table-container', style={
-                            'maxHeight': '500px', 'overflowY': 'auto'
-                        }),
-                        
-                        # Action buttons
-                        html.Div([
-                            html.Button(
-                                "✅ Restore Selected to Active",
-                                id='btn-restore-from-viewer',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#16a34a', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer',
-                                    'fontWeight': 'bold', 'marginRight': '10px'
-                                }
-                            ),
-                            html.Span(id='fp-viewer-action-result', style={'color': '#e0e0e0'})
-                        ], style={'marginTop': '15px', 'textAlign': 'left'})
-                    ], style={
-                        'backgroundColor': '#2d3748', 'padding': '25px',
-                        'borderRadius': '8px', 'maxWidth': '1200px', 'width': '90%',
-                        'margin': '0 auto', 'border': '1px solid #555'
-                    })
-                ], id='fp-viewer-modal', style={
-                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
-                }),
                 
                 # Jira Action Result Message
                 html.Div(id='jira-action-result', style={
@@ -5414,6 +5148,274 @@ def create_layout():
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
                 'zIndex': '10000', 'paddingTop': '50px'
+            }),
+
+            # FP Reason Input Modal (shared between both views - must be outside containers)
+            html.Div([
+                html.Div([
+                    html.H4("Mark as False Positive", style={'color': '#e0e0e0', 'marginBottom': '15px'}),
+                    html.Label("Reason (optional):", style={'color': '#b0b0b0', 'marginBottom': '8px', 'display': 'block'}),
+                    dcc.Textarea(
+                        id='fp-reason-input',
+                        placeholder='e.g., Test data, Sample key, Not a real secret...',
+                        style={
+                            'width': '100%', 'height': '80px',
+                            'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                            'border': '1px solid #555', 'borderRadius': '4px',
+                            'padding': '10px', 'marginBottom': '15px'
+                        }
+                    ),
+                    html.Div([
+                        html.Button(
+                            "Confirm Mark as FP", 
+                            id='btn-confirm-fp',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#dc2626', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "Cancel", 
+                            id='btn-cancel-fp',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer'
+                            }
+                        ),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '20px',
+                    'borderRadius': '8px', 'maxWidth': '500px',
+                    'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='fp-reason-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '10000', 'paddingTop': '100px'
+            }),
+
+            # Project Management Modal (shared between both views - must be outside containers)
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("📂 Project & Directory Management", style={'margin': '0', 'color': '#60a5fa'}),
+                        html.Button("✕", id='close-project-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Manage multiple scan directories and trigger custom scans.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    # Directory List Section
+                    html.Div([
+                        html.H4("📁 Scan Directories", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div(id='project-directory-list', style={
+                            'maxHeight': '200px', 'overflowY': 'auto', 'marginBottom': '15px',
+                            'border': '1px solid #444', 'borderRadius': '6px', 'padding': '10px'
+                        }),
+                    ]),
+                    
+                    # Add New Directory Section
+                    html.Div([
+                        html.H4("➕ Add New Directory", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.Label("Directory Path:", style={'color': '#e0e0e0'}),
+                            dcc.Input(
+                                id='new-dir-path',
+                                type='text',
+                                placeholder='/path/to/scan (e.g., /scan/newproject)',
+                                style={
+                                    'width': '100%', 'padding': '8px', 'marginBottom': '10px',
+                                    'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px'
+                                }
+                            ),
+                        ]),
+                        html.Div([
+                            html.Label("Display Name:", style={'color': '#e0e0e0'}),
+                            dcc.Input(
+                                id='new-dir-name',
+                                type='text',
+                                placeholder='My Project Name',
+                                style={
+                                    'width': '100%', 'padding': '8px', 'marginBottom': '10px',
+                                    'backgroundColor': '#3d3d3d', 'color': '#e0e0e0',
+                                    'border': '1px solid #555', 'borderRadius': '4px'
+                                }
+                            ),
+                        ]),
+                        html.Div([
+                            html.Div([
+                                html.Label("Scan Schedule:", style={'color': '#e0e0e0'}),
+                                dcc.Dropdown(
+                                    id='new-dir-schedule',
+                                    options=[
+                                        {'label': 'Manual Only', 'value': 'manual'},
+                                        {'label': 'Hourly', 'value': 'hourly'},
+                                        {'label': 'Daily', 'value': 'daily'},
+                                        {'label': 'Weekly', 'value': 'weekly'}
+                                    ],
+                                    value='daily',
+                                    clearable=False,
+                                    style={'width': '150px'},
+                                    className="dark-dropdown"
+                                ),
+                            ], style={'display': 'inline-block', 'marginRight': '20px'}),
+                            html.Div([
+                                html.Label("Priority:", style={'color': '#e0e0e0'}),
+                                dcc.Dropdown(
+                                    id='new-dir-priority',
+                                    options=[
+                                        {'label': '1 (Highest)', 'value': 1},
+                                        {'label': '2', 'value': 2},
+                                        {'label': '3', 'value': 3},
+                                        {'label': '4', 'value': 4},
+                                        {'label': '5 (Normal)', 'value': 5},
+                                        {'label': '6', 'value': 6},
+                                        {'label': '7', 'value': 7},
+                                        {'label': '8', 'value': 8},
+                                        {'label': '9', 'value': 9},
+                                        {'label': '10 (Lowest)', 'value': 10}
+                                    ],
+                                    value=5,
+                                    clearable=False,
+                                    style={'width': '130px'},
+                                    className="dark-dropdown"
+                                ),
+                            ], style={'display': 'inline-block'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Button(
+                            "➕ Add Directory",
+                            id='btn-add-directory',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#22c55e', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Div(id='add-dir-result', style={'marginTop': '10px'})
+                    ], style={
+                        'backgroundColor': '#1f2937', 'padding': '15px',
+                        'borderRadius': '8px', 'marginBottom': '20px'
+                    }),
+                    
+                    # Scan Controls Section
+                    html.Div([
+                        html.H4("🔍 Trigger Manual Scan", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div([
+                            dcc.Dropdown(
+                                id='scan-dir-selector',
+                                options=[],
+                                placeholder='Select directory to scan...',
+                                style={'width': '250px', 'display': 'inline-block', 'marginRight': '10px'},
+                                className="dark-dropdown"
+                            ),
+                            dcc.Dropdown(
+                                id='scan-type-selector',
+                                options=[
+                                    {'label': '🔄 Full Scan (All Tools)', 'value': 'full'},
+                                    {'label': '📝 Incremental', 'value': 'incremental'},
+                                    {'label': '🔍 Custom Scanner Only', 'value': 'custom_only'},
+                                    {'label': '🐷 TruffleHog Only', 'value': 'trufflehog_only'},
+                                    {'label': '🔐 Gitleaks Only', 'value': 'gitleaks_only'}
+                                ],
+                                value='full',
+                                clearable=False,
+                                style={'width': '180px', 'display': 'inline-block', 'marginRight': '10px'},
+                                className="dark-dropdown"
+                            ),
+                            html.Button(
+                                "▶️ Start Scan",
+                                id='btn-trigger-scan',
+                                n_clicks=0,
+                                style={
+                                    'backgroundColor': '#3b82f6', 'color': 'white',
+                                    'border': 'none', 'padding': '8px 16px',
+                                    'borderRadius': '6px', 'cursor': 'pointer',
+                                    'fontWeight': 'bold'
+                                }
+                            ),
+                        ], style={'marginBottom': '10px'}),
+                        html.Div(id='trigger-scan-result', style={'marginTop': '10px'})
+                    ], style={
+                        'backgroundColor': '#1f2937', 'padding': '15px',
+                        'borderRadius': '8px', 'marginBottom': '20px'
+                    }),
+                    
+                    # Pending Scans Section
+                    html.Div([
+                        html.H4("⏳ Pending/Running Scans", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div(id='pending-scans-list', style={
+                            'maxHeight': '150px', 'overflowY': 'auto'
+                        })
+                    ], style={
+                        'backgroundColor': '#1f2937', 'padding': '15px',
+                        'borderRadius': '8px'
+                    }),
+                    
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px',
+                    'borderRadius': '8px', 'maxWidth': '700px',
+                    'margin': '0 auto', 'border': '1px solid #555',
+                    'maxHeight': '85vh', 'overflowY': 'auto'
+                })
+            ], id='project-manager-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+                'zIndex': '10000', 'paddingTop': '30px'
+            }),
+
+            # False Positives Viewer Modal (shared between both views - must be outside containers)
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("🚫 False Positives", style={'margin': '0', 'color': '#f59e0b'}),
+                        html.Button("✕", id='close-fp-viewer-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Items marked as false positives with their reasons:", style={'color': '#9ca3af', 'marginBottom': '15px'}),
+                    
+                    # FP Table
+                    html.Div(id='fp-viewer-table-container', style={
+                        'maxHeight': '500px', 'overflowY': 'auto'
+                    }),
+                    
+                    # Action buttons
+                    html.Div([
+                        html.Button(
+                            "✅ Restore Selected to Active",
+                            id='btn-restore-from-viewer',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#16a34a', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold', 'marginRight': '10px'
+                            }
+                        ),
+                        html.Span(id='fp-viewer-action-result', style={'color': '#e0e0e0'})
+                    ], style={'marginTop': '15px', 'textAlign': 'left'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px',
+                    'borderRadius': '8px', 'maxWidth': '1200px', 'width': '90%',
+                    'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='fp-viewer-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '10000', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Finding Detail Modal (opens when clicking a table row)

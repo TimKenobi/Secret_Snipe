@@ -435,24 +435,195 @@ class EmailManager:
         self,
         finding_ids: List[str],
         owner_email: str,
-        owner_name: str,
-        dashboard_url: str = "http://localhost:8050"
+        owner_name: str = "File Owner",
+        dashboard_url: str = "http://localhost:8050",
+        escalation_days: int = 7
     ) -> Dict[str, Any]:
-        """Send notifications for multiple findings to same owner
+        """Send ONE consolidated notification for multiple findings to same owner
         
-        Returns summary of sent/failed notifications
+        Groups findings by file for better readability. Sends a single email
+        containing all findings rather than spamming with individual emails.
+        
+        Returns summary with success status and details
         """
-        results = {'sent': 0, 'failed': 0, 'errors': []}
+        from collections import defaultdict
         
-        for finding_id in finding_ids:
-            success, message = self.send_finding_notification(
-                finding_id, owner_email, owner_name, dashboard_url
+        results = {
+            'success': False,
+            'sent': 0,
+            'total_findings': len(finding_ids),
+            'files_included': 0,
+            'error': None
+        }
+        
+        if not finding_ids:
+            results['error'] = 'No findings to notify about'
+            return results
+        
+        try:
+            # Fetch all finding details
+            placeholders = ','.join(['%s'] * len(finding_ids))
+            query = f"""
+                SELECT f.*, p.name as project_name
+                FROM findings f
+                LEFT JOIN projects p ON f.project_id = p.id
+                WHERE f.id IN ({placeholders})
+                ORDER BY f.severity DESC, f.file_path
+            """
+            findings = self.db.execute_query(query, tuple(finding_ids))
+            
+            if not findings:
+                results['error'] = 'No findings found'
+                return results
+            
+            # Group findings by file for better organization
+            findings_by_file = defaultdict(list)
+            for f in findings:
+                findings_by_file[f.get('file_path', 'Unknown')].append(f)
+            
+            results['files_included'] = len(findings_by_file)
+            
+            # Calculate escalation date
+            escalation_date = datetime.now() + timedelta(days=escalation_days)
+            
+            # Build consolidated email content
+            severity_counts = defaultdict(int)
+            for f in findings:
+                severity_counts[f.get('severity', 'Medium')] += 1
+            
+            # Determine highest severity for subject line
+            severity_order = ['Critical', 'High', 'Medium', 'Low', 'Info']
+            highest_severity = 'Medium'
+            for sev in severity_order:
+                if severity_counts.get(sev, 0) > 0:
+                    highest_severity = sev
+                    break
+            
+            # Build subject
+            subject = f"[SecretSnipe] {highest_severity}: {len(findings)} Secret(s) Found in {len(findings_by_file)} File(s)"
+            
+            # Build HTML body
+            body_html = f"""
+            <html>
+            <body style="font-family: Arial, sans-serif; color: #333;">
+            <h2 style="color: #dc2626;">🔐 Secret Detection Alert</h2>
+            <p>Hello {owner_name or 'Team'},</p>
+            <p>SecretSnipe has detected <strong>{len(findings)} potential secret(s)</strong> in <strong>{len(findings_by_file)} file(s)</strong> that require your attention.</p>
+            
+            <h3>📊 Summary</h3>
+            <ul>
+            """
+            for sev in severity_order:
+                if severity_counts.get(sev, 0) > 0:
+                    color = {'Critical': '#7f1d1d', 'High': '#dc2626', 'Medium': '#f59e0b', 'Low': '#3b82f6', 'Info': '#6b7280'}.get(sev, '#333')
+                    body_html += f'<li><span style="color: {color}; font-weight: bold;">{sev}</span>: {severity_counts[sev]}</li>'
+            body_html += "</ul>"
+            
+            body_html += f"""
+            <h3>📁 Findings by File</h3>
+            <p style="color: #666; font-size: 0.9em;">Escalation date: {escalation_date.strftime('%Y-%m-%d')} ({escalation_days} days)</p>
+            """
+            
+            for file_path, file_findings in findings_by_file.items():
+                body_html += f"""
+                <div style="background: #f8f9fa; border-left: 4px solid #dc2626; padding: 10px; margin: 10px 0;">
+                    <strong>📄 {file_path}</strong> ({len(file_findings)} finding(s))
+                    <ul style="margin: 5px 0;">
+                """
+                for f in file_findings[:5]:  # Limit to first 5 per file
+                    sev_color = {'Critical': '#7f1d1d', 'High': '#dc2626', 'Medium': '#f59e0b', 'Low': '#3b82f6', 'Info': '#6b7280'}.get(f.get('severity', 'Medium'), '#333')
+                    body_html += f"""
+                    <li>
+                        <span style="color: {sev_color};">[{f.get('severity', 'Medium')}]</span>
+                        {f.get('secret_type', 'Unknown')} at line {f.get('line_number', 'N/A')}
+                    </li>
+                    """
+                if len(file_findings) > 5:
+                    body_html += f"<li><em>... and {len(file_findings) - 5} more findings</em></li>"
+                body_html += "</ul></div>"
+            
+            body_html += f"""
+            <h3>🔗 Take Action</h3>
+            <p>
+                <a href="{dashboard_url}" style="background: #3b82f6; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">
+                    View in Dashboard
+                </a>
+            </p>
+            <p style="color: #666; font-size: 0.9em; margin-top: 20px;">
+                Please review and resolve these findings before the escalation date.<br>
+                If these are false positives, mark them as such in the dashboard.
+            </p>
+            <hr style="border: none; border-top: 1px solid #ddd; margin: 20px 0;">
+            <p style="color: #999; font-size: 0.8em;">
+                This is an automated message from SecretSnipe Security Scanner.
+            </p>
+            </body>
+            </html>
+            """
+            
+            # Build plain text version
+            body_text = f"""
+Secret Detection Alert
+
+Hello {owner_name or 'Team'},
+
+SecretSnipe has detected {len(findings)} potential secret(s) in {len(findings_by_file)} file(s).
+
+Summary:
+"""
+            for sev in severity_order:
+                if severity_counts.get(sev, 0) > 0:
+                    body_text += f"- {sev}: {severity_counts[sev]}\n"
+            
+            body_text += "\nFindings by File:\n"
+            for file_path, file_findings in findings_by_file.items():
+                body_text += f"\n{file_path} ({len(file_findings)} findings):\n"
+                for f in file_findings[:5]:
+                    body_text += f"  - [{f.get('severity', 'Medium')}] {f.get('secret_type', 'Unknown')} at line {f.get('line_number', 'N/A')}\n"
+                if len(file_findings) > 5:
+                    body_text += f"  ... and {len(file_findings) - 5} more\n"
+            
+            body_text += f"""
+View in Dashboard: {dashboard_url}
+
+Please review and resolve these findings before {escalation_date.strftime('%Y-%m-%d')}.
+
+This is an automated message from SecretSnipe Security Scanner.
+"""
+            
+            # Send the consolidated email
+            success, message = self.send_email(
+                owner_email, owner_name, subject, body_text, body_html,
+                None, 'bulk_notification'
             )
+            
             if success:
-                results['sent'] += 1
+                results['success'] = True
+                results['sent'] = 1
+                
+                # Update all findings with notification info
+                for finding_id in finding_ids:
+                    try:
+                        update_query = """
+                            UPDATE findings
+                            SET owner_email = %s,
+                                assigned_owner = %s,
+                                notification_sent_at = NOW(),
+                                escalation_date = %s,
+                                escalation_status = 'pending'
+                            WHERE id = %s
+                        """
+                        self.db.execute_update(update_query, (
+                            owner_email, owner_name, escalation_date, finding_id
+                        ))
+                    except Exception as e:
+                        logger.warning(f"Could not update finding {finding_id} notification status: {e}")
             else:
-                results['failed'] += 1
-                results['errors'].append({'finding_id': finding_id, 'error': message})
+                results['error'] = message
+                
+        except Exception as e:
+            logger.error(f"Failed to send bulk notification: {e}")
+            results['error'] = str(e)
         
         return results
     

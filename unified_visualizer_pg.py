@@ -597,6 +597,9 @@ def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.Data
                 f.id, f.file_path, f.secret_type, f.secret_value, f.context, f.severity, f.tool_source,
                 f.first_seen, f.last_seen, f.confidence_score, f.resolution_status,
                 f.fp_reason, f.fp_marked_by, f.fp_marked_at,
+                f.line_number, f.finding_category, f.proof_content,
+                f.file_last_accessed, f.file_modified_at,
+                f.assigned_owner as owner_name, f.owner_email,
                 p.name as project_name, ss.scan_type
             FROM findings f
             JOIN projects p ON f.project_id = p.id
@@ -807,6 +810,33 @@ def get_distinct_secret_types() -> list:
         return []
 
 
+def get_category_options():
+    """Load categories from database for dropdown - defined early for update_dashboard"""
+    try:
+        categories = findings_manager.get_finding_categories()
+        options = [{'label': '📁 All Categories', 'value': 'all'}]
+        for cat in categories:
+            icon = cat.get('icon', '📌') or '📌'
+            name = cat.get('display_name', cat['category_key'])
+            options.append({
+                'label': f"{icon} {name}",
+                'value': cat['category_key']
+            })
+        return options if len(options) > 1 else [{'label': '📁 All Categories', 'value': 'all'}, {'label': '❓ Uncategorized', 'value': 'uncategorized'}]
+    except Exception as e:
+        logger.warning(f"Could not load categories: {e}")
+        # Return default categories as fallback
+        return [
+            {'label': '📁 All Categories', 'value': 'all'},
+            {'label': '🔑 Real Password', 'value': 'real_password'},
+            {'label': '🔐 Real API Key', 'value': 'real_api_key'},
+            {'label': '💰 Financial Data', 'value': 'finance_data'},
+            {'label': '📝 Placeholder/Example', 'value': 'placeholder'},
+            {'label': '🧪 Test Data', 'value': 'test_data'},
+            {'label': '❓ Uncategorized', 'value': 'uncategorized'},
+        ]
+
+
 # Layout definition moved to the complete create_layout function below
 
 # Callbacks
@@ -820,17 +850,21 @@ def get_distinct_secret_types() -> list:
      Output("last-update", "children"),
      Output("project-filter", "options"),
      Output("fp-count-badge", "children"),
-     Output("secret-type-filter", "options")],
+     Output("secret-type-filter", "options"),
+     Output("category-filter", "options")],
     [Input("severity-filter", "value"),
      Input("tool-filter", "value"),
      Input("project-filter", "value"),
      Input("secret-type-filter", "value"),
+     Input("category-filter", "value"),
+     Input("status-filter", "value"),
      Input("chart-tool-tabs", "value"),
      Input("refresh-btn", "n_clicks"),
      Input("interval-component", "n_intervals")]
 )
 @secure_callback
-def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_filter, chart_tool_filter, refresh_clicks, n_intervals):
+def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_filter, 
+                     category_filter, status_filter, chart_tool_filter, refresh_clicks, n_intervals):
     """Update all dashboard components with permanent dark mode and security validation"""
     
     # Check what triggered the callback
@@ -849,16 +883,21 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
     tool_filter = sanitize_input(tool_filter or "all", 100)
     project_filter = sanitize_input(project_filter or "all", 100)
     secret_type_filter = sanitize_input(secret_type_filter or "all", 200)
+    category_filter = sanitize_input(category_filter or "all", 100)
+    status_filter = sanitize_input(status_filter or "open", 100)
     chart_tool_filter = sanitize_input(chart_tool_filter or "all", 100)
 
     # Validate filter values
     valid_severities = ['all', 'Critical', 'High', 'Medium', 'Low']
     valid_tools = ['all', 'custom', 'trufflehog', 'gitleaks']
+    valid_statuses = ['all', 'open', 'reviewed', 'false_positive', 'accepted_risk']
 
     if severity_filter not in valid_severities:
         severity_filter = 'all'
     if tool_filter not in valid_tools:
         tool_filter = 'all'
+    if status_filter not in valid_statuses:
+        status_filter = 'open'
 
     # Dark mode is now permanently enabled
     is_dark_mode = True
@@ -918,7 +957,7 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
             paper_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None,
             plot_bgcolor='rgba(0,0,0,0)' if is_dark_mode else None
         )
-        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge, [{"label": "All Secret Types", "value": "all"}]
+        return empty_fig, empty_fig, empty_fig, empty_fig, [], "No data", "Never", [], fp_badge, [{"label": "All Secret Types", "value": "all"}], [{"label": "All Categories", "value": "all"}]
 
     # Use pre-aggregated chart data (charts never need the full DataFrame)
     use_cached_charts = True  # Always use cached charts for performance
@@ -942,6 +981,27 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
 
         if secret_type_filter != "all":
             filtered_df = filtered_df[filtered_df['secret_type'] == secret_type_filter]
+
+        # Apply category filter (uses finding_category column)
+        if category_filter != "all":
+            if 'finding_category' in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df['finding_category'] == category_filter]
+
+        # Apply status filter
+        if 'resolution_status' in filtered_df.columns:
+            if status_filter == "all":
+                # Show all items (no status filtering)
+                pass
+            elif status_filter == "open":
+                # 'open' - show only open (unresolved) items including nulls
+                filtered_df = filtered_df[
+                    (filtered_df['resolution_status'] == 'open') | 
+                    (filtered_df['resolution_status'].isna()) |
+                    (filtered_df['resolution_status'] == '')
+                ]
+            else:
+                # Specific status filter (reviewed, false_positive, accepted_risk)
+                filtered_df = filtered_df[filtered_df['resolution_status'] == status_filter]
 
     tool_label = {'all': 'All Tools', 'custom': 'Custom Scanner', 'trufflehog': 'TruffleHog', 'gitleaks': 'Gitleaks'}
     chart_title_suffix = f" - {tool_label.get(chart_tool_filter, 'All Tools')}" if chart_tool_filter != 'all' else ''
@@ -1060,7 +1120,7 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
     # If just switching chart tabs, return charts only, skip expensive table/stats processing
     if chart_tab_switch:
         return (severity_chart, tool_chart, timeline_chart, file_types_chart,
-                no_update, no_update, no_update, no_update, no_update, no_update)
+                no_update, no_update, no_update, no_update, no_update, no_update, no_update)
 
     # Prepare table data from limited query (already filtered at SQL level)
     table_data = filtered_df.to_dict('records') if not filtered_df.empty else []
@@ -1161,8 +1221,11 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
     secret_type_options = [{"label": "All Secret Types", "value": "all"}]
     secret_type_options.extend([{"label": st, "value": st} for st in secret_types])
 
+    # Get category options from database
+    category_options = get_category_options()
+
     return (severity_chart, tool_chart, timeline_chart, file_types_chart,
-            table_data, summary_stats, last_update, project_options, fp_badge, secret_type_options)
+            table_data, summary_stats, last_update, project_options, fp_badge, secret_type_options, category_options)
 
 # New Callbacks for Enhanced Features
 
@@ -1219,13 +1282,15 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
         if row_idx is not None and row_idx < len(table_data):
             row = table_data[row_idx]
             
-            # Store finding data for proof viewer
+            # Store finding data for proof viewer (including cached proof_content if available)
             finding_store_data = {
                 'id': row.get('id'),
                 'file_path': row.get('file_path'),
                 'line_number': row.get('line_number', 1),
                 'match_text': row.get('secret_value', ''),
-                'context': row.get('context', '')
+                'context': row.get('context', ''),
+                'proof_content': row.get('proof_content', ''),  # Pre-cached proof content
+                'category': row.get('category', row.get('finding_category', ''))
             }
             
             # Build detailed view
@@ -1310,6 +1375,22 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                     html.Div([
                         html.Label("📂 Project:"),
                         html.Div(row.get('project_name', 'N/A'), className="detail-value")
+                    ], className="detail-field-small")
+                ], className="detail-metadata-row"),
+                
+                # File timestamps row (for detecting stale files)
+                html.Div([
+                    html.Div([
+                        html.Label("📝 File Modified:"),
+                        html.Div(str(row.get('file_modified_at', 'N/A')), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("👁️ File Last Accessed:"),
+                        html.Div(str(row.get('file_last_accessed', 'N/A')), className="detail-value")
+                    ], className="detail-field-small"),
+                    html.Div([
+                        html.Label("📍 Line #:"),
+                        html.Div(str(row.get('line_number', 'N/A')), className="detail-value")
                     ], className="detail-field-small")
                 ], className="detail-metadata-row"),
                 
@@ -1699,65 +1780,10 @@ def handle_fp_actions(confirm_clicks, restore_clicks, selected_ids_for_fp, fp_re
     return "", {'display': 'none'}, selected_rows
 
 
-# File-based False Positive Management Callbacks
-@app.callback(
-    Output("file-action-result", "children"),
-    [Input("btn-mark-file-fp", "n_clicks")],
-    [State("file-grouped-table", "selected_rows"),
-     State("file-grouped-table", "data")],
-    prevent_initial_call=True
-)
-def handle_file_fp_action(mark_clicks, selected_rows, table_data):
-    """Handle marking all findings in selected files as false positives"""
-    if not mark_clicks or not selected_rows or not table_data:
-        return ""
-    
-    try:
-        # Get file paths from selected rows
-        selected_files = []
-        for i in selected_rows:
-            if i < len(table_data):
-                file_path = table_data[i].get('file_path')
-                if file_path:
-                    selected_files.append(file_path)
-        
-        if not selected_files:
-            return html.Span("⚠️ No files selected", style={'color': '#f59e0b'})
-        
-        # Get all finding IDs for these files
-        total_marked = 0
-        for file_path in selected_files:
-            query = """
-                SELECT id FROM findings 
-                WHERE file_path = %s 
-                AND resolution_status != 'false_positive'
-            """
-            results = db_manager.execute_query(query, (file_path,))
-            finding_ids = [row['id'] for row in results]
-            
-            if finding_ids:
-                result = findings_manager.mark_as_false_positive(
-                    finding_ids=finding_ids,
-                    reason=f"Bulk marked via file view: {file_path}",
-                    marked_by="dashboard_user"
-                )
-                total_marked += result.get('success', 0)
-        
-        # Force cache refresh
-        data_cache['findings_df'] = None
-        data_cache['last_update'] = None
-        
-        if total_marked > 0:
-            return html.Span(
-                f"✅ Marked {total_marked} findings in {len(selected_files)} file(s) as false positive",
-                style={'color': '#22c55e', 'fontWeight': 'bold'}
-            )
-        else:
-            return html.Span("⚠️ No findings to mark", style={'color': '#f59e0b'})
-    
-    except Exception as e:
-        logger.error(f"Error marking files as FP: {e}")
-        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+# NOTE: File-based FP and Clean callbacks have been replaced by the unified 
+# Update Status modal which handles all status changes from both views.
+# The btn-file-update-status button now triggers the status modal with
+# all resolution options (reviewed, false_positive, accepted_risk, etc.)
 
 
 # File-based Jira Ticket Creation Callback
@@ -1846,54 +1872,9 @@ def create_jira_tickets_for_files(n_clicks, selected_rows, table_data):
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
 
 
-# File-based Mark as Clean Callback
-@app.callback(
-    Output("file-action-result", "children", allow_duplicate=True),
-    [Input("btn-mark-file-clean", "n_clicks")],
-    [State("file-grouped-table", "selected_rows"),
-     State("file-grouped-table", "data")],
-    prevent_initial_call=True
-)
-def mark_files_as_clean(n_clicks, selected_rows, table_data):
-    """Mark all findings in selected files as reviewed/clean"""
-    if not n_clicks or not selected_rows or not table_data:
-        return ""
-    
-    try:
-        selected_files = []
-        for i in selected_rows:
-            if i < len(table_data):
-                file_path = table_data[i].get('file_path')
-                if file_path:
-                    selected_files.append(file_path)
-        
-        if not selected_files:
-            return html.Span("⚠️ No files selected", style={'color': '#f59e0b'})
-        
-        total_cleaned = 0
-        for file_path in selected_files:
-            result = findings_manager.mark_file_as_clean(
-                file_path=file_path, 
-                marked_by="dashboard_user",
-                reason="File reviewed and marked as clean via dashboard"
-            )
-            total_cleaned += result.get('count', 0)
-        
-        # Force cache refresh
-        data_cache['findings_df'] = None
-        data_cache['last_update'] = None
-        
-        if total_cleaned > 0:
-            return html.Span(
-                f"✅ Marked {total_cleaned} findings in {len(selected_files)} file(s) as clean/reviewed",
-                style={'color': '#22c55e', 'fontWeight': 'bold'}
-            )
-        else:
-            return html.Span("⚠️ No findings to mark", style={'color': '#f59e0b'})
-    
-    except Exception as e:
-        logger.error(f"Error marking files as clean: {e}")
-        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+# NOTE: mark_files_as_clean callback removed - functionality now provided
+# through the unified Update Status modal (btn-file-update-status) which 
+# supports all resolution statuses including "reviewed" (clean).
 
 
 # File-based Categorization Callback - Opens Category Modal with file findings
@@ -2344,10 +2325,11 @@ def trigger_manual_scan(n_clicks, directory_id, scan_type):
      Output("jira-project-key", "value"),
      Output("jira-issue-type", "value")],
     [Input("btn-jira-settings", "n_clicks"),
+     Input("btn-jira-settings-file", "n_clicks"),
      Input("btn-close-jira-settings", "n_clicks"),
      Input("btn-save-jira", "n_clicks")]
 )
-def toggle_jira_settings_modal(open_clicks, close_clicks, save_clicks):
+def toggle_jira_settings_modal(open_clicks, file_open_clicks, close_clicks, save_clicks):
     """Toggle the Jira settings modal and populate with saved values"""
     ctx = dash.callback_context
     hidden_style = {'display': 'none'}
@@ -2365,7 +2347,7 @@ def toggle_jira_settings_modal(open_clicks, close_clicks, save_clicks):
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-    if trigger_id == "btn-jira-settings":
+    if trigger_id in ["btn-jira-settings", "btn-jira-settings-file"]:
         # Opening modal - populate with saved values from config
         return (
             visible_style,
@@ -2568,13 +2550,23 @@ def create_jira_tickets(n_clicks, selected_rows, table_data):
 # ==================== EMAIL SETTINGS CALLBACKS ====================
 
 @app.callback(
-    Output("email-settings-modal", "style"),
+    [Output("email-settings-modal", "style"),
+     Output("email-smtp-host", "value"),
+     Output("email-smtp-port", "value"),
+     Output("email-security", "value"),
+     Output("email-username", "value"),
+     Output("email-from-address", "value"),
+     Output("email-from-name", "value"),
+     Output("email-reply-to", "value"),
+     Output("email-subject-template", "value"),
+     Output("email-body-template", "value")],
     [Input("btn-email-settings", "n_clicks"),
+     Input("btn-email-settings-file", "n_clicks"),
      Input("close-email-settings-btn", "n_clicks"),
      Input("btn-save-email", "n_clicks")]
 )
-def toggle_email_settings_modal(open_clicks, close_clicks, save_clicks):
-    """Toggle the email settings modal"""
+def toggle_email_settings_modal(open_clicks, file_open_clicks, close_clicks, save_clicks):
+    """Toggle the email settings modal and load saved values"""
     ctx = dash.callback_context
     hidden_style = {'display': 'none'}
     visible_style = {
@@ -2583,15 +2575,71 @@ def toggle_email_settings_modal(open_clicks, close_clicks, save_clicks):
         'zIndex': '9999', 'paddingTop': '30px', 'overflowY': 'auto'
     }
     
+    # Default email template
+    default_subject = '[SecretSnipe] Security Finding Requires Your Attention - {severity}'
+    default_body = '''Hello {owner_name},
+
+A security finding has been detected in a file you own that requires your attention.
+
+**Finding Details:**
+- File: {file_path}
+- Secret Type: {secret_type}
+- Severity: {severity}
+- Total Findings in File: {finding_count}
+
+Please review this finding at your earliest convenience and take appropriate action to remediate the exposed secret.
+
+**Actions Required:**
+1. Review the finding in the SecretSnipe dashboard
+2. Rotate any exposed credentials immediately
+3. Update your code to use environment variables or a secrets manager
+4. Mark the finding as resolved once addressed
+
+Dashboard: {dashboard_url}
+
+Best regards,
+SecretSnipe Security Team'''
+    
+    # Default values
+    defaults = (hidden_style, '', 587, 'tls', '', '', 'SecretSnipe Security', '', default_subject, default_body)
+    
     if not ctx.triggered:
-        return hidden_style
+        return defaults
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
-    if trigger_id == "btn-email-settings":
-        return visible_style
+    if trigger_id in ["btn-email-settings", "btn-email-settings-file"]:
+        # Load existing settings from database
+        try:
+            query = """
+                SELECT smtp_host, smtp_port, smtp_username, smtp_use_tls, smtp_use_ssl,
+                       from_email, from_name, reply_to_email, subject_template, body_template
+                FROM email_config
+                WHERE config_name = 'default'
+                LIMIT 1
+            """
+            result = db_manager.execute_query(query)
+            if result:
+                cfg = result[0]
+                security = 'tls' if cfg.get('smtp_use_tls') else ('ssl' if cfg.get('smtp_use_ssl') else 'none')
+                return (
+                    visible_style,
+                    cfg.get('smtp_host', '') or '',
+                    cfg.get('smtp_port', 587) or 587,
+                    security,
+                    cfg.get('smtp_username', '') or '',
+                    cfg.get('from_email', '') or '',
+                    cfg.get('from_name', 'SecretSnipe Security') or 'SecretSnipe Security',
+                    cfg.get('reply_to_email', '') or '',
+                    cfg.get('subject_template', default_subject) or default_subject,
+                    cfg.get('body_template', default_body) or default_body
+                )
+        except Exception as e:
+            logger.warning(f"Could not load email config: {e}")
+        
+        return (visible_style, '', 587, 'tls', '', '', 'SecretSnipe Security', '', default_subject, default_body)
     
-    return hidden_style
+    return defaults
 
 
 @app.callback(
@@ -2631,9 +2679,11 @@ def test_email_connection(n_clicks, host, port, username, password):
      State("email-password", "value"),
      State("email-from-address", "value"),
      State("email-from-name", "value"),
-     State("email-escalation-days", "value")]
+     State("email-reply-to", "value"),
+     State("email-subject-template", "value"),
+     State("email-body-template", "value")]
 )
-def save_email_settings(n_clicks, host, port, security, username, password, from_addr, from_name, escalation_days):
+def save_email_settings(n_clicks, host, port, security, username, password, from_addr, from_name, reply_to, subject_template, body_template):
     """Save email settings to database"""
     if not n_clicks:
         return ""
@@ -2642,32 +2692,60 @@ def save_email_settings(n_clicks, host, port, security, username, password, from
         return html.Span("⚠️ Please fill in required fields (SMTP host, from address)", style={'color': '#f59e0b'})
     
     try:
-        # Save to database
-        query = """
-            INSERT INTO email_config (config_name, smtp_host, smtp_port, smtp_username, smtp_password, 
-                                       from_email, from_name, use_tls, use_ssl, escalation_days)
-            VALUES ('default', %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (config_name) DO UPDATE SET
-                smtp_host = EXCLUDED.smtp_host,
-                smtp_port = EXCLUDED.smtp_port,
-                smtp_username = EXCLUDED.smtp_username,
-                smtp_password = EXCLUDED.smtp_password,
-                from_email = EXCLUDED.from_email,
-                from_name = EXCLUDED.from_name,
-                use_tls = EXCLUDED.use_tls,
-                use_ssl = EXCLUDED.use_ssl,
-                escalation_days = EXCLUDED.escalation_days,
-                updated_at = NOW()
-        """
         use_tls = security == 'tls'
         use_ssl = security == 'ssl'
         
-        with findings_manager.connection_pool.getconn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(query, (host, port, username, password, from_addr, from_name, use_tls, use_ssl, escalation_days))
-            conn.commit()
-            findings_manager.connection_pool.putconn(conn)
+        # Check if password is provided (if not, don't update it)
+        if password:
+            query = """
+                INSERT INTO email_config (config_name, smtp_host, smtp_port, smtp_username, smtp_password, 
+                                           smtp_use_tls, smtp_use_ssl, from_email, from_name, reply_to_email,
+                                           subject_template, body_template, is_active)
+                VALUES ('default', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+                ON CONFLICT (config_name) DO UPDATE SET
+                    smtp_host = EXCLUDED.smtp_host,
+                    smtp_port = EXCLUDED.smtp_port,
+                    smtp_username = EXCLUDED.smtp_username,
+                    smtp_password = EXCLUDED.smtp_password,
+                    smtp_use_tls = EXCLUDED.smtp_use_tls,
+                    smtp_use_ssl = EXCLUDED.smtp_use_ssl,
+                    from_email = EXCLUDED.from_email,
+                    from_name = EXCLUDED.from_name,
+                    reply_to_email = EXCLUDED.reply_to_email,
+                    subject_template = EXCLUDED.subject_template,
+                    body_template = EXCLUDED.body_template,
+                    is_active = true,
+                    updated_at = NOW()
+            """
+            db_manager.execute_update(query, (host, port, username, password, use_tls, use_ssl, from_addr, from_name, reply_to, subject_template, body_template))
+        else:
+            # Update without changing password
+            query = """
+                INSERT INTO email_config (config_name, smtp_host, smtp_port, smtp_username, 
+                                           smtp_use_tls, smtp_use_ssl, from_email, from_name, reply_to_email,
+                                           subject_template, body_template, is_active)
+                VALUES ('default', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, true)
+                ON CONFLICT (config_name) DO UPDATE SET
+                    smtp_host = EXCLUDED.smtp_host,
+                    smtp_port = EXCLUDED.smtp_port,
+                    smtp_username = EXCLUDED.smtp_username,
+                    smtp_use_tls = EXCLUDED.smtp_use_tls,
+                    smtp_use_ssl = EXCLUDED.smtp_use_ssl,
+                    from_email = EXCLUDED.from_email,
+                    from_name = EXCLUDED.from_name,
+                    reply_to_email = EXCLUDED.reply_to_email,
+                    subject_template = EXCLUDED.subject_template,
+                    body_template = EXCLUDED.body_template,
+                    is_active = true,
+                    updated_at = NOW()
+            """
+            db_manager.execute_update(query, (host, port, username, use_tls, use_ssl, from_addr, from_name, reply_to, subject_template, body_template))
         
+        # Reload email manager config if available
+        if email_manager:
+            email_manager.reload_config()
+        
+        logger.info(f"Email settings saved: host={host}, port={port}, from={from_addr}")
         return html.Span("✅ Settings saved successfully!", style={'color': '#22c55e'})
     except Exception as e:
         logger.error(f"Error saving email settings: {e}")
@@ -2676,9 +2754,11 @@ def save_email_settings(n_clicks, host, port, security, username, password, from
 
 # ==================== CATEGORY MODAL CALLBACKS ====================
 
+
 @app.callback(
     [Output("category-modal", "style"),
-     Output("selected-findings-for-category", "data")],
+     Output("selected-findings-for-category", "data"),
+     Output("category-selector", "options")],
     [Input("btn-open-category", "n_clicks"),
      Input("close-category-modal-btn", "n_clicks"),
      Input("btn-cancel-category", "n_clicks"),
@@ -2687,7 +2767,7 @@ def save_email_settings(n_clicks, host, port, security, username, password, from
      State("findings-table", "data")]
 )
 def toggle_category_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks, selected_rows, table_data):
-    """Toggle the category assignment modal"""
+    """Toggle the category assignment modal and load categories from DB"""
     ctx = dash.callback_context
     hidden_style = {'display': 'none'}
     visible_style = {
@@ -2696,17 +2776,20 @@ def toggle_category_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks
         'zIndex': '1000', 'paddingTop': '100px'
     }
     
+    # Get current categories from DB
+    category_options = get_category_options()
+    
     if not ctx.triggered:
-        return hidden_style, []
+        return hidden_style, [], category_options
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
     if trigger_id == "btn-open-category" and selected_rows and table_data:
         # Extract finding IDs
         finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
-        return visible_style, finding_ids
+        return visible_style, finding_ids, category_options
     
-    return hidden_style, []
+    return hidden_style, [], category_options
 
 
 @app.callback(
@@ -2721,10 +2804,122 @@ def apply_category(n_clicks, category, finding_ids):
         return ""
     
     try:
-        success_count = findings_manager.bulk_update_category(finding_ids, category)
+        result = findings_manager.bulk_update_category(finding_ids, category)
+        success_count = result.get('success', 0) if isinstance(result, dict) else result
         return html.Span(f"✅ Category applied to {success_count} finding(s)", style={'color': '#22c55e'})
     except Exception as e:
         logger.error(f"Error applying category: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== MANAGE CATEGORIES MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("manage-categories-modal", "style"),
+     Output("categories-list", "children")],
+    [Input("btn-manage-categories", "n_clicks"),
+     Input("close-manage-categories-btn", "n_clicks"),
+     Input("btn-close-manage-categories", "n_clicks"),
+     Input("btn-add-category", "n_clicks")]
+)
+def toggle_manage_categories_modal(open_clicks, close_clicks, close2_clicks, add_clicks):
+    """Toggle the manage categories modal and load existing categories"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+        'zIndex': '1001', 'paddingTop': '30px', 'overflowY': 'auto'
+    }
+    
+    # Build categories list
+    def build_categories_list():
+        try:
+            categories = findings_manager.get_finding_categories()
+            if not categories:
+                return html.P("No categories found", style={'color': '#9ca3af'})
+            
+            items = []
+            for cat in categories:
+                icon = cat.get('icon', '📌') or '📌'
+                name = cat.get('display_name', cat['category_key'])
+                is_custom = cat.get('is_custom', False)
+                color = cat.get('color_code', '#6b7280')
+                
+                items.append(html.Div([
+                    html.Span(icon, style={'marginRight': '8px', 'fontSize': '16px'}),
+                    html.Span(name, style={'color': '#e0e0e0', 'fontWeight': 'bold'}),
+                    html.Span(f" ({cat['category_key']})", style={'color': '#6b7280', 'fontSize': '12px'}),
+                    html.Span(
+                        " [Custom]" if is_custom else " [System]",
+                        style={'color': '#60a5fa' if is_custom else '#9ca3af', 'fontSize': '11px', 'marginLeft': '8px'}
+                    ),
+                    html.Div(style={
+                        'display': 'inline-block', 'width': '12px', 'height': '12px',
+                        'backgroundColor': color, 'borderRadius': '3px', 'marginLeft': '8px', 'verticalAlign': 'middle'
+                    })
+                ], style={'padding': '8px 0', 'borderBottom': '1px solid #374151'}))
+            
+            return items
+        except Exception as e:
+            logger.error(f"Error loading categories: {e}")
+            return html.P(f"Error loading categories: {str(e)}", style={'color': '#ef4444'})
+    
+    if not ctx.triggered:
+        return hidden_style, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trigger_id == "btn-manage-categories":
+        return visible_style, build_categories_list()
+    
+    if trigger_id == "btn-add-category":
+        # Refresh list after adding
+        return visible_style, build_categories_list()
+    
+    return hidden_style, []
+
+
+@app.callback(
+    Output("manage-categories-result", "children"),
+    [Input("btn-add-category", "n_clicks")],
+    [State("new-category-key", "value"),
+     State("new-category-name", "value"),
+     State("new-category-description", "value"),
+     State("new-category-icon", "value"),
+     State("new-category-color", "value"),
+     State("new-category-weight", "value")]
+)
+def add_custom_category(n_clicks, key, name, description, icon, color, weight):
+    """Add a new custom category to the database"""
+    if not n_clicks:
+        return ""
+    
+    if not key or not name:
+        return html.Span("⚠️ Category key and display name are required", style={'color': '#f59e0b'})
+    
+    # Validate key format (lowercase, underscores only)
+    import re
+    if not re.match(r'^[a-z][a-z0-9_]*$', key):
+        return html.Span("⚠️ Key must be lowercase with underscores only (e.g., my_category)", style={'color': '#f59e0b'})
+    
+    try:
+        query = """
+            INSERT INTO finding_categories (category_key, display_name, description, icon, color_code, severity_weight, is_custom, sort_order)
+            VALUES (%s, %s, %s, %s, %s, %s, true, 150)
+            ON CONFLICT (category_key) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                description = EXCLUDED.description,
+                icon = EXCLUDED.icon,
+                color_code = EXCLUDED.color_code,
+                severity_weight = EXCLUDED.severity_weight
+        """
+        db_manager.execute_update(query, (key, name, description or '', icon or '📌', color or '#3b82f6', weight or 50))
+        
+        logger.info(f"Added custom category: {key} = {name}")
+        return html.Span(f"✅ Category '{name}' added successfully!", style={'color': '#22c55e'})
+    except Exception as e:
+        logger.error(f"Error adding category: {e}")
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
 
 
@@ -2734,14 +2929,18 @@ def apply_category(n_clicks, category, finding_ids):
     [Output("severity-modal", "style"),
      Output("selected-findings-for-severity", "data")],
     [Input("btn-open-severity", "n_clicks"),
+     Input("btn-file-adjust-severity", "n_clicks"),
      Input("close-severity-modal-btn", "n_clicks"),
      Input("btn-cancel-severity", "n_clicks"),
      Input("btn-apply-severity", "n_clicks")],
     [State("findings-table", "selected_rows"),
-     State("findings-table", "data")]
+     State("findings-table", "data"),
+     State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")]
 )
-def toggle_severity_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks, selected_rows, table_data):
-    """Toggle the severity adjustment modal"""
+def toggle_severity_modal(open_clicks, file_open_clicks, close_clicks, cancel_clicks, apply_clicks, 
+                          selected_rows, table_data, file_selected_rows, file_table_data):
+    """Toggle the severity adjustment modal - works for both All Findings and Group by File views"""
     ctx = dash.callback_context
     hidden_style = {'display': 'none'}
     visible_style = {
@@ -2755,9 +2954,27 @@ def toggle_severity_modal(open_clicks, close_clicks, cancel_clicks, apply_clicks
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
+    # All Findings view - direct finding IDs
     if trigger_id == "btn-open-severity" and selected_rows and table_data:
         finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
         return visible_style, finding_ids
+    
+    # Group by File view - get all finding IDs for selected files
+    if trigger_id == "btn-file-adjust-severity" and file_selected_rows and file_table_data:
+        selected_files = [file_table_data[i].get('file_path') for i in file_selected_rows if i < len(file_table_data)]
+        if selected_files:
+            all_finding_ids = []
+            for file_path in selected_files:
+                query = """
+                    SELECT id FROM findings 
+                    WHERE file_path = %s 
+                    AND resolution_status != 'false_positive'
+                """
+                results = db_manager.execute_query(query, (file_path,))
+                all_finding_ids.extend([row['id'] for row in results])
+            if all_finding_ids:
+                return visible_style, all_finding_ids
+        return hidden_style, []
     
     return hidden_style, []
 
@@ -2782,6 +2999,103 @@ def apply_severity(n_clicks, severity, reason, finding_ids):
         return html.Span(f"✅ Severity updated for {success_count} finding(s)", style={'color': '#22c55e'})
     except Exception as e:
         logger.error(f"Error updating severity: {e}")
+        return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
+
+
+# ==================== RESOLUTION STATUS MODAL CALLBACKS ====================
+
+@app.callback(
+    [Output("status-modal", "style"),
+     Output("selected-findings-for-status", "data")],
+    [Input("btn-open-status", "n_clicks"),
+     Input("btn-file-update-status", "n_clicks"),
+     Input("close-status-modal-btn", "n_clicks"),
+     Input("btn-cancel-status", "n_clicks"),
+     Input("btn-apply-status", "n_clicks")],
+    [State("findings-table", "selected_rows"),
+     State("findings-table", "data"),
+     State("file-grouped-table", "selected_rows"),
+     State("file-grouped-table", "data")]
+)
+def toggle_status_modal(open_clicks, file_open_clicks, close_clicks, cancel_clicks, apply_clicks, 
+                        selected_rows, table_data, file_selected_rows, file_table_data):
+    """Toggle the resolution status update modal - works for both All Findings and Group by File views"""
+    ctx = dash.callback_context
+    hidden_style = {'display': 'none'}
+    visible_style = {
+        'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
+        'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+        'zIndex': '1000', 'paddingTop': '50px', 'overflowY': 'auto'
+    }
+    
+    if not ctx.triggered:
+        return hidden_style, []
+    
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    # All Findings view - direct finding IDs
+    if trigger_id == "btn-open-status" and selected_rows and table_data:
+        finding_ids = [table_data[i].get('id') for i in selected_rows if i < len(table_data)]
+        return visible_style, finding_ids
+    
+    # Group by File view - get all finding IDs for selected files
+    if trigger_id == "btn-file-update-status" and file_selected_rows and file_table_data:
+        selected_files = [file_table_data[i].get('file_path') for i in file_selected_rows if i < len(file_table_data)]
+        if selected_files:
+            all_finding_ids = []
+            for file_path in selected_files:
+                query = """
+                    SELECT id FROM findings 
+                    WHERE file_path = %s 
+                    AND resolution_status != 'false_positive'
+                """
+                results = db_manager.execute_query(query, (file_path,))
+                all_finding_ids.extend([row['id'] for row in results])
+            if all_finding_ids:
+                return visible_style, all_finding_ids
+        return hidden_style, []
+    
+    return hidden_style, []
+
+
+@app.callback(
+    Output("status-update-result", "children"),
+    [Input("btn-apply-status", "n_clicks")],
+    [State("resolution-status-selector", "value"),
+     State("resolution-status-reason", "value"),
+     State("selected-findings-for-status", "data")]
+)
+def apply_resolution_status(n_clicks, status, reason, finding_ids):
+    """Apply resolution status to selected findings"""
+    if not n_clicks or not status or not finding_ids:
+        return ""
+    
+    try:
+        result = findings_manager.update_resolution_status(
+            finding_ids=finding_ids,
+            status=status,
+            reason=reason or f"Status changed to {status}",
+            updated_by="dashboard_user"
+        )
+        
+        # Force cache refresh
+        data_cache['findings_df'] = None
+        data_cache['last_update'] = None
+        
+        status_labels = {
+            'reviewed': 'Reviewed/Remediated',
+            'false_positive': 'False Positive',
+            'accepted_risk': 'Accepted Risk',
+            'open': 'Open'
+        }
+        status_label = status_labels.get(status, status)
+        
+        if result['success'] > 0:
+            return html.Span(f"✅ {result['success']} finding(s) marked as {status_label}", style={'color': '#22c55e'})
+        else:
+            return html.Span("❌ No findings were updated", style={'color': '#ef4444'})
+    except Exception as e:
+        logger.error(f"Error updating resolution status: {e}")
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
 
 
@@ -2828,25 +3142,25 @@ def toggle_send_email_modal(open_clicks, close_clicks, cancel_clicks, send_click
      State("selected-findings-for-email", "data")]
 )
 def send_email_notification(n_clicks, owner_name, owner_email, escalation_days, finding_ids):
-    """Send email notification to file owner"""
+    """Send email notification to file owner - ONE consolidated email"""
     if not n_clicks or not owner_email or not finding_ids:
         return ""
     
     try:
         from email_manager import email_manager
         
-        # Assign owner and set escalation for each finding
-        success_count = 0
-        for finding_id in finding_ids:
-            findings_manager.assign_owner(finding_id, owner_email, owner_name or "File Owner")
-            success_count += 1
-        
-        # Send notification email
-        result = email_manager.send_bulk_notifications(finding_ids, owner_email)
+        # Send ONE consolidated notification email for all findings
+        result = email_manager.send_bulk_notifications(
+            finding_ids=finding_ids,
+            owner_email=owner_email,
+            owner_name=owner_name or "File Owner",
+            escalation_days=escalation_days or 7
+        )
         
         if result.get('success'):
             return html.Span(
-                f"✅ Email sent to {owner_email} for {success_count} finding(s). Escalation in {escalation_days} days.",
+                f"✅ Email sent to {owner_email} with {result.get('total_findings', len(finding_ids))} finding(s) "
+                f"across {result.get('files_included', 1)} file(s). Escalation in {escalation_days} days.",
                 style={'color': '#22c55e'}
             )
         else:
@@ -2858,11 +3172,43 @@ def send_email_notification(n_clicks, owner_name, owner_email, escalation_days, 
 
 # ==================== PROOF VIEWER MODAL CALLBACKS ====================
 
+def is_binary_file(file_path):
+    """Check if a file is binary by reading first few bytes"""
+    try:
+        with open(file_path, 'rb') as f:
+            chunk = f.read(1024)
+            # Check for null bytes (common in binary files)
+            if b'\x00' in chunk:
+                return True
+            # Check for high ratio of non-text characters
+            text_chars = bytearray({7,8,9,10,12,13,27} | set(range(0x20, 0x100)) - {0x7f})
+            non_text = sum(1 for b in chunk if b not in text_chars)
+            if len(chunk) > 0 and non_text / len(chunk) > 0.3:
+                return True
+    except Exception:
+        pass
+    return False
+
+# Common binary/proprietary file extensions
+BINARY_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.zip', '.tar', '.gz', '.rar', '.7z',
+    '.exe', '.dll', '.so', '.dylib',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg',
+    '.mp3', '.mp4', '.avi', '.mov', '.mkv',
+    '.bin', '.dat', '.db', '.sqlite',
+    '.class', '.jar', '.war', '.pyc', '.pyo',
+    '.o', '.a', '.lib',
+}
+
 @app.callback(
     [Output("proof-modal", "style"),
      Output("proof-file-path", "children"),
      Output("proof-finding-info", "children"),
-     Output("proof-content-display", "children")],
+     Output("proof-content-display", "children"),
+     Output("proof-binary-warning", "style"),
+     Output("proof-binary-warning", "children"),
+     Output("proof-file-store", "data")],
     [Input("btn-view-proof", "n_clicks"),
      Input("close-proof-modal-btn", "n_clicks"),
      Input("btn-close-proof", "n_clicks")],
@@ -2872,6 +3218,7 @@ def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
     """Toggle the proof viewer modal and load full context"""
     ctx = dash.callback_context
     hidden_style = {'display': 'none'}
+    warning_hidden = {'display': 'none'}
     visible_style = {
         'display': 'block', 'position': 'fixed', 'top': '0', 'left': '0',
         'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
@@ -2879,7 +3226,7 @@ def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
     }
     
     if not ctx.triggered:
-        return hidden_style, "", "", ""
+        return hidden_style, "", "", "", warning_hidden, "", {}
     
     trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
     
@@ -2889,36 +3236,110 @@ def toggle_proof_modal(view_clicks, close_clicks, close2_clicks, finding_data):
         line_number = finding_data.get('line_number', 0)
         match_text = finding_data.get('match_text', '')
         
-        # Try to read the actual file for full context
+        # Store file path for download
+        file_store = {'file_path': file_path, 'finding_id': finding_id}
+        
+        # Check if file is binary or proprietary
+        file_ext = os.path.splitext(file_path)[1].lower()
+        is_binary = file_ext in BINARY_EXTENSIONS
+        
+        if not is_binary and os.path.exists(file_path):
+            is_binary = is_binary_file(file_path)
+        
+        if is_binary:
+            # Show binary file warning with download option
+            warning_style = {
+                'display': 'block',
+                'backgroundColor': '#f59e0b33',
+                'border': '1px solid #f59e0b',
+                'borderRadius': '8px',
+                'padding': '15px',
+                'marginBottom': '15px'
+            }
+            warning_content = [
+                html.Div([
+                    html.Strong("⚠️ Binary/Proprietary File Detected", style={'color': '#f59e0b', 'fontSize': '16px'}),
+                ], style={'marginBottom': '10px'}),
+                html.Div(f"This file ({file_ext or 'binary'}) cannot be displayed as text.", style={'color': '#e0e0e0'}),
+                html.Div("Use the 'Download File' button to view it in an appropriate application.", style={'color': '#9ca3af', 'marginTop': '5px'}),
+            ]
+            
+            # Show stored match text
+            proof_content = f"Stored match context:\n\n{match_text}" if match_text else "No preview available for binary files."
+            
+            return (
+                visible_style,
+                f"📁 {file_path}",
+                f"Line {line_number} | Finding ID: {finding_id} | ⚠️ Binary File",
+                proof_content,
+                warning_style,
+                warning_content,
+                file_store
+            )
+        
+        # For text files, check if we have cached proof content first
+        cached_proof = finding_data.get('proof_content', '')
         proof_content = "Unable to load file content"
-        try:
-            if os.path.exists(file_path):
-                with open(file_path, 'r', errors='ignore') as f:
-                    lines = f.readlines()
-                    # Show 10 lines before and after
-                    start_line = max(0, line_number - 11)
-                    end_line = min(len(lines), line_number + 10)
-                    
-                    context_lines = []
-                    for i, line in enumerate(lines[start_line:end_line], start=start_line + 1):
-                        marker = ">>> " if i == line_number else "    "
-                        context_lines.append(f"{i:4d} {marker}{line.rstrip()}")
-                    
-                    proof_content = "\n".join(context_lines)
-            else:
-                # Use stored match text as fallback
-                proof_content = f"File not accessible. Stored match:\n\n{match_text}"
-        except Exception as e:
-            proof_content = f"Error reading file: {e}\n\nStored match:\n{match_text}"
+        
+        if cached_proof:
+            # Use cached proof content from database (faster)
+            proof_content = cached_proof
+        else:
+            # Try to read from file
+            try:
+                if os.path.exists(file_path):
+                    with open(file_path, 'r', errors='ignore') as f:
+                        lines = f.readlines()
+                        # Show 10 lines before and after
+                        start_line = max(0, line_number - 11)
+                        end_line = min(len(lines), line_number + 10)
+                        
+                        context_lines = []
+                        for i, line in enumerate(lines[start_line:end_line], start=start_line + 1):
+                            marker = ">>> " if i == line_number else "    "
+                            context_lines.append(f"{i:4d} {marker}{line.rstrip()}")
+                        
+                        proof_content = "\n".join(context_lines)
+                else:
+                    # Use stored match text as fallback
+                    proof_content = f"File not accessible. Stored match:\n\n{match_text}"
+            except Exception as e:
+                proof_content = f"Error reading file: {e}\n\nStored match:\n{match_text}"
         
         return (
             visible_style,
             f"📁 {file_path}",
             f"Line {line_number} | Finding ID: {finding_id}",
-            proof_content
+            proof_content,
+            warning_hidden,
+            "",
+            file_store
         )
     
-    return hidden_style, "", "", ""
+    return hidden_style, "", "", "", warning_hidden, "", {}
+
+
+# Download proof file callback
+@app.callback(
+    Output("proof-file-download", "data"),
+    [Input("btn-download-proof-file", "n_clicks")],
+    [State("proof-file-store", "data")],
+    prevent_initial_call=True
+)
+def download_proof_file(n_clicks, file_store):
+    """Handle file download for proof viewer"""
+    if not n_clicks or not file_store:
+        return None
+    
+    file_path = file_store.get('file_path')
+    if not file_path or not os.path.exists(file_path):
+        return None
+    
+    # Sanitize and validate path
+    file_path = os.path.abspath(file_path)
+    
+    # Return the file for download
+    return dcc.send_file(file_path)
 
 
 @app.callback(
@@ -3779,6 +4200,37 @@ def create_layout():
                         style={'minWidth': '220px', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
                     )
                 ], className="filter-item"),
+
+                html.Div([
+                    html.Label("Category Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
+                    dcc.Dropdown(
+                        id="category-filter",
+                        options=[{"label": "All Categories", "value": "all"}],
+                        value="all",
+                        clearable=False,
+                        searchable=True,
+                        placeholder="Filter by category...",
+                        optionHeight=35,
+                        style={'minWidth': '200px', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
+                    )
+                ], className="filter-item"),
+
+                html.Div([
+                    html.Label("Status Filter:", style={'color': '#e0e0e0', 'fontWeight': '600', 'marginBottom': '8px'}),
+                    dcc.Dropdown(
+                        id="status-filter",
+                        options=[
+                            {"label": "Open Only", "value": "open"},
+                            {"label": "All Statuses", "value": "all"},
+                            {"label": "Reviewed", "value": "reviewed"},
+                            {"label": "False Positive", "value": "false_positive"},
+                            {"label": "Accepted Risk", "value": "accepted_risk"},
+                        ],
+                        value="open",
+                        clearable=False,
+                        style={'minWidth': '150px', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0'}
+                    )
+                ], className="filter-item"),
             ], className="filters"),
 
             # Charts Section with Tool Tabs
@@ -4053,36 +4505,12 @@ def create_layout():
                 html.Div([
                     html.Div([
                         html.Button(
-                            "�️ View False Positives",
-                            id='btn-view-fps-file',
+                            "📋 Update File Status", 
+                            id='btn-file-update-status',
                             n_clicks=0,
-                            title="View all findings marked as false positives",
+                            title="Mark all findings in selected files as Reviewed, False Positive, or Accepted Risk",
                             style={
-                                'backgroundColor': '#6b7280', 'color': 'white',
-                                'border': 'none', 'padding': '8px 16px',
-                                'borderRadius': '6px', 'cursor': 'pointer',
-                                'marginRight': '10px', 'fontWeight': 'bold'
-                            }
-                        ),
-                        html.Button(
-                            "�🚫 Mark Files as FP", 
-                            id='btn-mark-file-fp',
-                            n_clicks=0,
-                            title="Mark all findings in selected files as false positives",
-                            style={
-                                'backgroundColor': '#dc2626', 'color': 'white',
-                                'border': 'none', 'padding': '8px 16px',
-                                'borderRadius': '6px', 'cursor': 'pointer',
-                                'marginRight': '10px', 'fontWeight': 'bold'
-                            }
-                        ),
-                        html.Button(
-                            "✅ Mark Files as Clean", 
-                            id='btn-mark-file-clean',
-                            n_clicks=0,
-                            title="Mark all findings in selected files as reviewed and clean",
-                            style={
-                                'backgroundColor': '#22c55e', 'color': 'white',
+                                'backgroundColor': '#8b5cf6', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
                                 'marginRight': '10px', 'fontWeight': 'bold'
@@ -4095,6 +4523,18 @@ def create_layout():
                             title="Categorize all findings in selected files",
                             style={
                                 'backgroundColor': '#f59e0b', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "⚡ Adjust File Severity", 
+                            id='btn-file-adjust-severity',
+                            n_clicks=0,
+                            title="Adjust severity for all findings in selected files",
+                            style={
+                                'backgroundColor': '#ef4444', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
                                 'marginRight': '10px', 'fontWeight': 'bold'
@@ -4121,10 +4561,46 @@ def create_layout():
                                 'backgroundColor': '#0052cc', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "👁️ View FPs",
+                            id='btn-view-fps-file',
+                            n_clicks=0,
+                            title="View all findings marked as false positives",
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold', 'marginRight': '10px'
+                            }
+                        ),
+                        html.Button(
+                            "⚙️ Jira Settings", 
+                            id='btn-jira-settings-file',
+                            n_clicks=0,
+                            title="Configure Jira integration settings",
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold', 'marginRight': '10px'
+                            }
+                        ),
+                        html.Button(
+                            "📧 Email Settings", 
+                            id='btn-email-settings-file',
+                            n_clicks=0,
+                            title="Configure email notification settings",
+                            style={
+                                'backgroundColor': '#3b82f6', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
                                 'fontWeight': 'bold'
                             }
                         ),
-                    ], style={'display': 'flex', 'justifyContent': 'flex-end', 'marginTop': '15px'}),
+                    ], style={'display': 'flex', 'justifyContent': 'flex-end', 'marginTop': '15px', 'flexWrap': 'wrap', 'gap': '5px'}),
                     html.Div(id='file-action-result', style={'marginTop': '10px', 'textAlign': 'right'}),
                     html.Div(id='file-jira-result', style={'marginTop': '5px', 'textAlign': 'right'})
                 ], style={'padding': '10px 0'})
@@ -4214,6 +4690,18 @@ def create_layout():
                             n_clicks=0,
                             style={
                                 'backgroundColor': '#0052cc', 'color': 'white',
+                                'border': 'none', 'padding': '8px 16px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "📋 Update Status", 
+                            id='btn-open-status',
+                            n_clicks=0,
+                            title="Mark as Reviewed, False Positive, or Accepted Risk",
+                            style={
+                                'backgroundColor': '#8b5cf6', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
                                 'marginRight': '10px', 'fontWeight': 'bold'
@@ -4969,12 +5457,57 @@ def create_layout():
                                              'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
                         ], style={'marginBottom': '15px'}),
                         html.Div([
-                            html.Label("Escalation Days:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Input(id='email-escalation-days', type='number', value=7, min=1, max=30,
-                                      style={'width': '150px', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                            html.Label("Reply-To Email (optional):", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-reply-to', type='email', placeholder='security-team@yourcompany.com',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
                                              'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
-                            html.Span(" days before escalating unresolved findings", style={'color': '#9ca3af', 'marginLeft': '10px'}),
-                        ], style={'marginBottom': '20px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.P("💡 Password is only required if SMTP server requires authentication. Leave blank to keep existing password.",
+                               style={'color': '#9ca3af', 'fontSize': '12px', 'marginTop': '10px'}),
+                    ], style={'backgroundColor': '#1f2937', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px'}),
+                    
+                    # Email Template Section
+                    html.Div([
+                        html.H3("📝 Email Template", style={'color': '#f59e0b', 'marginBottom': '15px'}),
+                        html.P("Customize the email notification template. Use placeholders: {owner_name}, {file_path}, {secret_type}, {severity}, {finding_count}, {dashboard_url}",
+                               style={'color': '#9ca3af', 'fontSize': '12px', 'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("Subject Template:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Input(id='email-subject-template', type='text', 
+                                      value='[SecretSnipe] Security Finding Requires Your Attention - {severity}',
+                                      style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
+                                             'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                        ], style={'marginBottom': '15px'}),
+                        html.Div([
+                            html.Label("Body Template:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
+                            dcc.Textarea(id='email-body-template',
+                                      value='''Hello {owner_name},
+
+A security finding has been detected in a file you own that requires your attention.
+
+**Finding Details:**
+- File: {file_path}
+- Secret Type: {secret_type}
+- Severity: {severity}
+- Total Findings in File: {finding_count}
+
+Please review this finding at your earliest convenience and take appropriate action to remediate the exposed secret.
+
+**Actions Required:**
+1. Review the finding in the SecretSnipe dashboard
+2. Rotate any exposed credentials immediately
+3. Update your code to use environment variables or a secrets manager
+4. Mark the finding as resolved once addressed
+
+Dashboard: {dashboard_url}
+
+Best regards,
+SecretSnipe Security Team''',
+                                      style={'width': '100%', 'height': '250px', 'padding': '10px', 
+                                             'backgroundColor': '#1e1e1e', 'color': '#e0e0e0', 
+                                             'border': '1px solid #555', 'borderRadius': '4px',
+                                             'fontFamily': 'monospace', 'fontSize': '12px'}),
+                        ], style={'marginBottom': '15px'}),
                     ], style={'backgroundColor': '#1f2937', 'padding': '15px', 'borderRadius': '8px', 'marginBottom': '20px'}),
                     
                     html.Div(id='email-test-result', style={'marginBottom': '15px'}),
@@ -4994,7 +5527,7 @@ def create_layout():
                     ], style={'textAlign': 'right'})
                 ], style={
                     'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
-                    'maxWidth': '600px', 'margin': '0 auto', 'border': '1px solid #555'
+                    'maxWidth': '900px', 'margin': '0 auto', 'border': '1px solid #555'
                 })
             ], id='email-settings-modal', style={
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
@@ -5018,23 +5551,18 @@ def create_layout():
                     
                     html.Div([
                         html.Label("Finding Category:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
-                        dcc.Dropdown(id='category-selector', options=[
-                            {'label': '🔑 Real Password', 'value': 'real_password'},
-                            {'label': '🔐 Real API Key', 'value': 'real_api_key'},
-                            {'label': '💰 Financial Data', 'value': 'finance_data'},
-                            {'label': '🗄️ Database Credential', 'value': 'database_credential'},
-                            {'label': '☁️ Cloud Credential', 'value': 'cloud_credential'},
-                            {'label': '🔏 Private Key', 'value': 'private_key'},
-                            {'label': '📝 Placeholder/Example', 'value': 'placeholder'},
-                            {'label': '🧪 Test Data', 'value': 'test_data'},
-                            {'label': '📖 Sample/Demo Key', 'value': 'sample_key'},
-                            {'label': '💬 Commented Out', 'value': 'commented_out'},
-                            {'label': '🔢 Encoded/Encrypted', 'value': 'encoded_data'},
-                            {'label': '🌐 Environment Variable', 'value': 'environment_variable'},
-                            {'label': '⚠️ Hardcoded Secret', 'value': 'hardcoded'},
-                            {'label': '⚙️ Config File Secret', 'value': 'config_file'},
-                            {'label': '❓ Uncategorized', 'value': 'uncategorized'},
-                        ], value=None, placeholder='Select a category...', style={'backgroundColor': '#1e1e1e'})
+                        # Categories loaded dynamically from database
+                        dcc.Dropdown(id='category-selector', options=[], value=None, 
+                                     placeholder='Select a category...', style={'backgroundColor': '#1e1e1e'})
+                    ], style={'marginBottom': '15px'}),
+                    
+                    # Link to manage categories
+                    html.Div([
+                        html.Button("➕ Manage Categories", id='btn-manage-categories', n_clicks=0, style={
+                            'backgroundColor': 'transparent', 'color': '#60a5fa', 'border': '1px solid #60a5fa',
+                            'padding': '6px 12px', 'borderRadius': '4px', 'cursor': 'pointer',
+                            'fontSize': '12px'
+                        }),
                     ], style={'marginBottom': '20px'}),
                     
                     dcc.Store(id='selected-findings-for-category', data=[]),
@@ -5059,6 +5587,98 @@ def create_layout():
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
                 'zIndex': '1000', 'paddingTop': '100px'
+            }),
+
+            # Manage Categories Modal - Create/Edit custom categories
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("⚙️ Manage Categories", style={'margin': '0', 'color': '#60a5fa'}),
+                        html.Button("✕", id='close-manage-categories-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Create custom categories for organizing findings. System categories cannot be deleted.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    # Existing categories list
+                    html.Div([
+                        html.H4("Existing Categories", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div(id='categories-list', style={
+                            'maxHeight': '200px', 'overflowY': 'auto', 'marginBottom': '20px',
+                            'border': '1px solid #444', 'borderRadius': '6px', 'padding': '10px',
+                            'backgroundColor': '#1f2937'
+                        }),
+                    ]),
+                    
+                    # Add new category form
+                    html.Div([
+                        html.H4("➕ Add New Category", style={'color': '#e0e0e0', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.Div([
+                                html.Label("Category Key:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                dcc.Input(id='new-category-key', type='text', placeholder='my_custom_category',
+                                          style={'width': '100%', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                 'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                            ], style={'marginBottom': '10px'}),
+                            html.Div([
+                                html.Label("Display Name:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                dcc.Input(id='new-category-name', type='text', placeholder='My Custom Category',
+                                          style={'width': '100%', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                 'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                            ], style={'marginBottom': '10px'}),
+                            html.Div([
+                                html.Label("Description:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                dcc.Input(id='new-category-description', type='text', placeholder='Description of this category',
+                                          style={'width': '100%', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                 'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                            ], style={'marginBottom': '10px'}),
+                            html.Div([
+                                html.Div([
+                                    html.Label("Icon:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                    dcc.Input(id='new-category-icon', type='text', placeholder='🔒', value='📌',
+                                              style={'width': '60px', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                     'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                                ], style={'display': 'inline-block', 'marginRight': '15px'}),
+                                html.Div([
+                                    html.Label("Color:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                    dcc.Input(id='new-category-color', type='text', placeholder='#3b82f6', value='#3b82f6',
+                                              style={'width': '100px', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                     'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                                ], style={'display': 'inline-block', 'marginRight': '15px'}),
+                                html.Div([
+                                    html.Label("Severity Weight:", style={'color': '#b0b0b0', 'fontSize': '12px'}),
+                                    dcc.Input(id='new-category-weight', type='number', value=50, min=-100, max=100,
+                                              style={'width': '80px', 'padding': '8px', 'backgroundColor': '#1e1e1e',
+                                                     'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                                ], style={'display': 'inline-block'}),
+                            ], style={'marginBottom': '15px'}),
+                            html.Button("➕ Add Category", id='btn-add-category', n_clicks=0, style={
+                                'backgroundColor': '#22c55e', 'color': 'white', 'border': 'none',
+                                'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                                'fontWeight': 'bold'
+                            }),
+                        ], style={'backgroundColor': '#1f2937', 'padding': '15px', 'borderRadius': '8px'}),
+                    ]),
+                    
+                    html.Div(id='manage-categories-result', style={'marginTop': '15px'}),
+                    
+                    html.Div([
+                        html.Button("Close", id='btn-close-manage-categories', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right', 'marginTop': '20px'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '600px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='manage-categories-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.85)',
+                'zIndex': '1001', 'paddingTop': '30px', 'overflowY': 'auto'
             }),
 
             # Severity Adjustment Modal
@@ -5114,6 +5734,86 @@ def create_layout():
                 'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                 'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
                 'zIndex': '1000', 'paddingTop': '100px'
+            }),
+
+            # Resolution Status Modal - For proper status workflow
+            html.Div([
+                html.Div([
+                    html.Div([
+                        html.H2("📋 Update Resolution Status", style={'margin': '0', 'color': '#8b5cf6'}),
+                        html.Button("✕", id='close-status-modal-btn', n_clicks=0, style={
+                            'background': 'none', 'border': 'none', 'color': '#aaa',
+                            'fontSize': '24px', 'cursor': 'pointer', 'padding': '0'
+                        })
+                    ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '20px'}),
+                    
+                    html.P("Update the resolution status of selected findings.", 
+                           style={'color': '#9ca3af', 'marginBottom': '20px'}),
+                    
+                    # Status explanation cards
+                    html.Div([
+                        html.Div([
+                            html.Strong("✅ Reviewed/Remediated", style={'color': '#22c55e'}),
+                            html.P("Finding was real but has been addressed. Secret rotated, credential removed, or issue fixed.", 
+                                   style={'color': '#9ca3af', 'fontSize': '12px', 'margin': '5px 0 0 0'})
+                        ], style={'padding': '10px', 'backgroundColor': '#1f2937', 'borderRadius': '6px', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.Strong("🚫 False Positive", style={'color': '#f59e0b'}),
+                            html.P("Not a real secret. Regex matched test data, placeholder, or sample value.", 
+                                   style={'color': '#9ca3af', 'fontSize': '12px', 'margin': '5px 0 0 0'})
+                        ], style={'padding': '10px', 'backgroundColor': '#1f2937', 'borderRadius': '6px', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.Strong("⚠️ Accepted Risk", style={'color': '#8b5cf6'}),
+                            html.P("Real secret but risk is acknowledged and accepted. Document justification.", 
+                                   style={'color': '#9ca3af', 'fontSize': '12px', 'margin': '5px 0 0 0'})
+                        ], style={'padding': '10px', 'backgroundColor': '#1f2937', 'borderRadius': '6px', 'marginBottom': '10px'}),
+                        html.Div([
+                            html.Strong("🔄 Reopen", style={'color': '#ef4444'}),
+                            html.P("Set status back to Open for re-review.", 
+                                   style={'color': '#9ca3af', 'fontSize': '12px', 'margin': '5px 0 0 0'})
+                        ], style={'padding': '10px', 'backgroundColor': '#1f2937', 'borderRadius': '6px', 'marginBottom': '15px'}),
+                    ]),
+                    
+                    html.Div([
+                        html.Label("New Status:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Dropdown(id='resolution-status-selector', options=[
+                            {'label': '✅ Reviewed/Remediated', 'value': 'reviewed'},
+                            {'label': '🚫 False Positive', 'value': 'false_positive'},
+                            {'label': '⚠️ Accepted Risk', 'value': 'accepted_risk'},
+                            {'label': '🔄 Reopen (Set to Open)', 'value': 'open'},
+                        ], value=None, placeholder='Select new status...', style={'backgroundColor': '#1e1e1e'})
+                    ], style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Label("Reason/Notes:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
+                        dcc.Textarea(id='resolution-status-reason', 
+                                     placeholder='e.g., Credential rotated on 2026-02-03, new key deployed...',
+                                     style={'width': '100%', 'height': '80px', 'backgroundColor': '#1e1e1e',
+                                            'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px', 'padding': '10px'})
+                    ], style={'marginBottom': '20px'}),
+                    
+                    dcc.Store(id='selected-findings-for-status', data=[]),
+                    html.Div(id='status-update-result', style={'marginBottom': '15px'}),
+                    
+                    html.Div([
+                        html.Button("✅ Apply Status", id='btn-apply-status', n_clicks=0, style={
+                            'backgroundColor': '#8b5cf6', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
+                        html.Button("Cancel", id='btn-cancel-status', n_clicks=0, style={
+                            'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
+                        }),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
+                    'maxWidth': '550px', 'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='status-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '1000', 'paddingTop': '50px', 'overflowY': 'auto'
             }),
 
             # Send Email Notification Modal
@@ -5191,6 +5891,9 @@ def create_layout():
                     html.Div(id='proof-file-path', style={'color': '#60a5fa', 'marginBottom': '10px', 'fontFamily': 'monospace'}),
                     html.Div(id='proof-finding-info', style={'color': '#9ca3af', 'marginBottom': '15px'}),
                     
+                    # Binary file warning (hidden by default)
+                    html.Div(id='proof-binary-warning', style={'display': 'none'}),
+                    
                     html.Div([
                         html.Pre(id='proof-content-display', style={
                             'backgroundColor': '#1a1a1a', 'color': '#e0e0e0', 'padding': '20px',
@@ -5201,6 +5904,11 @@ def create_layout():
                     ], style={'marginBottom': '20px'}),
                     
                     html.Div([
+                        html.Button("⬇️ Download File", id='btn-download-proof-file', n_clicks=0, style={
+                            'backgroundColor': '#2563eb', 'color': 'white', 'border': 'none',
+                            'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
+                            'fontWeight': 'bold', 'marginRight': '10px'
+                        }),
                         html.Button("📋 Copy to Clipboard", id='btn-copy-proof', n_clicks=0, style={
                             'backgroundColor': '#6b7280', 'color': 'white', 'border': 'none',
                             'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer',
@@ -5210,7 +5918,13 @@ def create_layout():
                             'backgroundColor': '#374151', 'color': 'white', 'border': 'none',
                             'padding': '10px 20px', 'borderRadius': '6px', 'cursor': 'pointer'
                         }),
-                    ], style={'textAlign': 'right'})
+                    ], style={'textAlign': 'right'}),
+                    
+                    # Download component (for serving files)
+                    dcc.Download(id='proof-file-download'),
+                    
+                    # Store for proof file path (for download)
+                    dcc.Store(id='proof-file-store', data={}),
                 ], style={
                     'backgroundColor': '#2d3748', 'padding': '25px', 'borderRadius': '8px',
                     'maxWidth': '1000px', 'width': '90%', 'margin': '0 auto', 'border': '1px solid #555'
@@ -6214,6 +6928,16 @@ def main():
     logger.info("🔒 Security features active: Rate limiting, Input validation, Audit logging")
 
     try:
+        # Suppress Flask development server warning in production
+        import warnings
+        from werkzeug.serving import WSGIRequestHandler
+        
+        # Suppress the development server warning
+        if not debug_mode:
+            import logging as log_module
+            log_module.getLogger('werkzeug').setLevel(log_module.ERROR)
+            warnings.filterwarnings('ignore', message='.*development server.*')
+        
         # Start the server with security configurations
         app.run(
             host=dashboard_host,

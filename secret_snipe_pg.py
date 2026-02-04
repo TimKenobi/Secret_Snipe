@@ -947,8 +947,10 @@ def process_file(file_path, project_id, scan_session_id):
         try:
             file_stat = file_path.stat()
             file_modified_at = datetime.fromtimestamp(file_stat.st_mtime)
+            file_last_accessed = datetime.fromtimestamp(file_stat.st_atime)
         except Exception:
             file_modified_at = None
+            file_last_accessed = None
 
         # Scan text for secrets
         findings = scan_text_with_signatures(text, file_path_str)
@@ -971,6 +973,7 @@ def process_file(file_path, project_id, scan_session_id):
                     'is_valid': finding['is_valid'],
                     'validation_reason': finding['validation_reason'],
                     'file_modified_at': str(file_modified_at) if file_modified_at else None,
+                    'file_last_accessed': str(file_last_accessed) if file_last_accessed else None,
                     'file_size': file_size
                 }
             )

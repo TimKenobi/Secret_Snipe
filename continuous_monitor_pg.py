@@ -349,6 +349,9 @@ class ContinuousMonitor:
                         continue
 
             if copied_count > 0:  # Check if any files were copied
+                # Get existing findings for these files BEFORE scanning
+                existing_findings = self._get_existing_findings_for_files(changed_files)
+                
                 # Run multi-scanner on temp directory
                 result = self.orchestrator.run_multi_scan(
                     directory=temp_dir,
@@ -359,6 +362,15 @@ class ContinuousMonitor:
                 if result['success']:
                     logger.info(f"Incremental scan progress: {copied_count}/{len(file_paths)} files; {result['total_findings']} findings")
                     scan_session_manager.update_session_status(self.session_id, 'in_progress', total_findings=result['total_findings'])
+
+                    # Auto-resolve findings that are no longer detected (secrets were removed)
+                    resolved_count = self._auto_resolve_missing_findings(
+                        changed_files, 
+                        existing_findings, 
+                        result.get('session_id')
+                    )
+                    if resolved_count > 0:
+                        logger.info(f"Auto-resolved {resolved_count} findings (secrets removed from files)")
 
                     # Check for critical findings and send notifications
                     self._check_critical_findings(result['session_id'])
@@ -371,6 +383,86 @@ class ContinuousMonitor:
 
         except Exception as e:
             logger.error(f"Error scanning changed files: {e}")
+
+    def _get_existing_findings_for_files(self, file_paths: List[Path]) -> Dict[str, List[Dict]]:
+        """Get existing open findings for specified files (for comparison after rescan)"""
+        findings_by_file = {}
+        try:
+            file_strs = [str(fp) for fp in file_paths]
+            placeholders = ','.join(['%s'] * len(file_strs))
+            query = f"""
+                SELECT id, file_path, line_number, secret_type, secret_value
+                FROM findings 
+                WHERE file_path IN ({placeholders})
+                  AND resolution_status = 'open'
+            """
+            results = db_manager.execute_query(query, tuple(file_strs))
+            for row in results:
+                fp = row['file_path']
+                if fp not in findings_by_file:
+                    findings_by_file[fp] = []
+                findings_by_file[fp].append(dict(row))
+        except Exception as e:
+            logger.warning(f"Could not get existing findings for files: {e}")
+        return findings_by_file
+
+    def _auto_resolve_missing_findings(self, changed_files: List[Path], 
+                                        existing_findings: Dict[str, List[Dict]],
+                                        new_session_id: str) -> int:
+        """Auto-resolve findings when the secret is no longer detected in the file
+        
+        This happens when a developer fixes a leak - the secret is removed, so the
+        finding should be automatically marked as resolved.
+        """
+        resolved_count = 0
+        try:
+            for file_path in changed_files:
+                fp_str = str(file_path)
+                if fp_str not in existing_findings:
+                    continue
+                    
+                old_findings = existing_findings[fp_str]
+                if not old_findings:
+                    continue
+                
+                # Get new findings for this file from the new scan
+                query = """
+                    SELECT line_number, secret_type, secret_value
+                    FROM findings 
+                    WHERE file_path = %s
+                      AND scan_session_id = %s
+                """
+                new_findings = db_manager.execute_query(query, (fp_str, new_session_id))
+                
+                # Create a set of (line, type, value) tuples for quick lookup
+                new_finding_set = set()
+                for nf in new_findings:
+                    # Use hash of secret value for comparison
+                    key = (nf['secret_type'], nf.get('secret_value', '')[:50])
+                    new_finding_set.add(key)
+                
+                # Check each old finding - if secret is no longer detected, resolve it
+                for old in old_findings:
+                    old_key = (old['secret_type'], old.get('secret_value', '')[:50])
+                    if old_key not in new_finding_set:
+                        # Secret is no longer detected - auto-resolve
+                        update_query = """
+                            UPDATE findings 
+                            SET resolution_status = 'resolved',
+                                review_reason = 'Auto-resolved: secret no longer detected after file modification',
+                                reviewed_by = 'continuous_monitor',
+                                reviewed_at = NOW(),
+                                updated_at = NOW()
+                            WHERE id = %s
+                        """
+                        db_manager.execute_update(update_query, (old['id'],))
+                        resolved_count += 1
+                        logger.info(f"Auto-resolved finding {old['id']} - secret removed from {fp_str}")
+                        
+        except Exception as e:
+            logger.error(f"Error auto-resolving findings: {e}")
+        
+        return resolved_count
 
     def _check_critical_findings(self, session_id: str):
         """Check for critical findings and queue notifications"""

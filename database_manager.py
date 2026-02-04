@@ -200,12 +200,19 @@ class FindingsManager:
 
         # Extract file metadata from metadata dict if present
         file_modified_at = None
+        file_last_accessed = None
         file_size = None
         if metadata:
             file_modified_at_str = metadata.pop('file_modified_at', None)
             if file_modified_at_str and file_modified_at_str != 'None':
                 try:
                     file_modified_at = datetime.fromisoformat(file_modified_at_str.replace(' ', 'T'))
+                except Exception:
+                    pass
+            file_last_accessed_str = metadata.pop('file_last_accessed', None)
+            if file_last_accessed_str and file_last_accessed_str != 'None':
+                try:
+                    file_last_accessed = datetime.fromisoformat(file_last_accessed_str.replace(' ', 'T'))
                 except Exception:
                     pass
             file_size = metadata.pop('file_size', None)
@@ -224,8 +231,8 @@ class FindingsManager:
                 scan_session_id, project_id, file_path, line_number,
                 secret_type, secret_value, context, severity,
                 confidence_score, tool_source, fingerprint, metadata,
-                file_modified_at, file_size, file_extension
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                file_modified_at, file_size, file_extension, file_last_accessed
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
         """
 
@@ -234,7 +241,7 @@ class FindingsManager:
             secret_type, secret_value, context, severity,
             confidence_score, tool_source, fingerprint,
             json.dumps(metadata or {}),
-            file_modified_at, file_size, file_extension
+            file_modified_at, file_size, file_extension, file_last_accessed
         )
 
         result = self.db.execute_query(query, params)
@@ -624,33 +631,111 @@ class FindingsManager:
 
     def mark_file_as_clean(self, file_path: str, reason: str = None,
                            fp_category: str = None, marked_by: str = "user") -> Dict[str, Any]:
-        """Mark all findings in a file as false positive
+        """Mark all findings in a file as reviewed/clean (not false positive)
         
         This ensures symmetry between Group by File and All Findings views.
+        Uses 'reviewed' status - meaning the finding was real but has been addressed.
         """
         query = """
             UPDATE findings 
-            SET resolution_status = 'false_positive',
-                fp_reason = %s,
-                fp_category = %s,
-                fp_marked_by = %s,
-                fp_marked_at = NOW(),
+            SET resolution_status = 'reviewed',
                 resolved_at = NOW(),
+                review_reason = %s,
+                reviewed_by = %s,
+                reviewed_at = NOW(),
                 updated_at = NOW()
             WHERE file_path = %s AND resolution_status = 'open'
             RETURNING id
         """
-        results = self.db.execute_query(query, (reason, fp_category, marked_by, file_path))
+        results = self.db.execute_query(query, (reason, marked_by, file_path))
         
         affected_ids = [str(r['id']) for r in results] if results else []
         
-        logger.info(f"Marked {len(affected_ids)} findings in {file_path} as false positive")
+        logger.info(f"Marked {len(affected_ids)} findings in {file_path} as reviewed/clean")
         
         return {
             'file_path': file_path,
+            'count': len(affected_ids),
             'findings_marked': len(affected_ids),
             'finding_ids': affected_ids
         }
+
+    def update_resolution_status(self, finding_ids: List[str], status: str, 
+                                  reason: str = None, updated_by: str = "user") -> Dict[str, Any]:
+        """Update resolution status for multiple findings
+        
+        Valid statuses:
+        - 'open': New/unreviewed finding
+        - 'reviewed': Finding reviewed, addressed/remediated  
+        - 'false_positive': Not a real secret (detection error)
+        - 'accepted_risk': Real secret, risk acknowledged, no action planned
+        - 'resolved': Finding resolved/rotated (legacy, use 'reviewed')
+        """
+        if not finding_ids:
+            return {'success': 0, 'failed': 0}
+        
+        valid_statuses = ['open', 'reviewed', 'false_positive', 'accepted_risk', 'resolved']
+        if status not in valid_statuses:
+            raise ValueError(f"Invalid status: {status}. Must be one of {valid_statuses}")
+        
+        results = {'success': 0, 'failed': 0}
+        
+        if status == 'false_positive':
+            # Use existing false positive method
+            return self.mark_as_false_positive(finding_ids, reason, updated_by)
+        
+        # Build query based on status
+        if status == 'open':
+            # Reopening - clear resolution fields
+            query = """
+                UPDATE findings 
+                SET resolution_status = 'open',
+                    resolved_at = NULL,
+                    review_reason = NULL,
+                    reviewed_by = NULL,
+                    reviewed_at = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+            """
+        elif status in ('reviewed', 'resolved'):
+            query = """
+                UPDATE findings 
+                SET resolution_status = %s,
+                    resolved_at = NOW(),
+                    review_reason = %s,
+                    reviewed_by = %s,
+                    reviewed_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+            """
+        elif status == 'accepted_risk':
+            query = """
+                UPDATE findings 
+                SET resolution_status = 'accepted_risk',
+                    risk_accepted_reason = %s,
+                    risk_accepted_by = %s,
+                    risk_accepted_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s
+            """
+        
+        for finding_id in finding_ids:
+            try:
+                if status == 'open':
+                    affected = self.db.execute_update(query, (finding_id,))
+                else:
+                    affected = self.db.execute_update(query, (status if status in ('reviewed', 'resolved') else None, 
+                                                               reason, updated_by, finding_id))
+                if affected > 0:
+                    results['success'] += 1
+                    self._log_finding_change(finding_id, 'resolution_status', 'open', status, updated_by)
+                else:
+                    results['failed'] += 1
+            except Exception as e:
+                logger.error(f"Error updating finding {finding_id} status: {e}")
+                results['failed'] += 1
+        
+        return results
 
     def get_findings_by_folder(self, folder_path: str, include_subfolders: bool = True,
                                resolution_status: str = 'open') -> List[Dict[str, Any]]:

@@ -4,15 +4,41 @@ A comprehensive secret detection and visualization platform built with PostgreSQ
 
 ## 🚀 Features
 
+### Core Scanning
 - **Multi-Format Support**: Scans 25+ file types including PDFs, Office documents, images, and archives
 - **Multi-Tool Integration**: Supports custom regex, Trufflehog, and Gitleaks scanners
+- **OCR Scanning**: Detects secrets in images using Tesseract/EasyOCR
+- **Parallel Processing**: Multi-threaded scanning for large codebases
+
+### Dashboard & Visualization
+- **Interactive Dashboard**: Real-time visualization with Dash/Plotly
+- **Dual View Modes**: "All Findings" and "Group by File" for flexible workflow
+- **Proof Viewer**: View full file context with syntax highlighting and binary file download
+- **Charts & Analytics**: Severity distribution, tool coverage, trend analysis
+
+### Workflow Management
+- **Resolution Status Tracking**: Mark findings as Reviewed, False Positive, Accepted Risk, or Resolved
+- **Severity Adjustment**: Override automatic severity based on context
+- **Custom Categories**: Organize findings with built-in and custom categories
+- **Bulk Operations**: Apply actions to multiple findings at once
+
+### Notifications & Integrations
+- **Email Notifications**: Consolidated email alerts with customizable templates
+- **Jira Integration**: Create tickets grouped by file (one ticket per file with all findings)
+- **Webhook Notifications**: Real-time alerts for severe security findings
+- **Escalation Workflow**: Automatic escalation after configurable time period
+
+### Continuous Monitoring
+- **File Watch**: Real-time monitoring for file changes
+- **Auto-Resolution**: Automatically marks findings as resolved when secrets are removed
+- **Incremental Scanning**: Only re-scans changed files for efficiency
+
+### Enterprise Features
 - **PostgreSQL Backend**: ACID-compliant database with full audit trails
 - **Redis Caching**: High-performance caching and session management
-- **Interactive Dashboard**: Real-time visualization with Dash/Plotly
-- **Configurable Reports**: Automated report generation with multiple formats
-- **Webhook Notifications**: Real-time alerts for severe security findings
+- **Data Persistence**: Docker volumes for reliable data persistence
+- **Production Mode**: Suppressed development warnings for production use
 - **Docker Ready**: Complete containerization for Linux deployment
-- **Parallel Processing**: Multi-threaded scanning for large codebases
 
 ## 🏗️ Architecture
 

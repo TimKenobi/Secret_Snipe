@@ -2817,6 +2817,29 @@ def apply_category(n_clicks, category, finding_ids):
         return html.Span(f"❌ Error: {str(e)}", style={'color': '#ef4444'})
 
 
+@app.callback(
+    Output("category-preview", "children"),
+    [Input("category-selector", "options")],
+    prevent_initial_call=False
+)
+def update_category_preview(options):
+    """Show existing categories as a preview when modal opens"""
+    if not options or len(options) == 0:
+        return "No categories available. Click 'Manage Categories' to create one."
+    
+    # Filter out the "Select a category" placeholder if present
+    category_names = [opt.get('label', '') for opt in options if opt.get('value')]
+    
+    if not category_names:
+        return "No categories available. Click 'Manage Categories' to create one."
+    
+    return html.Div([
+        html.Span("Available categories: ", style={'fontWeight': 'bold'}),
+        html.Span(", ".join(category_names[:10])),  # Show first 10
+        html.Span(f" (+{len(category_names) - 10} more)" if len(category_names) > 10 else "")
+    ])
+
+
 # ==================== MANAGE CATEGORIES MODAL CALLBACKS ====================
 
 @app.callback(
@@ -4662,15 +4685,16 @@ def create_layout():
                                 'backgroundColor': '#6b7280', 'color': 'white',
                                 'border': 'none', 'padding': '8px 16px',
                                 'borderRadius': '6px', 'cursor': 'pointer',
-                                'marginRight': '15px', 'fontWeight': 'bold'
+                                'marginRight': '20px', 'fontWeight': 'bold'
                             }
                         ),
                         html.Span(id='fp-count-badge', style={
                             'padding': '4px 10px', 
                             'backgroundColor': '#6b7280', 'borderRadius': '12px',
-                            'fontSize': '12px', 'color': '#fff'
+                            'fontSize': '12px', 'color': '#fff',
+                            'marginRight': '20px'
                         }),
-                    ], style={'display': 'flex', 'alignItems': 'center', 'flex': '1'}),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'flex': '1', 'flexWrap': 'wrap', 'gap': '10px'}),
                     
                     # Right side - Bulk action buttons
                     html.Div([
@@ -4836,141 +4860,6 @@ def create_layout():
                     'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
                     'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
                     'zIndex': '10000', 'paddingTop': '100px'
-                }),
-                
-                # Jira Settings Modal
-                html.Div([
-                    html.Div([
-                        html.H4("⚙️ Jira Integration Settings", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
-                        
-                        html.Div([
-                            html.Label("Jira Server URL:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Input(
-                                id='jira-server-url',
-                                type='text',
-                                placeholder='https://your-company.atlassian.net',
-                                style={
-                                    'width': '100%', 'padding': '10px',
-                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
-                                    'border': '1px solid #555', 'borderRadius': '4px',
-                                    'marginBottom': '15px'
-                                }
-                            ),
-                        ]),
-                        
-                        html.Div([
-                            html.Label("Username (Email):", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Input(
-                                id='jira-username',
-                                type='text',
-                                placeholder='your.email@company.com',
-                                style={
-                                    'width': '100%', 'padding': '10px',
-                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
-                                    'border': '1px solid #555', 'borderRadius': '4px',
-                                    'marginBottom': '15px'
-                                }
-                            ),
-                        ]),
-                        
-                        html.Div([
-                            html.Label("API Token:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Input(
-                                id='jira-api-token',
-                                type='password',
-                                placeholder='Your Jira API token',
-                                style={
-                                    'width': '100%', 'padding': '10px',
-                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
-                                    'border': '1px solid #555', 'borderRadius': '4px',
-                                    'marginBottom': '15px'
-                                }
-                            ),
-                        ]),
-                        
-                        html.Div([
-                            html.Label("Project Key:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Input(
-                                id='jira-project-key',
-                                type='text',
-                                placeholder='SEC, SECOPS, etc.',
-                                style={
-                                    'width': '100%', 'padding': '10px',
-                                    'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
-                                    'border': '1px solid #555', 'borderRadius': '4px',
-                                    'marginBottom': '15px'
-                                }
-                            ),
-                        ]),
-                        
-                        html.Div([
-                            html.Label("Issue Type:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
-                            dcc.Dropdown(
-                                id='jira-issue-type',
-                                options=[
-                                    {'label': 'Task', 'value': 'Task'},
-                                    {'label': 'Bug', 'value': 'Bug'},
-                                    {'label': 'Story', 'value': 'Story'},
-                                    {'label': 'Security', 'value': 'Security'},
-                                ],
-                                value='Task',
-                                style={'backgroundColor': '#1e1e1e', 'marginBottom': '15px'}
-                            ),
-                        ]),
-                        
-                        html.Div(id='jira-connection-status', style={
-                            'marginBottom': '10px', 'padding': '10px',
-                            'borderRadius': '4px', 'backgroundColor': '#374151'
-                        }),
-                        
-                        html.Div(id='jira-save-status', style={
-                            'marginBottom': '15px', 'padding': '10px',
-                            'borderRadius': '4px', 'backgroundColor': '#374151'
-                        }),
-                        
-                        html.Div([
-                            html.Button(
-                                "🔗 Test Connection", 
-                                id='btn-test-jira',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#0052cc', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer',
-                                    'marginRight': '10px', 'fontWeight': 'bold'
-                                }
-                            ),
-                            html.Button(
-                                "💾 Save Settings", 
-                                id='btn-save-jira',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#16a34a', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer',
-                                    'marginRight': '10px', 'fontWeight': 'bold'
-                                }
-                            ),
-                            html.Button(
-                                "Close", 
-                                id='btn-close-jira-settings',
-                                n_clicks=0,
-                                style={
-                                    'backgroundColor': '#6b7280', 'color': 'white',
-                                    'border': 'none', 'padding': '10px 20px',
-                                    'borderRadius': '6px', 'cursor': 'pointer'
-                                }
-                            ),
-                        ], style={'textAlign': 'right'})
-                    ], style={
-                        'backgroundColor': '#2d3748', 'padding': '25px',
-                        'borderRadius': '8px', 'maxWidth': '500px',
-                        'margin': '0 auto', 'border': '1px solid #555'
-                    })
-                ], id='jira-settings-modal', style={
-                    'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
-                    'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
-                    'zIndex': '10000', 'paddingTop': '50px'
                 }),
                 
                 # Project Management Modal
@@ -5392,6 +5281,141 @@ def create_layout():
                 )
             ], id="all-findings-container", className="data-table", style={'display': 'none'}),
 
+            # Jira Settings Modal (shared between both views - must be outside containers)
+            html.Div([
+                html.Div([
+                    html.H4("⚙️ Jira Integration Settings", style={'color': '#e0e0e0', 'marginBottom': '20px'}),
+                    
+                    html.Div([
+                        html.Label("Jira Server URL:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(
+                            id='jira-server-url',
+                            type='text',
+                            placeholder='https://your-company.atlassian.net',
+                            style={
+                                'width': '100%', 'padding': '10px',
+                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '4px',
+                                'marginBottom': '15px'
+                            }
+                        ),
+                    ]),
+                    
+                    html.Div([
+                        html.Label("Username (Email):", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(
+                            id='jira-username',
+                            type='text',
+                            placeholder='your.email@company.com',
+                            style={
+                                'width': '100%', 'padding': '10px',
+                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '4px',
+                                'marginBottom': '15px'
+                            }
+                        ),
+                    ]),
+                    
+                    html.Div([
+                        html.Label("API Token:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(
+                            id='jira-api-token',
+                            type='password',
+                            placeholder='Your Jira API token',
+                            style={
+                                'width': '100%', 'padding': '10px',
+                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '4px',
+                                'marginBottom': '15px'
+                            }
+                        ),
+                    ]),
+                    
+                    html.Div([
+                        html.Label("Project Key:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Input(
+                            id='jira-project-key',
+                            type='text',
+                            placeholder='SEC, SECOPS, etc.',
+                            style={
+                                'width': '100%', 'padding': '10px',
+                                'backgroundColor': '#1e1e1e', 'color': '#e0e0e0',
+                                'border': '1px solid #555', 'borderRadius': '4px',
+                                'marginBottom': '15px'
+                            }
+                        ),
+                    ]),
+                    
+                    html.Div([
+                        html.Label("Issue Type:", style={'color': '#b0b0b0', 'marginBottom': '5px', 'display': 'block'}),
+                        dcc.Dropdown(
+                            id='jira-issue-type',
+                            options=[
+                                {'label': 'Task', 'value': 'Task'},
+                                {'label': 'Bug', 'value': 'Bug'},
+                                {'label': 'Story', 'value': 'Story'},
+                                {'label': 'Security', 'value': 'Security'},
+                            ],
+                            value='Task',
+                            style={'backgroundColor': '#1e1e1e', 'marginBottom': '15px'}
+                        ),
+                    ]),
+                    
+                    html.Div(id='jira-connection-status', style={
+                        'marginBottom': '10px', 'padding': '10px',
+                        'borderRadius': '4px', 'backgroundColor': '#374151'
+                    }),
+                    
+                    html.Div(id='jira-save-status', style={
+                        'marginBottom': '15px', 'padding': '10px',
+                        'borderRadius': '4px', 'backgroundColor': '#374151'
+                    }),
+                    
+                    html.Div([
+                        html.Button(
+                            "🔗 Test Connection", 
+                            id='btn-test-jira',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#0052cc', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "💾 Save Settings", 
+                            id='btn-save-jira',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#16a34a', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer',
+                                'marginRight': '10px', 'fontWeight': 'bold'
+                            }
+                        ),
+                        html.Button(
+                            "Close", 
+                            id='btn-close-jira-settings',
+                            n_clicks=0,
+                            style={
+                                'backgroundColor': '#6b7280', 'color': 'white',
+                                'border': 'none', 'padding': '10px 20px',
+                                'borderRadius': '6px', 'cursor': 'pointer'
+                            }
+                        ),
+                    ], style={'textAlign': 'right'})
+                ], style={
+                    'backgroundColor': '#2d3748', 'padding': '25px',
+                    'borderRadius': '8px', 'maxWidth': '500px',
+                    'margin': '0 auto', 'border': '1px solid #555'
+                })
+            ], id='jira-settings-modal', style={
+                'display': 'none', 'position': 'fixed', 'top': '0', 'left': '0',
+                'right': '0', 'bottom': '0', 'backgroundColor': 'rgba(0,0,0,0.7)',
+                'zIndex': '10000', 'paddingTop': '50px'
+            }),
+
             # Finding Detail Modal (opens when clicking a table row)
             html.Div([
                 html.Div(id="modal-backdrop", className="modal-backdrop"),
@@ -5565,7 +5589,11 @@ SecretSnipe Security Team''',
                         html.Label("Finding Category:", style={'color': '#e0e0e0', 'marginBottom': '8px', 'display': 'block'}),
                         # Categories loaded dynamically from database
                         dcc.Dropdown(id='category-selector', options=[], value=None, 
-                                     placeholder='Select a category...', style={'backgroundColor': '#1e1e1e'})
+                                     placeholder='Select a category...', 
+                                     searchable=True,
+                                     clearable=True,
+                                     style={'backgroundColor': '#1e1e1e'}),
+                        html.Div(id='category-preview', style={'marginTop': '10px', 'fontSize': '12px', 'color': '#9ca3af'})
                     ], style={'marginBottom': '15px'}),
                     
                     # Link to manage categories

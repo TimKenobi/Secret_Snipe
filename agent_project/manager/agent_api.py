@@ -12,6 +12,7 @@ Endpoints:
 
 import os
 import sys
+import json
 import logging
 import secrets
 import hashlib
@@ -1492,6 +1493,11 @@ class AgentCommand(BaseModel):
     parameters: Dict[str, Any] = {}
 
 
+class CommandResult(BaseModel):
+    """Request model for command completion result"""
+    result: Dict[str, Any] = {}
+
+
 @app.post(f"/api/{API_VERSION}/agents/{{agent_id}}/command")
 async def send_agent_command(agent_id: str, request: AgentCommand, key_info: Dict = Depends(verify_api_key)):
     """Send a command to an agent (will be picked up on next heartbeat)"""
@@ -1519,9 +1525,9 @@ async def get_pending_commands(agent_id: str, key_info: Dict = Depends(verify_ap
 
 
 @app.post(f"/api/{API_VERSION}/agents/{{agent_id}}/commands/{{command_id}}/complete")
-async def complete_command(agent_id: str, command_id: str, result: Dict[str, Any] = {}, key_info: Dict = Depends(verify_api_key)):
+async def complete_command(agent_id: str, command_id: str, body: CommandResult = CommandResult(), key_info: Dict = Depends(verify_api_key)):
     """Mark a command as completed and store result"""
-    db_manager.complete_command(command_id, result)
+    db_manager.complete_command(command_id, body.result)
     return APIResponse(success=True, message="Command completed").to_dict()
 
 

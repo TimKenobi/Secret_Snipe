@@ -1,0 +1,48 @@
+# SecretSnipe Agent Dashboard - Dockerfile
+# Builds the Dash-based agent management dashboard
+
+FROM python:3.11-slim
+
+LABEL maintainer="SecretSnipe Team"
+LABEL description="SecretSnipe Agent Management Dashboard"
+LABEL version="1.0.0"
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r secretsnipe && useradd -r -g secretsnipe secretsnipe
+
+# Set work directory
+WORKDIR /app
+
+# Copy requirements first for caching
+COPY manager/requirements.txt /app/requirements.txt
+
+# Install additional dashboard dependencies
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir dash dash-bootstrap-components plotly pandas
+
+# Copy application code
+COPY shared/ /app/shared/
+COPY manager/ /app/manager/
+
+# Create directories and set permissions
+RUN mkdir -p /app/logs && chown -R secretsnipe:secretsnipe /app
+
+# Switch to non-root user
+USER secretsnipe
+
+# Expose port
+EXPOSE 8051
+
+# Default command - use enterprise dashboard
+CMD ["python", "manager/agent_dashboard_enterprise.py"]

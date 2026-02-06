@@ -1,0 +1,54 @@
+# SecretSnipe Agent Manager - Dockerfile
+# Builds the FastAPI-based agent management server
+
+FROM python:3.11-slim
+
+LABEL maintainer="SecretSnipe Team"
+LABEL description="SecretSnipe Agent Manager API Server"
+LABEL version="1.0.0"
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Create non-root user
+RUN groupadd -r secretsnipe && useradd -r -g secretsnipe secretsnipe
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set work directory
+WORKDIR /app
+
+# Copy requirements first for caching
+COPY manager/requirements.txt /app/requirements.txt
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY shared/ /app/shared/
+COPY manager/ /app/manager/
+
+# Create logs directory
+RUN mkdir -p /app/logs && chown -R secretsnipe:secretsnipe /app
+
+# Switch to non-root user
+USER secretsnipe
+
+# Expose ports
+EXPOSE 8443 8051
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8443/api/v1/health || exit 1
+
+# Default command
+CMD ["python", "-m", "uvicorn", "manager.agent_api:app", "--host", "0.0.0.0", "--port", "8443"]

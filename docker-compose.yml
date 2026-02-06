@@ -219,6 +219,84 @@ services:
       - /tmp
     command: ["python", "unified_visualizer_pg.py"]
 
+  # SecretSnipe Visualizer V2 (Agent Administration Prototype)
+  visualizer-v2:
+    build: .
+    container_name: secretsnipe-visualizer-v2
+    environment:
+      # Database - V2 uses SEPARATE database for clean testing
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secretsnipe_v2
+      DB_USER: secretsnipe
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Redis - separate DB index for V2
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 1
+      # Dashboard Security
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: 8052
+      DASHBOARD_DEBUG: "false"
+      DASHBOARD_RATE_LIMIT: "true"
+      # Email Configuration (optional - can also be set via GUI)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-SecretSnipe Security}
+      EMAIL_ESCALATION_DAYS: ${EMAIL_ESCALATION_DAYS:-7}
+      # Application
+      LOG_LEVEL: INFO
+      DEBUG: "false"
+    ports:
+      - "8052:8052"  # V2 dashboard port
+    volumes:
+      - ./signatures.json:/app/signatures.json:ro
+      - ./config.json:/app/config.json:ro
+      - ./logs:/app/logs
+      - ./dashboard_audit.log:/app/dashboard_audit.log
+      - ./jira_config:/app/jira_config
+      - ./assets:/app/assets:ro
+      # V2 specific files
+      - ./unified_visualizer_v2.py:/app/unified_visualizer_v2.py:ro
+      - ./agent_administration.py:/app/agent_administration.py:ro
+      # Agent installer for downloads
+      - ./agent_project/windows_installer:/app/agent_project/windows_installer:ro
+      # Shared Python files
+      - ./database_manager.py:/app/database_manager.py:ro
+      - ./redis_manager.py:/app/redis_manager.py:ro
+      - ./config.py:/app/config.py:ro
+      - ./jira_manager.py:/app/jira_manager.py:ro
+      - ./email_manager.py:/app/email_manager.py:ro
+      - ./project_manager.py:/app/project_manager.py:ro
+    networks:
+      - stahlsitsec_web
+      - secretsnipe-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.25'
+        reservations:
+          memory: 256M
+          cpus: '0.125'
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: ["python", "unified_visualizer_v2.py"]
+    profiles:
+      - v2  # Only starts with: docker compose --profile v2 up
+
   # Webhook Service (Optional)
   webhook-service:
     build: .

@@ -71,3 +71,5 @@ config.json
 
 # Cookie files
 cookies.txt
+agent_project/test_secrets_sample.txt
+**/test_secrets*.txt

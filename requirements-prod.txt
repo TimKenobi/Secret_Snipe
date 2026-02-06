@@ -5,6 +5,7 @@ sqlalchemy>=2.0.0  # ORM for complex queries
 
 # Dashboard dependencies
 dash>=2.0.0
+dash-bootstrap-components>=1.5.0  # For agent administration UI
 pandas>=2.0.0
 plotly>=5.0.0
 networkx>=3.0

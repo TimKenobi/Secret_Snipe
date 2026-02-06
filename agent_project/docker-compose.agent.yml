@@ -1,0 +1,174 @@
+# SecretSnipe Agent Infrastructure - Docker Compose
+# This is SEPARATE from the main SecretSnipe deployment
+# Run with: docker-compose -f docker-compose.agent.yml up -d
+
+version: '3.8'
+
+services:
+  # ===== Agent Manager API =====
+  agent-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile.manager
+    container_name: secretsnipe-agent-manager
+    restart: unless-stopped
+    ports:
+      - "8443:8443"      # Agent API
+    environment:
+      # Database
+      - DATABASE_URL=postgresql://secretsnipe:${DB_PASSWORD:-secretsnipe_secure_pass}@agent-db:5432/secretsnipe_agents
+      
+      # Redis for caching/pubsub
+      - REDIS_URL=redis://agent-redis:6379/0
+      
+      # API Settings
+      - API_HOST=0.0.0.0
+      - API_PORT=8443
+      - API_WORKERS=4
+      
+      # Security
+      - BOOTSTRAP_ENABLED=${BOOTSTRAP_ENABLED:-true}
+      - BOOTSTRAP_TOKEN=${BOOTSTRAP_TOKEN:-}
+      - SSL_ENABLED=${SSL_ENABLED:-false}
+      - SSL_CERT_FILE=/certs/server.crt
+      - SSL_KEY_FILE=/certs/server.key
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # Agent Settings
+      - AGENT_TIMEOUT_SECONDS=120
+      - JOB_TIMEOUT_SECONDS=3600
+      
+    volumes:
+      # SSL Certificates (optional)
+      - ./certs:/certs:ro
+      
+      # Logs
+      - agent_manager_logs:/app/logs
+      
+    depends_on:
+      agent-db:
+        condition: service_healthy
+      agent-redis:
+        condition: service_healthy
+    
+    networks:
+      - agent-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8443/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    labels:
+      - "com.secretsnipe.component=agent-manager"
+      - "com.secretsnipe.description=Agent Management API Server"
+
+  # ===== Agent Dashboard =====
+  agent-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: secretsnipe-agent-dashboard
+    restart: unless-stopped
+    ports:
+      - "8051:8051"      # Dashboard Web UI
+    environment:
+      # API Connection - Enterprise Dashboard uses MANAGER_URL and API_KEY
+      - MANAGER_URL=http://agent-manager:8443
+      - API_KEY=${DASHBOARD_API_KEY:-G7HEyqLjUfpB-nes--YzsbYMYXuQNiQfeYDjxuxUSC5-nDZBylR8CsMr_PtsWQSdR-Sz7jsUwdMDCMpefPSX2w}
+      - SECRETSNIPE_API_KEY=${DASHBOARD_API_KEY:-G7HEyqLjUfpB-nes--YzsbYMYXuQNiQfeYDjxuxUSC5-nDZBylR8CsMr_PtsWQSdR-Sz7jsUwdMDCMpefPSX2w}
+      
+      # Dashboard Settings
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=8051
+      - DEBUG=false
+      
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+    depends_on:
+      agent-manager:
+        condition: service_healthy
+      agent-db:
+        condition: service_healthy
+    
+    networks:
+      - agent-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8051/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    
+    labels:
+      - "com.secretsnipe.component=agent-dashboard"
+      - "com.secretsnipe.description=Agent Management Dashboard UI"
+
+  # ===== Agent Database =====
+  agent-db:
+    image: postgres:15-alpine
+    container_name: secretsnipe-agent-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=secretsnipe
+      - POSTGRES_PASSWORD=${DB_PASSWORD:-secretsnipe_secure_pass}
+      - POSTGRES_DB=secretsnipe_agents
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - agent_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_agent_db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5433:5432"  # Different port to avoid conflict with main DB
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U secretsnipe -d secretsnipe_agents"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.secretsnipe.component=agent-database"
+
+  # ===== Agent Redis =====
+  agent-redis:
+    image: redis:7-alpine
+    container_name: secretsnipe-agent-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - agent_redis_data:/data
+    ports:
+      - "6380:6379"  # Different port to avoid conflict with main Redis
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels:
+      - "com.secretsnipe.component=agent-redis"
+
+# ===== Networks =====
+networks:
+  agent-network:
+    name: secretsnipe-agent-network
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+# ===== Volumes =====
+volumes:
+  agent_postgres_data:
+    name: secretsnipe_agent_postgres
+  agent_redis_data:
+    name: secretsnipe_agent_redis
+  agent_manager_logs:
+    name: secretsnipe_agent_logs

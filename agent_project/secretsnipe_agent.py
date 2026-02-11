@@ -745,8 +745,26 @@ class SecretSnipeAgent:
             logger.error(f"Error walking {directory}: {e}")
         return files
     
+    def _normalize_path(self, path: str) -> str:
+        """
+        Normalize file paths to use consistent backslashes on Windows.
+        This ensures findings from different scanners (gitleaks uses /, custom uses \\)
+        are deduplicated properly.
+        """
+        if platform.system() == "Windows":
+            # Convert forward slashes to backslashes on Windows
+            return path.replace('/', '\\')
+        else:
+            # Convert backslashes to forward slashes on Linux
+            return path.replace('\\', '/')
+    
     def _submit_findings(self, job_id, findings):
         logger.info(f"📤 Submitting {len(findings)} findings for job {job_id}")
+        
+        # Normalize all file paths before submission
+        for finding in findings:
+            if 'file_path' in finding:
+                finding['file_path'] = self._normalize_path(finding['file_path'])
         
         batch_size = 100
         for i in range(0, len(findings), batch_size):

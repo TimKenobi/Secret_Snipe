@@ -1995,14 +1995,14 @@ def create_administration_layout() -> html.Div:
         
         # Navigation Tabs - Reorganized for clarity
         dcc.Tabs(id='admin-tabs', value='config', children=[
-            dcc.Tab(label='⚙️ Scan Config', value='config', className='admin-tab'),
-            dcc.Tab(label='🖥️ Agents', value='overview', className='admin-tab'),
-            dcc.Tab(label='📋 Jobs', value='jobs', className='admin-tab'),
-            dcc.Tab(label='📅 Schedules', value='schedules', className='admin-tab'),
-            dcc.Tab(label='� Contacts', value='contacts', className='admin-tab'),
-            dcc.Tab(label='�🔑 API Keys', value='apikeys', className='admin-tab'),
-            dcc.Tab(label='📜 Logs', value='logs', className='admin-tab'),
-            dcc.Tab(label='📥 Downloads', value='downloads', className='admin-tab'),
+            dcc.Tab(label='Scan Config', value='config', className='admin-tab'),
+            dcc.Tab(label='Agents', value='overview', className='admin-tab'),
+            dcc.Tab(label='Jobs', value='jobs', className='admin-tab'),
+            dcc.Tab(label='Schedules', value='schedules', className='admin-tab'),
+            dcc.Tab(label='Contacts', value='contacts', className='admin-tab'),
+            dcc.Tab(label='API Keys', value='apikeys', className='admin-tab'),
+            dcc.Tab(label='Logs', value='logs', className='admin-tab'),
+            dcc.Tab(label='Downloads', value='downloads', className='admin-tab'),
         ], style={'marginBottom': '0'}),
         
         # Tab Content

@@ -298,6 +298,11 @@ class SecretSnipeAgent:
                 result_data = self._update_agent(params.get("version", "latest"))
             elif command == "clear_cache":
                 result_data = {"cleared": True}
+            elif command == "uninstall":
+                # Complete command before uninstall
+                self._complete_command(command_id, {"status": "uninstalling"})
+                self._uninstall_agent(wipe_config=params.get("wipe_config", True))
+                return
             else:
                 result_data = {"error": f"Unknown command: {command}"}
             
@@ -434,6 +439,155 @@ class SecretSnipeAgent:
         except Exception as e:
             return {"error": str(e)}
     
+    def _uninstall_agent(self, wipe_config: bool = True):
+        """Uninstall the agent - stop service and optionally wipe config"""
+        logger.info(f"🗑️ Uninstalling agent (wipe_config={wipe_config})...")
+        
+        if platform.system() == "Windows":
+            import subprocess
+            import shutil
+            
+            install_path = Path(os.getenv("SECRETSNIPE_INSTALL_PATH", r"C:\Program Files\SecretSnipe"))
+            
+            try:
+                # Stop the service first
+                logger.info("Stopping service...")
+                subprocess.run(["sc", "stop", "SecretSnipeAgent"], capture_output=True)
+                time.sleep(2)
+                
+                if wipe_config:
+                    # Wipe configuration files
+                    config_path = install_path / "config"
+                    if config_path.exists():
+                        logger.info(f"Wiping config at {config_path}")
+                        shutil.rmtree(config_path, ignore_errors=True)
+                    
+                    # Wipe fingerprint/registration data
+                    for f in ["agent_config.json", "machine_fingerprint.txt", ".registered"]:
+                        fp = install_path / f
+                        if fp.exists():
+                            fp.unlink()
+                            logger.info(f"Removed {f}")
+                
+                # Remove the service registration
+                logger.info("Removing service registration...")
+                nssm_path = install_path / "nssm.exe"
+                if nssm_path.exists():
+                    subprocess.run([str(nssm_path), "remove", "SecretSnipeAgent", "confirm"], capture_output=True)
+                else:
+                    subprocess.run(["sc", "delete", "SecretSnipeAgent"], capture_output=True)
+                
+                logger.info("Agent uninstalled successfully")
+                
+            except Exception as e:
+                logger.error(f"Uninstall error: {e}")
+            
+            # Exit the process
+            sys.exit(0)
+        else:
+            # Linux - stop systemd service and exit
+            import subprocess
+            try:
+                subprocess.run(["systemctl", "stop", "secretsnipe-agent"], capture_output=True)
+                subprocess.run(["systemctl", "disable", "secretsnipe-agent"], capture_output=True)
+                
+                if wipe_config:
+                    config_paths = [
+                        Path("/etc/secretsnipe/config.json"),
+                        Path("/var/lib/secretsnipe/"),
+                        Path.home() / ".secretsnipe/"
+                    ]
+                    for p in config_paths:
+                        if p.exists():
+                            if p.is_dir():
+                                import shutil
+                                shutil.rmtree(p, ignore_errors=True)
+                            else:
+                                p.unlink()
+                            logger.info(f"Removed {p}")
+            except Exception as e:
+                logger.error(f"Uninstall error: {e}")
+            
+            sys.exit(0)
+    
+    def _mount_network_share(self, unc_path: str, username: str = None, password: str = None, drive_letter: str = None) -> str:
+        """
+        Mount a network share (CIFS/SMB) on Windows.
+        
+        Args:
+            unc_path: UNC path like \\\\server\\share
+            username: Domain\\username or just username
+            password: Password for the share
+            drive_letter: Optional drive letter to map (e.g., 'Z:')
+            
+        Returns:
+            The path to use for scanning (drive letter if mapped, else UNC)
+        """
+        if platform.system() != "Windows":
+            logger.warning("Network share mounting only supported on Windows")
+            return unc_path
+        
+        import subprocess
+        
+        # Normalize the path
+        unc_path = unc_path.replace('/', '\\')
+        if not unc_path.startswith('\\\\'):
+            unc_path = '\\\\' + unc_path.lstrip('\\')
+        
+        try:
+            # Check if share is already accessible
+            if Path(unc_path).exists():
+                logger.info(f"Network share already accessible: {unc_path}")
+                return unc_path
+            
+            # Try to mount with credentials
+            if drive_letter:
+                # Map to a drive letter
+                cmd = ['net', 'use', drive_letter, unc_path]
+                if username and password:
+                    cmd.extend([f'/user:{username}', password])
+                cmd.append('/persistent:no')
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    logger.info(f"Mapped {unc_path} to {drive_letter}")
+                    return drive_letter
+                else:
+                    logger.error(f"Failed to map drive: {result.stderr}")
+            else:
+                # Just establish the connection without mapping
+                cmd = ['net', 'use', unc_path]
+                if username and password:
+                    cmd.extend([f'/user:{username}', password])
+                cmd.append('/persistent:no')
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode == 0:
+                    logger.info(f"Connected to network share: {unc_path}")
+                    return unc_path
+                else:
+                    logger.error(f"Failed to connect to share: {result.stderr}")
+                    
+        except Exception as e:
+            logger.error(f"Error mounting network share {unc_path}: {e}")
+        
+        return unc_path
+    
+    def _unmount_network_share(self, path: str):
+        """Unmount a previously mounted network share"""
+        if platform.system() != "Windows":
+            return
+        
+        import subprocess
+        
+        try:
+            # Only unmount if it's a drive letter we mapped
+            if len(path) == 2 and path[1] == ':':
+                subprocess.run(['net', 'use', path, '/delete', '/y'], capture_output=True)
+                logger.info(f"Unmounted {path}")
+        except Exception as e:
+            logger.warning(f"Error unmounting {path}: {e}")
+    
     def poll_for_jobs(self):
         while self.running:
             try:
@@ -450,6 +604,7 @@ class SecretSnipeAgent:
     def _execute_job(self, job):
         job_id = job.get("job_id")
         scan_paths = job.get("scan_paths", [])
+        share_credentials = job.get("share_credentials", {})  # Optional credentials for network shares
         
         logger.info(f"🔍 Starting job {job_id} on {len(scan_paths)} paths")
         
@@ -458,10 +613,26 @@ class SecretSnipeAgent:
         
         all_findings = []
         files_scanned = 0
+        mounted_shares = []  # Track what we mounted so we can clean up
         
         try:
             for scan_path in scan_paths:
-                path = Path(scan_path)
+                actual_path = scan_path
+                
+                # Check if this is a network share (UNC path)
+                if scan_path.startswith('\\\\') or scan_path.startswith('//'):
+                    # Try to mount the share
+                    share_creds = share_credentials.get(scan_path, {})
+                    actual_path = self._mount_network_share(
+                        scan_path,
+                        username=share_creds.get('username'),
+                        password=share_creds.get('password'),
+                        drive_letter=share_creds.get('drive_letter')
+                    )
+                    if actual_path != scan_path:
+                        mounted_shares.append(actual_path)
+                
+                path = Path(actual_path)
                 if not path.exists():
                     logger.warning(f"Path not found: {scan_path}")
                     continue
@@ -491,6 +662,10 @@ class SecretSnipeAgent:
                 "status": "failed",
                 "error_message": str(e)
             })
+        finally:
+            # Clean up any mounted shares
+            for share in mounted_shares:
+                self._unmount_network_share(share)
     
     def _scan_path(self, path):
         findings = []

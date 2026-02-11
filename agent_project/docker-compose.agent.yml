@@ -87,6 +87,10 @@ services:
       - DASHBOARD_PORT=8051
       - DEBUG=false
       
+      # Dashboard Authentication
+      - DASH_USERNAME=${DASH_USERNAME:-admin}
+      - DASH_PASSWORD=${DASH_PASSWORD:-secretsnipe}
+      
       # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       

@@ -952,9 +952,22 @@ def create_agent_overview_section() -> html.Div:
                     html.Button("Status", id='admin-agent-status', className='btn-secondary',
                                title='Get detailed agent status',
                                style={'marginRight': '10px'}),
+                    html.Button("Uninstall", id='admin-agent-uninstall', className='btn-danger',
+                               title='Uninstall agent from remote machine (sends command)',
+                               style={'marginRight': '10px'}),
                     html.Button("Remove", id='admin-agent-remove', className='btn-warning',
-                               title='Remove agent registration'),
+                               title='Remove agent registration from database only'),
                 ], style={'marginBottom': '15px'}),
+                
+                # Uninstall options
+                html.Div([
+                    dcc.Checklist(
+                        id='admin-uninstall-wipe-config',
+                        options=[{'label': ' Wipe configuration on uninstall (recommended)', 'value': 'wipe'}],
+                        value=['wipe'],
+                        style={'color': '#e0e0e0', 'fontSize': '13px'}
+                    ),
+                ], style={'marginBottom': '15px', 'paddingLeft': '5px'}),
                 
                 # Bulk Actions
                 html.Div([
@@ -3128,13 +3141,15 @@ def integrate_with_unified_visualizer(app, db_manager):
          Input('admin-agent-update', 'n_clicks'),
          Input('admin-agent-repair', 'n_clicks'),
          Input('admin-agent-status', 'n_clicks'),
+         Input('admin-agent-uninstall', 'n_clicks'),
          Input('admin-agent-remove', 'n_clicks'),
          Input('admin-bulk-update', 'n_clicks'),
          Input('admin-bulk-restart', 'n_clicks')],
-        State('admin-selected-agent-id', 'data'),
+        [State('admin-selected-agent-id', 'data'),
+         State('admin-uninstall-wipe-config', 'value')],
         prevent_initial_call=True
     )
-    def handle_agent_commands(restart_clicks, update_clicks, repair_clicks, status_clicks, remove_clicks, bulk_update_clicks, bulk_restart_clicks, agent_id):
+    def handle_agent_commands(restart_clicks, update_clicks, repair_clicks, status_clicks, uninstall_clicks, remove_clicks, bulk_update_clicks, bulk_restart_clicks, agent_id, wipe_config):
         """Handle agent management commands"""
         from dash import ctx
         trigger = ctx.triggered_id
@@ -3179,10 +3194,20 @@ def integrate_with_unified_visualizer(app, db_manager):
                 command_id = agent_db.queue_agent_command(agent_id, 'status', {})
                 return html.Div(f"📊 Status request queued (ID: {command_id[:8]}...) - Check logs for detailed output", style={'color': '#4dabf7'})
             
+            elif trigger == 'admin-agent-uninstall':
+                # Send uninstall command to agent (will stop service and optionally wipe config)
+                do_wipe = 'wipe' in (wipe_config or [])
+                command_id = agent_db.queue_agent_command(agent_id, 'uninstall', {'wipe_config': do_wipe})
+                return html.Div([
+                    html.Span("🗑️ Uninstall command queued. "),
+                    html.Span(f"Agent will stop service and {'wipe config' if do_wipe else 'preserve config'}. "),
+                    html.Span(f"(ID: {command_id[:8]}...)", style={'color': '#666', 'fontSize': '12px'})
+                ], style={'color': '#f6ad55'})
+            
             elif trigger == 'admin-agent-remove':
-                # Direct database delete
+                # Direct database delete (does NOT uninstall from remote machine)
                 agent_db.delete_agent(agent_id)
-                return html.Div(f"🗑️ Agent removed successfully", style={'color': '#ecc94b'})
+                return html.Div("🗑️ Agent removed from database (not uninstalled from remote machine)", style={'color': '#ecc94b'})
             
         except Exception as e:
             return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})

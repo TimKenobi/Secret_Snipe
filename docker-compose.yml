@@ -230,6 +230,12 @@ services:
       DB_NAME: secretsnipe_v2
       DB_USER: secretsnipe
       DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
+      # Agent Database config (for agent mode)
+      AGENT_DB_HOST: 10.150.110.24
+      AGENT_DB_PORT: 5433
+      AGENT_DB_NAME: secretsnipe_agents
+      AGENT_DB_USER: secretsnipe
+      AGENT_DB_PASSWORD: secretsnipe_secure_pass
       # Redis - separate DB index for V2
       REDIS_HOST: redis
       REDIS_PORT: 6379

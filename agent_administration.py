@@ -24,10 +24,19 @@ from functools import wraps
 import hashlib
 
 from dash import html, dcc, dash_table, Input, Output, State, callback, no_update, ALL, MATCH
+from dash.exceptions import PreventUpdate
 import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# Import redis_manager for scan mode storage
+try:
+    import redis_manager
+    REDIS_AVAILABLE = True
+except ImportError:
+    redis_manager = None
+    REDIS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -90,8 +99,8 @@ class AgentDatabaseManager:
                 (SELECT COUNT(*) FROM agent_jobs WHERE status = 'pending') as pending_jobs,
                 (SELECT COUNT(*) FROM agent_jobs WHERE status = 'running') as running_jobs,
                 (SELECT COUNT(*) FROM agent_findings WHERE status = 'open') as open_findings,
-                (SELECT COUNT(*) FROM agent_findings WHERE status = 'open' AND severity = 'Critical') as critical_findings,
-                (SELECT COUNT(*) FROM agent_findings WHERE status = 'open' AND severity = 'High') as high_findings
+                (SELECT COUNT(*) FROM agent_findings WHERE status = 'open' AND UPPER(severity) = 'CRITICAL') as critical_findings,
+                (SELECT COUNT(*) FROM agent_findings WHERE status = 'open' AND UPPER(severity) = 'HIGH') as high_findings
             FROM agents
         """
         try:
@@ -117,7 +126,8 @@ class AgentDatabaseManager:
                 last_heartbeat,
                 EXTRACT(EPOCH FROM (NOW() - last_heartbeat)) as seconds_since_heartbeat,
                 capabilities,
-                registered_at
+                registered_at,
+                agent_version
             FROM agents
         """
         
@@ -177,7 +187,8 @@ class AgentDatabaseManager:
             return []
     
     def create_job(self, agent_id: str, scan_paths: List[str], scanners: List[str] = None,
-                   job_type: str = 'scan', priority: int = 5) -> Optional[Dict]:
+                   job_type: str = 'scan', priority: int = 5, 
+                   continuous: bool = False, interval_minutes: int = None) -> Optional[Dict]:
         """Create a new scan job in agent manager database"""
         import uuid
         job_id = str(uuid.uuid4())
@@ -186,11 +197,19 @@ class AgentDatabaseManager:
         try:
             conn = self._get_agent_db_connection()
             cur = conn.cursor()
+            
+            # Build metadata for continuous jobs
+            metadata = {}
+            if continuous and interval_minutes:
+                metadata['continuous'] = True
+                metadata['interval_minutes'] = interval_minutes
+                metadata['next_run'] = None  # Will be set after first completion
+            
             cur.execute("""
-                INSERT INTO agent_jobs (job_id, agent_id, job_type, scan_paths, scanners, priority, status)
-                VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s::jsonb, %s, 'pending')
+                INSERT INTO agent_jobs (job_id, agent_id, job_type, scan_paths, scanners, priority, status, metadata)
+                VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s::jsonb, %s, 'pending', %s::jsonb)
                 RETURNING *
-            """, (job_id, agent_id, job_type, json.dumps(scan_paths), json.dumps(scanners), priority))
+            """, (job_id, agent_id, job_type, json.dumps(scan_paths), json.dumps(scanners), priority, json.dumps(metadata)))
             result = cur.fetchone()
             conn.commit()
             cur.close()
@@ -227,7 +246,7 @@ class AgentDatabaseManager:
         if status:
             conditions.append(f"af.status = '{status}'")
         if severity:
-            conditions.append(f"af.severity = '{severity}'")
+            conditions.append(f"UPPER(af.severity) = UPPER('{severity}')")
         if agent_id:
             conditions.append(f"af.agent_id = '{agent_id}'::uuid")
         
@@ -472,6 +491,200 @@ class AgentDatabaseManager:
             return affected > 0
         except Exception as e:
             logger.error(f"Error deleting agent: {e}")
+            return False
+    
+    # ========== ADDRESS BOOK / CONTACTS MANAGEMENT ==========
+    
+    def list_contacts(self, active_only: bool = False) -> List[Dict]:
+        """List all contacts from address book"""
+        query = """
+            SELECT * FROM address_book
+        """
+        if active_only:
+            query += " WHERE is_active = TRUE"
+        query += " ORDER BY name"
+        
+        try:
+            results = self._execute_agent_query(query)
+            return [dict(r) for r in results] if results else []
+        except Exception as e:
+            logger.error(f"Error listing contacts: {e}")
+            return []
+    
+    def add_contact(self, name: str, email: str, department: str = None, 
+                    title: str = None, phone: str = None, notes: str = None) -> Optional[Dict]:
+        """Add a new contact to the address book"""
+        import uuid
+        contact_id = str(uuid.uuid4())
+        
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO address_book (contact_id, name, email, department, title, phone, notes)
+                VALUES (%s::uuid, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (email) DO UPDATE SET 
+                    name = EXCLUDED.name,
+                    department = EXCLUDED.department,
+                    title = EXCLUDED.title,
+                    phone = EXCLUDED.phone,
+                    notes = EXCLUDED.notes,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING *
+            """, (contact_id, name, email, department, title, phone, notes))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"Error adding contact: {e}")
+            return None
+    
+    def update_contact(self, contact_id: str, name: str = None, email: str = None,
+                       department: str = None, title: str = None, 
+                       phone: str = None, notes: str = None, is_active: bool = None) -> bool:
+        """Update a contact in the address book"""
+        updates = []
+        params = []
+        
+        if name is not None:
+            updates.append("name = %s")
+            params.append(name)
+        if email is not None:
+            updates.append("email = %s")
+            params.append(email)
+        if department is not None:
+            updates.append("department = %s")
+            params.append(department)
+        if title is not None:
+            updates.append("title = %s")
+            params.append(title)
+        if phone is not None:
+            updates.append("phone = %s")
+            params.append(phone)
+        if notes is not None:
+            updates.append("notes = %s")
+            params.append(notes)
+        if is_active is not None:
+            updates.append("is_active = %s")
+            params.append(is_active)
+        
+        if not updates:
+            return True
+        
+        params.append(contact_id)
+        query = f"UPDATE address_book SET {', '.join(updates)} WHERE contact_id = %s::uuid RETURNING contact_id"
+        
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute(query, tuple(params))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return bool(result)
+        except Exception as e:
+            logger.error(f"Error updating contact: {e}")
+            return False
+    
+    def delete_contact(self, contact_id: str) -> bool:
+        """Delete a contact from the address book"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM address_book WHERE contact_id = %s::uuid", (contact_id,))
+            affected = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+            return affected > 0
+        except Exception as e:
+            logger.error(f"Error deleting contact: {e}")
+            return False
+    
+    def assign_finding_owner(self, finding_id: str, contact_id: str = None, 
+                             owner_email: str = None, owner_name: str = None,
+                             assigned_by: str = 'manual') -> bool:
+        """Assign an owner to a finding"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            
+            # If contact_id provided, get email and name from contact
+            if contact_id:
+                cur.execute("SELECT email, name FROM address_book WHERE contact_id = %s::uuid", (contact_id,))
+                contact = cur.fetchone()
+                if contact:
+                    owner_email = contact['email']
+                    owner_name = contact['name']
+            
+            cur.execute("""
+                UPDATE agent_findings 
+                SET owner_id = %s::uuid, owner_email = %s, owner_name = %s,
+                    owner_assigned_at = CURRENT_TIMESTAMP, owner_assigned_by = %s
+                WHERE finding_id = %s::uuid
+                RETURNING finding_id
+            """, (contact_id, owner_email, owner_name, assigned_by, finding_id))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return bool(result)
+        except Exception as e:
+            logger.error(f"Error assigning owner: {e}")
+            return False
+    
+    def list_path_ownership(self) -> List[Dict]:
+        """List path ownership mappings"""
+        query = """
+            SELECT po.*, ab.name as owner_name, ab.email as owner_email
+            FROM path_ownership po
+            JOIN address_book ab ON po.owner_id = ab.contact_id
+            ORDER BY po.priority DESC, po.path_pattern
+        """
+        try:
+            results = self._execute_agent_query(query)
+            return [dict(r) for r in results] if results else []
+        except Exception as e:
+            logger.error(f"Error listing path ownership: {e}")
+            return []
+    
+    def add_path_ownership(self, path_pattern: str, owner_id: str, 
+                           is_regex: bool = False, description: str = None,
+                           priority: int = 0, created_by: str = None) -> Optional[Dict]:
+        """Add a path ownership mapping"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO path_ownership (path_pattern, owner_id, is_regex, description, priority, created_by)
+                VALUES (%s, %s::uuid, %s, %s, %s, %s)
+                RETURNING *
+            """, (path_pattern, owner_id, is_regex, description, priority, created_by))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return dict(result) if result else None
+        except Exception as e:
+            logger.error(f"Error adding path ownership: {e}")
+            return None
+    
+    def delete_path_ownership(self, ownership_id: int) -> bool:
+        """Delete a path ownership mapping"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM path_ownership WHERE id = %s", (ownership_id,))
+            affected = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+            return affected > 0
+        except Exception as e:
+            logger.error(f"Error deleting path ownership: {e}")
             return False
 
 
@@ -727,18 +940,33 @@ def create_agent_overview_section() -> html.Div:
                 html.P("Select an agent above to manage it. Actions are queued and executed on the next heartbeat.",
                        style={'color': '#666', 'fontSize': '12px', 'marginBottom': '15px'}),
                 html.Div([
-                    html.Button("🔍 Discover Paths", id='admin-agent-discover-paths', className='btn-secondary',
-                               title='Request agent to list available directories/drives that can be scanned',
+                    html.Button("Restart", id='admin-agent-restart', className='btn-warning',
+                               title='Restart the agent service remotely',
                                style={'marginRight': '10px'}),
-                    html.Button("🔄 Restart Agent", id='admin-agent-restart', className='btn-warning',
-                               title='Restart the agent service remotely (may briefly interrupt scans)',
+                    html.Button("Update", id='admin-agent-update', className='btn-primary',
+                               title='Push agent software update',
                                style={'marginRight': '10px'}),
-                    html.Button("⬆️ Update Agent", id='admin-agent-update', className='btn-primary',
-                               title='Push agent software update (agent will download and restart)',
+                    html.Button("Repair", id='admin-agent-repair', className='btn-secondary',
+                               title='Reinstall Python deps and verify scanners',
                                style={'marginRight': '10px'}),
-                    html.Button("🗑️ Remove Agent", id='admin-agent-remove', className='btn-warning',
-                               title='Remove agent registration from server (agent will need to re-register)'),
+                    html.Button("Status", id='admin-agent-status', className='btn-secondary',
+                               title='Get detailed agent status',
+                               style={'marginRight': '10px'}),
+                    html.Button("Remove", id='admin-agent-remove', className='btn-warning',
+                               title='Remove agent registration'),
                 ], style={'marginBottom': '15px'}),
+                
+                # Bulk Actions
+                html.Div([
+                    html.H6("Bulk Actions (All Online)", style={'marginBottom': '10px', 'color': '#888'}),
+                    html.Button("Update All", id='admin-bulk-update', className='btn-primary',
+                               title='Update all online agents', style={'marginRight': '10px'}),
+                    html.Button("Restart All", id='admin-bulk-restart', className='btn-warning',
+                               title='Restart all online agents'),
+                ], style={'marginTop': '15px', 'paddingTop': '15px', 'borderTop': '1px solid #333'}),
+                
+                # Hidden dummy button for callback (discover paths now automatic)
+                html.Button(id='admin-agent-discover-paths', style={'display': 'none'}),
                 
                 # Store for selected agent
                 dcc.Store(id='admin-selected-agent-id', data=None),
@@ -756,6 +984,32 @@ def create_job_management_section() -> html.Div:
     return html.Div([
         html.H3("📋 Job Management", style={'marginBottom': '20px'}),
         
+        # Folder Browser Modal
+        dbc.Modal([
+            dbc.ModalHeader(dbc.ModalTitle("📁 Browse Agent Folders")),
+            dbc.ModalBody([
+                html.Div(id='folder-browser-status', style={'marginBottom': '10px'}),
+                html.Div([
+                    dcc.Input(
+                        id='folder-browser-search',
+                        type='text',
+                        placeholder='🔍 Search paths...',
+                        style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                               'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px',
+                               'marginBottom': '10px'}
+                    ),
+                ]),
+                html.Div(
+                    id='folder-browser-tree',
+                    style={'maxHeight': '400px', 'overflowY': 'auto', 'backgroundColor': '#1a1a1a',
+                           'padding': '10px', 'borderRadius': '4px', 'border': '1px solid #333'}
+                ),
+            ]),
+            dbc.ModalFooter([
+                html.Button("Cancel", id='folder-browser-cancel', className='btn-secondary'),
+            ])
+        ], id='folder-browser-modal', size='lg', is_open=False),
+        
         # Create Job Form
         html.Div([
             html.H4("Create New Scan Job"),
@@ -767,28 +1021,24 @@ def create_job_management_section() -> html.Div:
                         placeholder='Select an agent...',
                         style={'backgroundColor': '#2d2d2d'}
                     ),
-                    html.Button("🔍 Browse Paths", id='admin-browse-agent-paths', className='btn-secondary',
-                               title='Discover available paths on the selected agent',
-                               style={'marginTop': '5px', 'fontSize': '11px', 'padding': '4px 8px'}),
+                    html.Div(id='agent-paths-auto-status', style={'fontSize': '11px', 'marginTop': '3px', 'color': '#888'}),
                 ], style={'flex': '1'}),
                 
                 html.Div([
                     html.Label("Scan Path:"),
                     html.Div([
-                        dcc.Input(
-                            id='admin-job-path',
-                            type='text',
-                            placeholder='e.g., C:\\SharedDrives or /mnt/cifs',
-                            style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
-                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'}
-                        ),
-                        # Path suggestions dropdown (populated after Browse Paths)
-                        dcc.Dropdown(
-                            id='admin-job-path-suggestions',
-                            placeholder='Or select from discovered paths...',
-                            style={'backgroundColor': '#2d2d2d', 'marginTop': '5px'},
-                            options=[]
-                        ),
+                        html.Div([
+                            dcc.Input(
+                                id='admin-job-path',
+                                type='text',
+                                placeholder='e.g., C:\\SharedDrives or /mnt/cifs',
+                                style={'flex': '1', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                       'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'}
+                            ),
+                            html.Button("📁 Browse", id='admin-browse-agent-paths', className='btn-secondary',
+                                       title='Browse available folders on the selected agent',
+                                       style={'marginLeft': '5px', 'padding': '8px 12px'}),
+                        ], style={'display': 'flex', 'width': '100%'}),
                     ])
                 ], style={'flex': '2'}),
                 
@@ -807,12 +1057,40 @@ def create_job_management_section() -> html.Div:
                     )
                 ], style={'flex': '1'}),
                 
+                html.Div([
+                    html.Label("Options:"),
+                    dcc.Checklist(
+                        id='admin-job-continuous',
+                        options=[
+                            {'label': ' Continuous Scan (repeat every interval)', 'value': 'continuous'},
+                        ],
+                        value=[],
+                        style={'color': '#e0e0e0'}
+                    ),
+                    dcc.Dropdown(
+                        id='admin-job-interval',
+                        options=[
+                            {'label': 'Every 15 minutes', 'value': 15},
+                            {'label': 'Every 30 minutes', 'value': 30},
+                            {'label': 'Every hour', 'value': 60},
+                            {'label': 'Every 4 hours', 'value': 240},
+                            {'label': 'Every 12 hours', 'value': 720},
+                            {'label': 'Daily', 'value': 1440},
+                        ],
+                        value=60,
+                        placeholder='Scan interval...',
+                        style={'backgroundColor': '#2d2d2d', 'width': '180px', 'marginTop': '5px'},
+                        disabled=True
+                    )
+                ], style={'flex': '1'}),
+                
                 html.Button("🚀 Create Job", id='admin-create-job-btn', className='btn-primary',
                            title='Create a new scan job for the selected agent and path')
             ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end', 'marginBottom': '15px'}),
             
-            # Path discovery result
-            html.Div(id='admin-path-discovery-result', style={'marginBottom': '10px'}),
+            # Path discovery result (hidden, for dropdown compatibility)
+            html.Div(id='admin-path-discovery-result', style={'display': 'none'}),
+            dcc.Dropdown(id='admin-job-path-suggestions', style={'display': 'none'}, options=[]),
             html.Div(id='admin-job-result', style={'marginTop': '10px'})
         ], className='admin-form'),
         
@@ -1256,6 +1534,169 @@ def create_schedules_section() -> html.Div:
     ])
 
 
+def create_contacts_section() -> html.Div:
+    """Create the contacts / address book section"""
+    return html.Div([
+        html.H3("📇 Contacts & Ownership", style={'marginBottom': '20px'}),
+        html.P("Manage contacts for finding ownership and notifications. Assign owners to findings or set up automatic path-based ownership.", 
+               style={'color': '#888', 'marginBottom': '30px'}),
+        
+        # Add Contact Form
+        html.Div([
+            html.H4("Add New Contact", style={'marginBottom': '15px'}),
+            html.Div([
+                html.Div([
+                    html.Label("Name:"),
+                    dcc.Input(id='contact-name', type='text', placeholder='Full Name',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '1'}),
+                html.Div([
+                    html.Label("Email:"),
+                    dcc.Input(id='contact-email', type='email', placeholder='email@company.com',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '1'}),
+                html.Div([
+                    html.Label("Department:"),
+                    dcc.Input(id='contact-dept', type='text', placeholder='IT Security',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '1'}),
+                html.Div([
+                    html.Label("Phone:"),
+                    dcc.Input(id='contact-phone', type='text', placeholder='555-1234',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '0 0 150px'}),
+                html.Div([
+                    html.Label(" "),
+                    html.Button("➕ Add Contact", id='add-contact-btn', className='btn-primary',
+                               style={'width': '100%'})
+                ], style={'flex': '0 0 150px', 'display': 'flex', 'flexDirection': 'column', 'justifyContent': 'flex-end'}),
+            ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end'}),
+            html.Div(id='add-contact-result', style={'marginTop': '10px'})
+        ], className='admin-form', style={'marginBottom': '30px'}),
+        
+        # Contacts List
+        html.Div([
+            html.Div([
+                html.H4("Contact Directory"),
+                html.Button("🔄 Refresh", id='refresh-contacts-btn', className='btn-secondary',
+                           style={'marginLeft': '10px'})
+            ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '15px'}),
+            dash_table.DataTable(
+                id='contacts-table',
+                columns=[
+                    {'name': 'Name', 'id': 'name'},
+                    {'name': 'Email', 'id': 'email'},
+                    {'name': 'Department', 'id': 'department'},
+                    {'name': 'Phone', 'id': 'phone'},
+                    {'name': 'Active', 'id': 'is_active'},
+                    {'name': 'Created', 'id': 'created_at'},
+                ],
+                data=[],
+                style_table={'overflowX': 'auto'},
+                style_header={'backgroundColor': '#1e1e1e', 'color': '#e0e0e0', 'fontWeight': 'bold'},
+                style_cell={'backgroundColor': '#252525', 'color': '#e0e0e0', 'textAlign': 'left', 
+                           'padding': '10px', 'border': '1px solid #333'},
+                style_data_conditional=[
+                    {'if': {'filter_query': '{is_active} = false'}, 'color': '#888', 'fontStyle': 'italic'}
+                ],
+                row_selectable='single',
+                page_size=15,
+            ),
+            html.Div([
+                html.Button("✏️ Edit Selected", id='edit-contact-btn', className='btn-secondary',
+                           style={'marginRight': '10px'}, disabled=True),
+                html.Button("🗑️ Delete Selected", id='delete-contact-btn', className='btn-danger',
+                           disabled=True),
+            ], style={'marginTop': '10px'})
+        ], className='admin-section', style={'marginBottom': '30px'}),
+        
+        # Path Ownership Rules
+        html.Div([
+            html.H4("🗂️ Path Ownership Rules", style={'marginBottom': '15px'}),
+            html.P("Automatically assign owners to findings based on file paths. Use wildcards (*) or regex patterns.",
+                   style={'color': '#888', 'marginBottom': '20px', 'fontSize': '13px'}),
+            
+            html.Div([
+                html.Div([
+                    html.Label("Path Pattern:"),
+                    dcc.Input(id='ownership-path', type='text', 
+                             placeholder='C:\\Projects\\HR\\* or /opt/app/*',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '2'}),
+                html.Div([
+                    html.Label("Owner:"),
+                    dcc.Dropdown(id='ownership-owner', placeholder='Select owner...',
+                                style={'backgroundColor': '#2d2d2d'})
+                ], style={'flex': '1'}),
+                html.Div([
+                    html.Label("Is Regex:"),
+                    dcc.Checklist(id='ownership-regex', options=[{'label': ' ', 'value': 'regex'}],
+                                 value=[], style={'marginTop': '10px'})
+                ], style={'flex': '0 0 80px'}),
+                html.Div([
+                    html.Label(" "),
+                    html.Button("➕ Add Rule", id='add-ownership-btn', className='btn-primary',
+                               style={'width': '100%'})
+                ], style={'flex': '0 0 120px', 'display': 'flex', 'flexDirection': 'column', 'justifyContent': 'flex-end'}),
+            ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end', 'marginBottom': '15px'}),
+            html.Div(id='add-ownership-result'),
+            
+            dash_table.DataTable(
+                id='ownership-table',
+                columns=[
+                    {'name': 'Path Pattern', 'id': 'path_pattern'},
+                    {'name': 'Owner', 'id': 'owner_name'},
+                    {'name': 'Email', 'id': 'owner_email'},
+                    {'name': 'Regex', 'id': 'is_regex'},
+                    {'name': 'Priority', 'id': 'priority'},
+                ],
+                data=[],
+                style_table={'overflowX': 'auto'},
+                style_header={'backgroundColor': '#1e1e1e', 'color': '#e0e0e0', 'fontWeight': 'bold'},
+                style_cell={'backgroundColor': '#252525', 'color': '#e0e0e0', 'textAlign': 'left', 
+                           'padding': '10px', 'border': '1px solid #333'},
+                row_selectable='single',
+                page_size=10,
+            ),
+            html.Div([
+                html.Button("🗑️ Delete Rule", id='delete-ownership-btn', className='btn-danger', disabled=True),
+            ], style={'marginTop': '10px'})
+        ], className='admin-section'),
+        
+        # Bulk Assignment Section
+        html.Div([
+            html.H4("📧 Bulk Owner Assignment", style={'marginBottom': '15px'}),
+            html.P("Assign an owner to multiple findings at once.",
+                   style={'color': '#888', 'marginBottom': '20px', 'fontSize': '13px'}),
+            html.Div([
+                html.Div([
+                    html.Label("Filter Findings:"),
+                    dcc.Input(id='bulk-filter-path', type='text', placeholder='Filter by path pattern...',
+                             style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                   'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                ], style={'flex': '2'}),
+                html.Div([
+                    html.Label("Assign To:"),
+                    dcc.Dropdown(id='bulk-assign-owner', placeholder='Select owner...',
+                                style={'backgroundColor': '#2d2d2d'})
+                ], style={'flex': '1'}),
+                html.Div([
+                    html.Label(" "),
+                    html.Button("🔍 Preview", id='bulk-preview-btn', className='btn-secondary',
+                               style={'marginRight': '10px'}),
+                    html.Button("📧 Assign All", id='bulk-assign-btn', className='btn-primary'),
+                ], style={'display': 'flex', 'alignItems': 'flex-end', 'gap': '5px'}),
+            ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end'}),
+            html.Div(id='bulk-assign-result', style={'marginTop': '15px'})
+        ], className='admin-section', style={'marginTop': '30px'})
+    ])
+
+
 def create_downloads_section() -> html.Div:
     """Create the agent downloads section"""
     return html.Div([
@@ -1544,9 +1985,9 @@ def create_administration_layout() -> html.Div:
             dcc.Tab(label='⚙️ Scan Config', value='config', className='admin-tab'),
             dcc.Tab(label='🖥️ Agents', value='overview', className='admin-tab'),
             dcc.Tab(label='📋 Jobs', value='jobs', className='admin-tab'),
-            dcc.Tab(label='� Schedules', value='schedules', className='admin-tab'),
-            dcc.Tab(label='🔍 Findings', value='findings', className='admin-tab'),
-            dcc.Tab(label='🔑 API Keys', value='apikeys', className='admin-tab'),
+            dcc.Tab(label='📅 Schedules', value='schedules', className='admin-tab'),
+            dcc.Tab(label='� Contacts', value='contacts', className='admin-tab'),
+            dcc.Tab(label='�🔑 API Keys', value='apikeys', className='admin-tab'),
             dcc.Tab(label='📜 Logs', value='logs', className='admin-tab'),
             dcc.Tab(label='📥 Downloads', value='downloads', className='admin-tab'),
         ], style={'marginBottom': '0'}),
@@ -1727,6 +2168,8 @@ def integrate_with_unified_visualizer(app, db_manager):
             return create_logs_section()
         elif tab == 'downloads':
             return create_downloads_section()
+        elif tab == 'contacts':
+            return create_contacts_section()
         return html.Div("Select a tab")
     
     @app.callback(
@@ -1794,6 +2237,7 @@ def integrate_with_unified_visualizer(app, db_manager):
                 'hostname': a.get('hostname', 'Unknown'),
                 'ip_address': str(a.get('ip_address', '')),
                 'os_type': a.get('os_type', ''),
+                'version': a.get('agent_version', '—') or '—',
                 'assigned_targets': '—',
                 'last_seen': last_seen,
                 'jobs': 0,
@@ -1808,6 +2252,7 @@ def integrate_with_unified_visualizer(app, db_manager):
                 {'name': 'Hostname', 'id': 'hostname'},
                 {'name': 'IP Address', 'id': 'ip_address'},
                 {'name': 'OS', 'id': 'os_type'},
+                {'name': 'Version', 'id': 'version'},
                 {'name': 'Assigned Targets', 'id': 'assigned_targets'},
                 {'name': 'Last Seen', 'id': 'last_seen'},
                 {'name': 'Jobs', 'id': 'jobs'},
@@ -1836,6 +2281,7 @@ def integrate_with_unified_visualizer(app, db_manager):
                 {'if': {'column_id': 'hostname'}, 'width': '180px'},
                 {'if': {'column_id': 'ip_address'}, 'width': '140px'},
                 {'if': {'column_id': 'os_type'}, 'width': '90px'},
+                {'if': {'column_id': 'version'}, 'width': '80px', 'textAlign': 'center'},
                 {'if': {'column_id': 'assigned_targets'}, 'width': '150px'},
                 {'if': {'column_id': 'last_seen'}, 'width': '100px'},
                 {'if': {'column_id': 'jobs'}, 'width': '60px', 'textAlign': 'center'},
@@ -1957,7 +2403,17 @@ def integrate_with_unified_visualizer(app, db_manager):
         prevent_initial_call=False
     )
     def load_scan_mode(stored_mode):
-        """Load the saved scan mode from store"""
+        """Load the saved scan mode from Redis (server truth) or local store"""
+        # Try to get from Redis first (server-side truth)
+        if REDIS_AVAILABLE and redis_manager and redis_manager.cache_manager:
+            try:
+                redis_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+                if redis_mode:
+                    return redis_mode
+            except Exception as e:
+                logger.warning(f"Failed to get scan mode from Redis: {e}")
+        
+        # Fall back to local storage
         if stored_mode:
             return stored_mode
         return 'hybrid'
@@ -1968,10 +2424,19 @@ def integrate_with_unified_visualizer(app, db_manager):
         prevent_initial_call=True
     )
     def save_scan_mode(mode):
-        """Save the selected scan mode to persistent storage"""
+        """Save the selected scan mode to persistent storage and Redis"""
         if mode is None:
             return no_update  # Don't save None value
         logger.info(f"Scan mode changed to: {mode}")
+        
+        # Also store in Redis for dashboard to read
+        if REDIS_AVAILABLE and redis_manager and redis_manager.cache_manager:
+            try:
+                redis_manager.cache_manager.set('scan_mode', 'current', mode, ttl_seconds=86400*30)  # 30 days
+                logger.info(f"Scan mode stored in Redis: {mode}")
+            except Exception as e:
+                logger.warning(f"Failed to store scan mode in Redis: {e}")
+        
         return mode
     
     # ========== SCAN TARGETS TABLE POPULATION ==========
@@ -2150,34 +2615,60 @@ def integrate_with_unified_visualizer(app, db_manager):
         Input('admin-create-job-btn', 'n_clicks'),
         [State('admin-job-agent-select', 'value'),
          State('admin-job-path', 'value'),
-         State('admin-job-scanners', 'value')],
+         State('admin-job-path-suggestions', 'value'),
+         State('admin-job-scanners', 'value'),
+         State('admin-job-continuous', 'value'),
+         State('admin-job-interval', 'value')],
         prevent_initial_call=True
     )
-    def create_scan_job(n_clicks, agent_id, paths, scanners):
+    def create_scan_job(n_clicks, agent_id, paths_input, paths_dropdown, scanners, continuous, interval):
         """Create a scan job for an agent"""
         if not n_clicks:
             return ""
+        
+        # Use dropdown selection if input is empty
+        paths = paths_input or paths_dropdown
         
         if not agent_id or not paths:
             return html.Div("❌ Agent and path are required", style={'color': '#f56565'})
         
         try:
             path_list = [p.strip() for p in paths.split(',')]
+            
+            # Check if continuous scanning is enabled
+            is_continuous = continuous and 'continuous' in continuous
+            scan_interval = interval if is_continuous else None
+            
             job = agent_db.create_job(
                 agent_id=agent_id,
                 scan_paths=path_list,
-                scanners=scanners or ['custom']
+                scanners=scanners or ['custom'],
+                continuous=is_continuous,
+                interval_minutes=scan_interval
             )
             
             if job:
+                msg = f"Job created: {str(job.get('job_id', ''))[:8]}..."
+                if is_continuous:
+                    msg += f" (continuous, every {interval}min)"
                 return html.Div([
                     html.Span("✅ ", style={'color': '#48bb78'}),
-                    html.Span(f"Job created: {str(job.get('job_id', ''))[:8]}...")
+                    html.Span(msg)
                 ], style={'color': '#48bb78'})
             return html.Div("❌ Failed to create job", style={'color': '#f56565'})
         except Exception as e:
             logger.error(f"Error creating job: {e}")
             return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+    
+    # ========== CONTINUOUS SCAN TOGGLE ==========
+    @app.callback(
+        Output('admin-job-interval', 'disabled'),
+        Input('admin-job-continuous', 'value'),
+        prevent_initial_call=False
+    )
+    def toggle_interval_dropdown(continuous):
+        """Enable/disable interval dropdown based on continuous checkbox"""
+        return not (continuous and 'continuous' in continuous)
     
     # ========== JOBS TABLE POPULATION ==========
     @app.callback(
@@ -2246,20 +2737,20 @@ def integrate_with_unified_visualizer(app, db_manager):
          Input('admin-finding-status-filter', 'value')],
         prevent_initial_call=False
     )
-    def populate_findings_table(n_intervals, n_clicks, severity, status):
+    def populate_findings_table(n_intervals, n_clicks, severity_filter, status):
         """Populate the findings table"""
         findings = agent_db.list_findings(
-            severity=severity if severity != 'all' else None,
+            severity=severity_filter if severity_filter != 'all' else None,
             status=status if status != 'all' else None
         )
         
         data = []
         for f in findings:
-            severity = f.get('severity', 'Unknown')
+            sev = (f.get('severity', 'Unknown') or 'Unknown').title()  # Normalize to title case
             severity_icons = {'Critical': '🔴', 'High': '🟠', 'Medium': '🟡', 'Low': '🟢'}
             
             data.append({
-                'severity_icon': f"{severity_icons.get(severity, '❓')} {severity}",
+                'severity_icon': f"{severity_icons.get(sev, '❓')} {sev}",
                 'secret_type': f.get('secret_type', 'Unknown'),
                 'file_path': (f.get('file_path', '') or '')[-50:] if f.get('file_path') else '-',
                 'line_number': f.get('line_number', '-') or '-',
@@ -2635,17 +3126,41 @@ def integrate_with_unified_visualizer(app, db_manager):
         Output('admin-agent-action-result', 'children', allow_duplicate=True),
         [Input('admin-agent-restart', 'n_clicks'),
          Input('admin-agent-update', 'n_clicks'),
-         Input('admin-agent-remove', 'n_clicks')],
+         Input('admin-agent-repair', 'n_clicks'),
+         Input('admin-agent-status', 'n_clicks'),
+         Input('admin-agent-remove', 'n_clicks'),
+         Input('admin-bulk-update', 'n_clicks'),
+         Input('admin-bulk-restart', 'n_clicks')],
         State('admin-selected-agent-id', 'data'),
         prevent_initial_call=True
     )
-    def handle_agent_commands(restart_clicks, update_clicks, remove_clicks, agent_id):
+    def handle_agent_commands(restart_clicks, update_clicks, repair_clicks, status_clicks, remove_clicks, bulk_update_clicks, bulk_restart_clicks, agent_id):
         """Handle agent management commands"""
         from dash import ctx
+        trigger = ctx.triggered_id
+        
+        # Bulk actions don't require agent selection
+        if trigger in ['admin-bulk-update', 'admin-bulk-restart']:
+            try:
+                agents = agent_db.get_all_agents()
+                if not agents:
+                    return html.Div("No agents registered", style={'color': '#888'})
+                
+                command_type = 'update' if trigger == 'admin-bulk-update' else 'restart'
+                count = 0
+                for agent in agents:
+                    if agent.get('status') in ['online', 'active']:
+                        agent_db.queue_agent_command(agent['agent_id'], command_type, {})
+                        count += 1
+                
+                icon = "⬆️" if trigger == 'admin-bulk-update' else "🔄"
+                return html.Div(f"{icon} {command_type.title()} command queued for {count} online agents", style={'color': '#48bb78'})
+            except Exception as e:
+                return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+        
+        # Individual agent actions require agent selection
         if not ctx.triggered or not agent_id:
             return html.Div("Select an agent first", style={'color': '#888'})
-        
-        trigger = ctx.triggered_id
         
         try:
             if trigger == 'admin-agent-restart':
@@ -2655,6 +3170,14 @@ def integrate_with_unified_visualizer(app, db_manager):
             elif trigger == 'admin-agent-update':
                 command_id = agent_db.queue_agent_command(agent_id, 'update', {'version': 'latest'})
                 return html.Div(f"⬆️ Update command queued (ID: {command_id[:8]}...)", style={'color': '#48bb78'})
+            
+            elif trigger == 'admin-agent-repair':
+                command_id = agent_db.queue_agent_command(agent_id, 'repair', {})
+                return html.Div(f"🔧 Repair command queued (ID: {command_id[:8]}...) - Will reinstall dependencies", style={'color': '#f6ad55'})
+            
+            elif trigger == 'admin-agent-status':
+                command_id = agent_db.queue_agent_command(agent_id, 'status', {})
+                return html.Div(f"📊 Status request queued (ID: {command_id[:8]}...) - Check logs for detailed output", style={'color': '#4dabf7'})
             
             elif trigger == 'admin-agent-remove':
                 # Direct database delete
@@ -2666,38 +3189,191 @@ def integrate_with_unified_visualizer(app, db_manager):
         
         return no_update
     
-    # ========== PATH BROWSING FOR JOBS ==========
+    # ========== FOLDER BROWSER MODAL ==========
+    @app.callback(
+        [Output('folder-browser-modal', 'is_open'),
+         Output('folder-browser-tree', 'children'),
+         Output('folder-browser-status', 'children')],
+        [Input('admin-browse-agent-paths', 'n_clicks'),
+         Input('folder-browser-cancel', 'n_clicks')],
+        [State('admin-job-agent-select', 'value'),
+         State('folder-browser-modal', 'is_open')],
+        prevent_initial_call=True
+    )
+    def toggle_folder_browser(browse_clicks, cancel_clicks, agent_id, is_open):
+        """Open/close folder browser modal and populate paths"""
+        from dash import ctx
+        
+        if ctx.triggered_id == 'folder-browser-cancel':
+            return False, [], ""
+        
+        if ctx.triggered_id == 'admin-browse-agent-paths':
+            if not agent_id:
+                return False, [], html.Div("⚠️ Select an agent first", style={'color': '#f6ad55'})
+            
+            try:
+                paths = agent_db.get_agent_paths(agent_id)
+                
+                if not paths:
+                    # Queue discovery and show waiting message
+                    agent_db.queue_agent_command(agent_id, 'list_paths', {})
+                    return True, [
+                        html.Div([
+                            html.Span("🔍 ", style={'fontSize': '20px'}),
+                            html.Span("Path discovery in progress..."),
+                            html.Br(),
+                            html.Span("This may take 30-60 seconds. Click 'Browse' again after the agent heartbeats.", 
+                                     style={'color': '#888', 'fontSize': '12px'})
+                        ], style={'textAlign': 'center', 'padding': '40px', 'color': '#4dabf7'})
+                    ], html.Div("⏳ Waiting for path discovery...", style={'color': '#4dabf7'})
+                
+                # Build folder tree from paths
+                tree_items = build_folder_tree(paths)
+                status = html.Div(f"✅ Found {len(paths)} available paths", style={'color': '#48bb78'})
+                
+                return True, tree_items, status
+            except Exception as e:
+                return True, [html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})], ""
+        
+        return is_open, [], ""
+    
+    def build_folder_tree(paths):
+        """Build a visual folder tree from paths"""
+        # Sort paths for better organization
+        sorted_paths = sorted(paths, key=lambda x: (x.count('\\') + x.count('/'), x.lower()))
+        
+        # Group by root
+        roots = {}
+        for path in sorted_paths:
+            # Determine root (drive letter or first component)
+            if ':\\' in path:
+                root = path[:3]  # C:\
+            elif path.startswith('/'):
+                parts = path.split('/')
+                root = '/' + (parts[1] if len(parts) > 1 else '')
+            else:
+                root = path.split('\\')[0] if '\\' in path else path.split('/')[0]
+            
+            if root not in roots:
+                roots[root] = []
+            roots[root].append(path)
+        
+        tree_items = []
+        for root, root_paths in roots.items():
+            # Root item
+            tree_items.append(
+                html.Div([
+                    html.Span("💾 " if ':\\' in root else "📁 ", style={'marginRight': '5px'}),
+                    html.Span(root, style={'fontWeight': 'bold', 'color': '#4dabf7'}),
+                ], style={'padding': '5px 0', 'borderBottom': '1px solid #333'})
+            )
+            
+            # Child paths (limit display for performance)
+            displayed = 0
+            for path in root_paths:
+                if path == root:
+                    continue
+                displayed += 1
+                if displayed > 50:
+                    tree_items.append(
+                        html.Div(f"  ... and {len(root_paths) - 50} more paths",
+                                style={'color': '#888', 'paddingLeft': '20px', 'fontSize': '12px'})
+                    )
+                    break
+                
+                # Calculate depth for indentation
+                depth = path.count('\\') + path.count('/') - (root.count('\\') + root.count('/'))
+                indent = 20 + (depth * 15)
+                
+                tree_items.append(
+                    html.Div([
+                        html.Button(
+                            [html.Span("📁 ", style={'marginRight': '3px'}), path],
+                            id={'type': 'folder-select-btn', 'path': path},
+                            className='btn-link',
+                            style={'background': 'none', 'border': 'none', 'color': '#e0e0e0',
+                                   'cursor': 'pointer', 'padding': '3px 5px', 'textAlign': 'left',
+                                   'width': '100%', 'fontSize': '13px'}
+                        )
+                    ], style={'paddingLeft': f'{indent}px'})
+                )
+        
+        return tree_items
+    
+    # ========== SELECT FOLDER FROM BROWSER ==========
+    @app.callback(
+        [Output('admin-job-path', 'value'),
+         Output('folder-browser-modal', 'is_open', allow_duplicate=True)],
+        Input({'type': 'folder-select-btn', 'path': ALL}, 'n_clicks'),
+        prevent_initial_call=True
+    )
+    def select_folder_from_browser(n_clicks_list):
+        """Handle folder selection from browser"""
+        from dash import ctx
+        
+        if not ctx.triggered or not any(n_clicks_list):
+            raise PreventUpdate
+        
+        # Get the path from the triggered button
+        triggered = ctx.triggered_id
+        if triggered and 'path' in triggered:
+            return triggered['path'], False
+        
+        raise PreventUpdate
+    
+    # ========== FILTER FOLDER BROWSER ==========
+    @app.callback(
+        Output('folder-browser-tree', 'children', allow_duplicate=True),
+        Input('folder-browser-search', 'value'),
+        State('admin-job-agent-select', 'value'),
+        prevent_initial_call=True
+    )
+    def filter_folder_browser(search_term, agent_id):
+        """Filter folder browser based on search"""
+        if not agent_id:
+            raise PreventUpdate
+        
+        paths = agent_db.get_agent_paths(agent_id)
+        if not paths:
+            raise PreventUpdate
+        
+        if search_term:
+            paths = [p for p in paths if search_term.lower() in p.lower()]
+        
+        return build_folder_tree(paths)
+    
+    # ========== AUTO-DISCOVER PATHS WHEN AGENT SELECTED ==========
+    @app.callback(
+        Output('agent-paths-auto-status', 'children'),
+        Input('admin-job-agent-select', 'value'),
+        prevent_initial_call=True
+    )
+    def auto_discover_agent_paths(agent_id):
+        """Automatically queue path discovery when agent is selected"""
+        if not agent_id:
+            return ""
+        
+        try:
+            paths = agent_db.get_agent_paths(agent_id)
+            if paths:
+                return html.Span(f"✅ {len(paths)} paths available", style={'color': '#48bb78'})
+            else:
+                # Queue discovery
+                agent_db.queue_agent_command(agent_id, 'list_paths', {})
+                return html.Span("🔍 Discovering paths...", style={'color': '#4dabf7'})
+        except Exception as e:
+            return html.Span(f"⚠️ {str(e)}", style={'color': '#f6ad55'})
+    
+    # Legacy callback outputs (keeping for compatibility)
     @app.callback(
         [Output('admin-path-discovery-result', 'children'),
          Output('admin-job-path-suggestions', 'options')],
         Input('admin-browse-agent-paths', 'n_clicks'),
-        State('admin-job-agent-select', 'value'),
         prevent_initial_call=True
     )
-    def browse_agent_paths_for_job(n_clicks, agent_id):
-        """Browse paths on selected agent for job creation"""
-        if not n_clicks or not agent_id:
-            return html.Div("Select an agent first", style={'color': '#888'}), []
-        
-        try:
-            # First check if we have cached paths
-            paths = agent_db.get_agent_paths(agent_id)
-            
-            if paths:
-                options = [{'label': p, 'value': p} for p in paths]
-                return html.Div([
-                    html.Span("✅ ", style={'color': '#48bb78'}),
-                    html.Span(f"Found {len(paths)} available paths on agent")
-                ], style={'color': '#48bb78'}), options
-            else:
-                # Queue discovery command
-                command_id = agent_db.queue_agent_command(agent_id, 'list_paths', {})
-                return html.Div([
-                    html.Span("🔍 ", style={'color': '#4dabf7'}),
-                    html.Span("Path discovery queued. Please wait ~30 seconds and click again.")
-                ], style={'color': '#4dabf7'}), []
-        except Exception as e:
-            return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'}), []
+    def legacy_path_discovery(n_clicks):
+        """Legacy callback - does nothing, modal handles this now"""
+        return "", []
     
     # ========== POPULATE SCHEDULES DROPDOWNS WITH AGENTS ==========
     @app.callback(
@@ -2895,6 +3571,268 @@ def integrate_with_unified_visualizer(app, db_manager):
         except Exception as e:
             logger.error(f"Error loading logs: {e}")
             return html.Div(f"Error loading logs: {str(e)}", style={'color': '#f56565', 'padding': '20px'})
+    
+    # ==========================
+    # Contacts Tab Callbacks
+    # ==========================
+    
+    @app.callback(
+        [Output('contacts-table', 'data'),
+         Output('ownership-owner', 'options'),
+         Output('bulk-assign-owner', 'options')],
+        [Input('refresh-contacts-btn', 'n_clicks'),
+         Input('admin-tabs', 'value')],
+        prevent_initial_call=False
+    )
+    def refresh_contacts_data(n_clicks, tab):
+        """Load contacts and populate dropdowns"""
+        if tab != 'contacts':
+            raise PreventUpdate
+        
+        try:
+            contacts = db_manager.list_contacts()
+            contact_options = [{'label': f"{c['name']} ({c['email']})", 'value': c['id']} for c in contacts]
+            
+            # Format for table
+            table_data = []
+            for c in contacts:
+                table_data.append({
+                    'id': c['id'],
+                    'name': c['name'],
+                    'email': c['email'],
+                    'department': c.get('department', ''),
+                    'phone': c.get('phone', ''),
+                    'is_active': '✓' if c.get('is_active') else '✗',
+                    'created_at': str(c.get('created_at', ''))[:10]
+                })
+            
+            return table_data, contact_options, contact_options
+        except Exception as e:
+            logger.error(f"Error loading contacts: {e}")
+            return [], [], []
+    
+    @app.callback(
+        [Output('add-contact-result', 'children'),
+         Output('contact-name', 'value'),
+         Output('contact-email', 'value'),
+         Output('contact-dept', 'value'),
+         Output('contact-phone', 'value')],
+        Input('add-contact-btn', 'n_clicks'),
+        [State('contact-name', 'value'),
+         State('contact-email', 'value'),
+         State('contact-dept', 'value'),
+         State('contact-phone', 'value')],
+        prevent_initial_call=True
+    )
+    def add_contact(n_clicks, name, email, dept, phone):
+        """Add a new contact"""
+        if not name or not email:
+            return html.Span("❌ Name and email are required", style={'color': '#f56565'}), dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        
+        try:
+            result = db_manager.add_contact(name, email, dept, None, phone)
+            if result:
+                return html.Span(f"✅ Contact '{name}' added successfully", style={'color': '#68d391'}), '', '', '', ''
+            else:
+                return html.Span("❌ Failed to add contact (may already exist)", style={'color': '#f56565'}), dash.no_update, dash.no_update, dash.no_update, dash.no_update
+        except Exception as e:
+            logger.error(f"Error adding contact: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'}), dash.no_update, dash.no_update, dash.no_update, dash.no_update
+    
+    @app.callback(
+        [Output('edit-contact-btn', 'disabled'),
+         Output('delete-contact-btn', 'disabled')],
+        Input('contacts-table', 'selected_rows'),
+        prevent_initial_call=True
+    )
+    def toggle_contact_buttons(selected):
+        """Enable/disable contact action buttons"""
+        disabled = not selected
+        return disabled, disabled
+    
+    @app.callback(
+        Output('add-contact-result', 'children', allow_duplicate=True),
+        Input('delete-contact-btn', 'n_clicks'),
+        [State('contacts-table', 'selected_rows'),
+         State('contacts-table', 'data')],
+        prevent_initial_call=True
+    )
+    def delete_contact(n_clicks, selected_rows, data):
+        """Delete selected contact"""
+        if not selected_rows:
+            return dash.no_update
+        
+        try:
+            contact = data[selected_rows[0]]
+            contact_id = contact['id']
+            success = db_manager.delete_contact(contact_id)
+            if success:
+                return html.Span(f"✅ Contact '{contact['name']}' deleted", style={'color': '#68d391'})
+            else:
+                return html.Span("❌ Failed to delete contact", style={'color': '#f56565'})
+        except Exception as e:
+            logger.error(f"Error deleting contact: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+    
+    @app.callback(
+        Output('ownership-table', 'data'),
+        [Input('refresh-contacts-btn', 'n_clicks'),
+         Input('admin-tabs', 'value')],
+        prevent_initial_call=False
+    )
+    def refresh_ownership_rules(n_clicks, tab):
+        """Load path ownership rules"""
+        if tab != 'contacts':
+            raise PreventUpdate
+        
+        try:
+            rules = db_manager.list_path_ownership()
+            return [{
+                'id': r['id'],
+                'path_pattern': r['path_pattern'],
+                'owner_name': r['owner_name'],
+                'owner_email': r['owner_email'],
+                'is_regex': '✓' if r.get('is_regex') else '✗',
+                'priority': r.get('priority', 0)
+            } for r in rules]
+        except Exception as e:
+            logger.error(f"Error loading ownership rules: {e}")
+            return []
+    
+    @app.callback(
+        Output('add-ownership-result', 'children'),
+        Input('add-ownership-btn', 'n_clicks'),
+        [State('ownership-path', 'value'),
+         State('ownership-owner', 'value'),
+         State('ownership-regex', 'value')],
+        prevent_initial_call=True
+    )
+    def add_ownership_rule(n_clicks, path_pattern, owner_id, is_regex_list):
+        """Add a path ownership rule"""
+        if not path_pattern or not owner_id:
+            return html.Span("❌ Path pattern and owner are required", style={'color': '#f56565'})
+        
+        try:
+            is_regex = 'regex' in (is_regex_list or [])
+            result = db_manager.add_path_ownership(path_pattern, owner_id, is_regex=is_regex)
+            if result:
+                return html.Span(f"✅ Ownership rule added for '{path_pattern}'", style={'color': '#68d391'})
+            else:
+                return html.Span("❌ Failed to add ownership rule", style={'color': '#f56565'})
+        except Exception as e:
+            logger.error(f"Error adding ownership rule: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+    
+    @app.callback(
+        Output('delete-ownership-btn', 'disabled'),
+        Input('ownership-table', 'selected_rows'),
+        prevent_initial_call=True
+    )
+    def toggle_ownership_delete(selected):
+        """Enable/disable ownership delete button"""
+        return not selected
+    
+    @app.callback(
+        Output('add-ownership-result', 'children', allow_duplicate=True),
+        Input('delete-ownership-btn', 'n_clicks'),
+        [State('ownership-table', 'selected_rows'),
+         State('ownership-table', 'data')],
+        prevent_initial_call=True
+    )
+    def delete_ownership_rule(n_clicks, selected_rows, data):
+        """Delete selected ownership rule"""
+        if not selected_rows:
+            return dash.no_update
+        
+        try:
+            rule = data[selected_rows[0]]
+            success = db_manager.delete_path_ownership(rule['id'])
+            if success:
+                return html.Span(f"✅ Ownership rule deleted", style={'color': '#68d391'})
+            else:
+                return html.Span("❌ Failed to delete rule", style={'color': '#f56565'})
+        except Exception as e:
+            logger.error(f"Error deleting rule: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+    
+    @app.callback(
+        Output('bulk-assign-result', 'children'),
+        Input('bulk-assign-btn', 'n_clicks'),
+        [State('bulk-filter-path', 'value'),
+         State('bulk-assign-owner', 'value')],
+        prevent_initial_call=True
+    )
+    def bulk_assign_owners(n_clicks, path_filter, owner_id):
+        """Bulk assign owner to findings matching path filter"""
+        if not owner_id:
+            return html.Span("❌ Please select an owner", style={'color': '#f56565'})
+        
+        try:
+            # Get owner info
+            contacts = db_manager.list_contacts(include_inactive=True)
+            owner = next((c for c in contacts if c['id'] == owner_id), None)
+            if not owner:
+                return html.Span("❌ Owner not found", style={'color': '#f56565'})
+            
+            # Build query to find matching findings
+            query = """
+                UPDATE agent_findings 
+                SET owner_id = %s, owner_email = %s, owner_name = %s, 
+                    owner_assigned_at = NOW(), owner_assigned_by = 'bulk_assign'
+                WHERE owner_id IS NULL
+            """
+            params = [owner_id, owner['email'], owner['name']]
+            
+            if path_filter:
+                query += " AND file_path ILIKE %s"
+                params.append(f"%{path_filter}%")
+            
+            conn = db_manager.get_connection()
+            if not conn:
+                return html.Span("❌ Database connection failed", style={'color': '#f56565'})
+            
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    count = cur.rowcount
+                conn.commit()
+                return html.Span(f"✅ Assigned {owner['name']} as owner to {count} findings", style={'color': '#68d391'})
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error in bulk assign: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+    
+    @app.callback(
+        Output('bulk-assign-result', 'children', allow_duplicate=True),
+        Input('bulk-preview-btn', 'n_clicks'),
+        State('bulk-filter-path', 'value'),
+        prevent_initial_call=True
+    )
+    def preview_bulk_assign(n_clicks, path_filter):
+        """Preview how many findings would be affected"""
+        try:
+            query = "SELECT COUNT(*) FROM agent_findings WHERE owner_id IS NULL"
+            params = []
+            
+            if path_filter:
+                query += " AND file_path ILIKE %s"
+                params.append(f"%{path_filter}%")
+            
+            conn = db_manager.get_connection()
+            if not conn:
+                return html.Span("❌ Database connection failed", style={'color': '#f56565'})
+            
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(query, params)
+                    count = cur.fetchone()[0]
+                return html.Span(f"ℹ️ {count} unassigned findings would be affected", style={'color': '#90cdf4'})
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error(f"Error in preview: {e}")
+            return html.Span(f"❌ Error: {str(e)}", style={'color': '#f56565'})
     
     logger.info("Administration module integrated successfully")
     return agent_db

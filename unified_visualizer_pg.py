@@ -474,6 +474,18 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
     global chart_data_cache
     now = datetime.now()
     
+    # Check if in agent mode
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    # If in agent mode, use agent database
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_chart_data(force_refresh)
+    
     # Check cache validity
     if (not force_refresh and
         chart_data_cache['last_update'] and
@@ -572,6 +584,178 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
             'last_update': None
         }
 
+
+def get_agent_chart_data(force_refresh: bool = False) -> dict:
+    """Get chart data from the agent database (V2 mode)."""
+    global chart_data_cache
+    now = datetime.now()
+    
+    # Check cache validity
+    if (not force_refresh and
+        chart_data_cache['last_update'] and
+        now - chart_data_cache['last_update'] < chart_data_cache['cache_duration']):
+        return chart_data_cache
+    
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        cur = conn.cursor()
+        
+        # Query 1: Severity counts - normalize case
+        cur.execute("""
+            SELECT INITCAP(severity) as severity, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY INITCAP(severity)
+        """)
+        severity_results = cur.fetchall()
+        chart_data_cache['severity_counts'] = {row['severity']: row['count'] for row in severity_results}
+        
+        # Query 2: Scanner distribution
+        cur.execute("""
+            SELECT scanner as tool_source, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY scanner
+        """)
+        tool_results = cur.fetchall()
+        chart_data_cache['tool_counts'] = {row['tool_source']: row['count'] for row in tool_results}
+        
+        # Query 3: Timeline data
+        cur.execute("""
+            SELECT DATE(found_at) as date, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+              AND found_at >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY DATE(found_at)
+            ORDER BY date
+        """)
+        timeline_results = cur.fetchall()
+        chart_data_cache['timeline_data'] = [
+            {'date': row['date'], 'count': row['count']} for row in timeline_results
+        ]
+        
+        # Query 4: File extension counts (extract from file_path)
+        cur.execute("""
+            SELECT 
+                COALESCE(SUBSTRING(file_path FROM '\\.[^.\\\\]+$'), 'unknown') as file_extension,
+                COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY SUBSTRING(file_path FROM '\\.[^.\\\\]+$')
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        extension_results = cur.fetchall()
+        chart_data_cache['file_extension_counts'] = {row['file_extension'] or 'unknown': row['count'] for row in extension_results}
+        
+        # Query 5: Secret type counts by scanner
+        cur.execute("""
+            SELECT scanner as tool_source, secret_type, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY scanner, secret_type
+            ORDER BY count DESC
+        """)
+        secret_results = cur.fetchall()
+        secret_by_tool = {}
+        for row in secret_results:
+            tool = row['tool_source']
+            if tool not in secret_by_tool:
+                secret_by_tool[tool] = {}
+            secret_by_tool[tool][row['secret_type']] = row['count']
+        chart_data_cache['secret_type_counts'] = secret_by_tool
+        
+        cur.close()
+        conn.close()
+        
+        chart_data_cache['last_update'] = now
+        logger.debug("Agent chart data cache refreshed")
+        
+        return chart_data_cache
+        
+    except Exception as e:
+        logger.error(f"Error fetching agent chart data: {e}")
+        return {
+            'severity_counts': {},
+            'tool_counts': {},
+            'timeline_data': [],
+            'file_extension_counts': {},
+            'secret_type_counts': {},
+            'last_update': None
+        }
+
+
+def get_agent_findings_data(limit: int = None) -> pd.DataFrame:
+    """Get findings from the agent database (V2 mode)."""
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        
+        query = f"""
+            SELECT
+                af.id, af.file_path, af.secret_type, af.secret_value, 
+                af.line_content as context, af.severity, af.scanner as tool_source,
+                af.found_at as first_seen, af.found_at as last_seen, 
+                1.0 as confidence_score, af.status as resolution_status,
+                NULL as fp_reason, NULL as fp_marked_by, NULL as fp_marked_at,
+                af.line_number, af.secret_type as finding_category, af.line_content as proof_content,
+                af.found_at as file_last_accessed, af.found_at as file_modified_at,
+                NULL as owner_name, NULL as owner_email,
+                'Agent Scan' as project_name, 'agent' as scan_type,
+                a.hostname as agent_hostname
+            FROM agent_findings af
+            LEFT JOIN agents a ON af.agent_id = a.agent_id
+            WHERE af.status = 'open'
+            ORDER BY af.found_at DESC
+            {limit_clause}
+        """
+        
+        cur = conn.cursor()
+        cur.execute(query)
+        findings = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if findings:
+            df = pd.DataFrame([dict(r) for r in findings])
+            df['first_seen'] = pd.to_datetime(df['first_seen'])
+            df['last_seen'] = pd.to_datetime(df['last_seen'])
+            return df
+        else:
+            return pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"Error fetching agent findings: {e}")
+        return pd.DataFrame()
+
+
 def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.DataFrame:
     """Get findings data from database with caching and security.
     
@@ -580,6 +764,18 @@ def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.Data
         limit: Optional limit on number of rows (for table display)
     """
     now = datetime.now()
+    
+    # Check if we're in agent mode
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    # If in agent mode, query agent database instead
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_findings_data(limit)
 
     # Check cache validity (only for unlimited queries)
     if (not force_refresh and limit is None and
@@ -3815,6 +4011,28 @@ def update_scanner_status(n_intervals):
         # Check Redis connectivity
         redis_connected = redis_manager.redis_manager and redis_manager.redis_manager.ping()
         redis_status = "✅ Connected" if redis_connected else "❌ Disconnected"
+        
+        # Check scan mode - if agent_only, don't show local scanner status
+        scan_mode = None
+        if redis_connected and redis_manager.cache_manager:
+            try:
+                scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            except Exception:
+                pass
+        
+        # If in agent-only mode, show agent status instead of local scanner status
+        if scan_mode == 'agent_only':
+            # Get total findings count from main database
+            total_query = "SELECT COUNT(*) as total FROM findings"
+            total_result = db_manager.execute_query(total_query)
+            total_findings = total_result[0]['total'] if total_result else 0
+            
+            return (
+                "Custom Scanner: 🛑 Disabled (Agent Mode)", "status-item status-inactive",
+                "Trufflehog: 🛑 Disabled (Agent Mode)", "status-item status-inactive",
+                "Gitleaks: 🛑 Disabled (Agent Mode)", "status-item status-inactive",
+                f"📊 Agent Mode Active | Findings: {total_findings:,} | Redis: {redis_status}", "status-item status-agent"
+            )
 
         # Try to get real-time progress from Redis
         custom_progress = None

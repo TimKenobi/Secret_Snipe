@@ -96,6 +96,15 @@ class FindingsSubmission(BaseModel):
     findings: List[Dict[str, Any]]
 
 
+class JobResultsSubmission(BaseModel):
+    """Request model for submitting job results (findings + status update)"""
+    status: str = "completed"
+    findings: List[Dict[str, Any]] = []
+    findings_count: int = 0
+    completed_at: Optional[str] = None
+    error: Optional[str] = None
+
+
 class CreateJobRequest(BaseModel):
     """Request model for creating a new scan job"""
     agent_id: Optional[str] = None
@@ -601,16 +610,37 @@ class AgentDatabaseManager:
     # ========== Findings Operations ==========
     
     def submit_findings(self, job_id: str, findings: List[Dict]) -> int:
-        """Submit findings from agent to agent_findings table"""
+        """Submit findings from agent to agent_findings table
+        
+        Handles field mapping from agent format to database format:
+        Agent sends: file, line, rule, match, severity, line_content, scanner
+        Database expects: file_path, line_number, secret_type, secret_value, pattern_name, etc.
+        """
         inserted = 0
+        
+        # Get agent_id from the job
+        agent_id = None
+        job = self.get_job(job_id)
+        if job:
+            agent_id = job.get('agent_id')
         
         with self._get_connection() as conn:
             with conn.cursor() as cur:
                 for finding in findings:
                     try:
+                        # Map agent field names to database field names
+                        file_path = finding.get('file_path') or finding.get('file', '')
+                        line_number = finding.get('line_number') or finding.get('line', 0)
+                        secret_type = finding.get('secret_type') or finding.get('rule', 'unknown')
+                        secret_value = finding.get('secret_value') or finding.get('match', '')
+                        pattern_name = finding.get('pattern_name') or finding.get('rule', '')
+                        severity = finding.get('severity', 'MEDIUM').upper()
+                        line_content = finding.get('line_content', '')
+                        scanner = finding.get('scanner', 'custom')
+                        
                         # Generate a fingerprint from the finding details
                         import hashlib
-                        fingerprint_data = f"{finding.get('file_path')}:{finding.get('line_number')}:{finding.get('secret_type')}:{finding.get('secret_value', '')[:20]}"
+                        fingerprint_data = f"{file_path}:{line_number}:{secret_type}:{secret_value[:20] if secret_value else ''}"
                         fingerprint = hashlib.sha256(fingerprint_data.encode()).hexdigest()[:32]
                         
                         cur.execute("""
@@ -621,15 +651,15 @@ class AgentDatabaseManager:
                             ON CONFLICT (fingerprint) DO NOTHING
                         """, (
                             job_id,
-                            finding.get('agent_id'),
-                            finding.get('secret_type'),
-                            finding.get('secret_value', '')[:500],  # Truncate
-                            finding.get('file_path'),
-                            finding.get('line_number'),
-                            finding.get('line_content', '')[:1000],  # Truncate
-                            finding.get('scanner', 'custom'),
-                            finding.get('pattern_name'),
-                            finding.get('severity', 'medium'),
+                            agent_id,
+                            secret_type,
+                            secret_value[:500] if secret_value else '',  # Truncate
+                            file_path,
+                            line_number,
+                            line_content[:1000] if line_content else '',  # Truncate
+                            scanner,
+                            pattern_name,
+                            severity,
                             fingerprint
                         ))
                         if cur.rowcount > 0:
@@ -1204,6 +1234,177 @@ async def download_agent_script():
     raise HTTPException(status_code=404, detail="Agent script not found")
 
 
+@app.get(f"/api/{API_VERSION}/agent/version")
+async def get_agent_version():
+    """Get the latest agent version available on the server - public endpoint (no auth required)
+    
+    Returns:
+        - latest_version: The version of the agent script hosted on the server
+        - download_url: URL to download the latest agent script
+    """
+    import re
+    
+    # Look for agent script to extract version
+    script_locations = [
+        Path(__file__).parent.parent / "windows_installer" / "secretsnipe_enterprise_agent.py",
+        Path(__file__).parent / "secretsnipe_enterprise_agent.py",
+        Path("/app/agent_project/windows_installer/secretsnipe_enterprise_agent.py"),
+        Path("/app/secretsnipe_enterprise_agent.py"),
+    ]
+    
+    latest_version = "unknown"
+    for script_path in script_locations:
+        if script_path.exists():
+            try:
+                content = script_path.read_text(encoding='utf-8')
+                # Extract AGENT_VERSION = "x.x.x" pattern
+                match = re.search(r'AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', content)
+                if match:
+                    latest_version = match.group(1)
+                    logger.info(f"Found agent version {latest_version} in {script_path}")
+                    break
+            except Exception as e:
+                logger.warning(f"Could not read version from {script_path}: {e}")
+    
+    return APIResponse(
+        success=True, 
+        message="OK",
+        data={
+            "latest_version": latest_version,
+            "download_url": f"/api/{API_VERSION}/agent/download"
+        }
+    ).to_dict()
+
+
+@app.get(f"/api/{API_VERSION}/installer/download")
+async def download_installer_script():
+    """Download the PowerShell installer script - public endpoint (no auth required)"""
+    from fastapi.responses import FileResponse
+    
+    script_locations = [
+        Path(__file__).parent.parent / "windows_installer" / "install_agent.ps1",
+        Path(__file__).parent / "install_agent.ps1",
+        Path("/app/windows_installer/install_agent.ps1"),
+    ]
+    
+    for script_path in script_locations:
+        if script_path.exists():
+            logger.info(f"Serving installer script from {script_path}")
+            return FileResponse(
+                path=str(script_path),
+                filename="install_agent.ps1",
+                media_type="application/octet-stream"
+            )
+    
+    raise HTTPException(status_code=404, detail="Installer script not found")
+
+
+@app.post(f"/api/{API_VERSION}/agents/{{agent_id}}/action")
+async def trigger_agent_action(
+    agent_id: str, 
+    action: str,
+    key_info: Dict = Depends(verify_api_key)
+):
+    """Trigger a remote action on an agent (update, repair, restart, reinstall, check_update)"""
+    valid_actions = ["update", "repair", "restart", "reinstall", "status", "test_scan", "check_update"]
+    
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Must be one of: {valid_actions}")
+    
+    # Create a command for the agent to process
+    command_id = db_manager.queue_agent_command(agent_id, action, {
+        "requested_by": key_info.get("key_name", "api"),
+        "requested_at": datetime.utcnow().isoformat()
+    })
+    
+    logger.info(f"Triggered action '{action}' on agent {agent_id}, command_id: {command_id}")
+    
+    return APIResponse(
+        success=True,
+        message=f"Action '{action}' triggered on agent",
+        data={"command_id": command_id, "action": action}
+    ).to_dict()
+
+
+@app.post(f"/api/{API_VERSION}/agents/bulk-action")
+async def trigger_bulk_agent_action(
+    action: str,
+    agent_ids: List[str] = None,
+    key_info: Dict = Depends(verify_api_key)
+):
+    """Trigger a remote action on multiple agents"""
+    valid_actions = ["update", "repair", "restart", "check_update"]
+    
+    if action not in valid_actions:
+        raise HTTPException(status_code=400, detail=f"Invalid action. Must be one of: {valid_actions}")
+    
+    # If no agents specified, get all online agents
+    if not agent_ids:
+        agents = db_manager.get_agents(status="online")
+        agent_ids = [a['agent_id'] for a in agents]
+    
+    commands = []
+    for agent_id in agent_ids:
+        command_id = db_manager.queue_agent_command(agent_id, action, {
+            "requested_by": key_info.get("key_name", "api"),
+            "bulk_action": True
+        })
+        commands.append({"agent_id": agent_id, "command_id": command_id})
+    
+    logger.info(f"Triggered bulk action '{action}' on {len(commands)} agents")
+    
+    return APIResponse(
+        success=True,
+        message=f"Action '{action}' triggered on {len(commands)} agents",
+        data={"commands": commands}
+    ).to_dict()
+
+
+@app.post(f"/api/{API_VERSION}/test-scan")
+async def test_scan_patterns(content: str = ""):
+    """Test the scanner patterns against provided content - useful for debugging (no auth required)"""
+    import re
+    
+    DEFAULT_SIGNATURES = [
+        {"name": "AWS Access Key", "pattern": r"(?:A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}", "severity": "CRITICAL"},
+        {"name": "AWS Secret Key", "pattern": r"(?i)aws[_\-\.]?secret[_\-\.]?(?:access[_\-\.]?)?key['\"]?\s*[:=]\s*['\"]?([A-Za-z0-9/+=]{40})", "severity": "CRITICAL"},
+        {"name": "GitHub Token", "pattern": r"gh[pousr]_[A-Za-z0-9_]{36,255}", "severity": "CRITICAL"},
+        {"name": "Private Key", "pattern": r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----", "severity": "CRITICAL"},
+        {"name": "Password in Config", "pattern": r"(?i)(?:password|passwd|pwd)['\"]?\s*[:=]\s*['\"]?([^\s'\"]{8,})['\"]?", "severity": "HIGH"},
+        {"name": "JWT Token", "pattern": r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "severity": "HIGH"},
+        {"name": "Slack Token", "pattern": r"xox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*", "severity": "HIGH"},
+    ]
+    
+    if not content:
+        # Test with sample content
+        content = """AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+password = "SuperSecretPass123!"
+ghp_1234567890abcdef1234567890abcdef12345678
+-----BEGIN RSA PRIVATE KEY-----"""
+    
+    findings = []
+    for sig in DEFAULT_SIGNATURES:
+        try:
+            pattern = re.compile(sig["pattern"], re.IGNORECASE | re.MULTILINE)
+            matches = pattern.findall(content)
+            if matches:
+                findings.append({
+                    "rule": sig["name"],
+                    "severity": sig["severity"],
+                    "matches": len(matches),
+                    "first_match": matches[0][:30] + "..." if len(str(matches[0])) > 30 else str(matches[0])
+                })
+        except Exception as e:
+            findings.append({"rule": sig["name"], "error": str(e)})
+    
+    return {
+        "content_length": len(content),
+        "patterns_tested": len(DEFAULT_SIGNATURES),
+        "findings": findings,
+        "total_findings": sum(f.get("matches", 0) for f in findings)
+    }
+
+
 # ========== Agent Endpoints ==========
 
 @app.post(f"/api/{API_VERSION}/agents/register")
@@ -1321,6 +1522,35 @@ async def submit_findings(job_id: str, request: FindingsSubmission, key_info: Di
         success=True, 
         message="Findings received",
         data={"submitted": len(request.findings), "inserted": count}
+    ).to_dict()
+
+
+@app.post(f"/api/{API_VERSION}/jobs/{{job_id}}/results")
+async def submit_job_results(job_id: str, request: JobResultsSubmission, key_info: Dict = Depends(verify_api_key)):
+    """Submit job results (findings + status update) - endpoint used by agent's submit_results()"""
+    # Submit findings if any
+    findings_inserted = 0
+    if request.findings:
+        findings_inserted = db_manager.submit_findings(job_id, request.findings)
+    
+    # Update job status
+    status_update = JobStatusUpdate(
+        status=request.status,
+        completed_at=request.completed_at,
+        findings_count=request.findings_count or len(request.findings),
+        error_message=request.error
+    )
+    db_manager.update_job_status(job_id, status_update)
+    
+    logger.info(f"Job {job_id} results submitted: status={request.status}, findings={len(request.findings)}, inserted={findings_inserted}")
+    return APIResponse(
+        success=True, 
+        message="Results submitted",
+        data={
+            "status": request.status,
+            "findings_submitted": len(request.findings),
+            "findings_inserted": findings_inserted
+        }
     ).to_dict()
 
 

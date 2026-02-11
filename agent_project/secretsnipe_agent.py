@@ -320,29 +320,65 @@ class SecretSnipeAgent:
         paths = []
         
         if platform.system() == "Windows":
-            # List all drive letters
             import string
-            for letter in string.ascii_uppercase:
-                drive = f"{letter}:\\"
-                if Path(drive).exists():
-                    try:
-                        usage = psutil.disk_usage(drive)
-                        paths.append({
-                            "path": drive,
-                            "type": "drive",
-                            "total_gb": round(usage.total / (1024**3), 2),
-                            "free_gb": round(usage.free / (1024**3), 2)
-                        })
-                    except:
-                        paths.append({"path": drive, "type": "drive"})
+            import ctypes
             
-            # Also check for network shares in common locations
-            for share_base in ["\\\\", "Z:\\", "Y:\\"]:
-                try:
-                    if Path(share_base).exists():
-                        paths.append({"path": share_base, "type": "network_share"})
-                except:
-                    pass
+            # Use Windows API to get all logical drives (more reliable)
+            try:
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for letter in string.ascii_uppercase:
+                    if bitmask & 1:
+                        drive = f"{letter}:\\"
+                        try:
+                            usage = psutil.disk_usage(drive)
+                            # Determine drive type
+                            drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+                            type_names = {0: "unknown", 1: "no_root", 2: "removable", 
+                                         3: "fixed", 4: "network", 5: "cdrom", 6: "ramdisk"}
+                            paths.append({
+                                "path": drive,
+                                "type": type_names.get(drive_type, "drive"),
+                                "total_gb": round(usage.total / (1024**3), 2),
+                                "free_gb": round(usage.free / (1024**3), 2)
+                            })
+                        except PermissionError:
+                            paths.append({"path": drive, "type": "inaccessible"})
+                        except Exception:
+                            paths.append({"path": drive, "type": "drive"})
+                    bitmask >>= 1
+            except Exception as e:
+                logger.warning(f"Could not enumerate drives via API: {e}")
+                # Fallback to simple check
+                for letter in string.ascii_uppercase:
+                    drive = f"{letter}:\\"
+                    if Path(drive).exists():
+                        try:
+                            usage = psutil.disk_usage(drive)
+                            paths.append({
+                                "path": drive,
+                                "type": "drive",
+                                "total_gb": round(usage.total / (1024**3), 2),
+                                "free_gb": round(usage.free / (1024**3), 2)
+                            })
+                        except:
+                            paths.append({"path": drive, "type": "drive"})
+            
+            # Enumerate network shares using net use command
+            try:
+                import subprocess
+                result = subprocess.run(['net', 'use'], capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        if '\\\\' in line:
+                            parts = line.split()
+                            for part in parts:
+                                if part.startswith('\\\\'):
+                                    unc_path = part.strip()
+                                    if Path(unc_path).exists():
+                                        paths.append({"path": unc_path, "type": "network_share"})
+                                        logger.info(f"📁 Found network share: {unc_path}")
+            except Exception as e:
+                logger.debug(f"Could not enumerate network shares: {e}")
         else:
             # Linux - list mount points
             for part in psutil.disk_partitions():

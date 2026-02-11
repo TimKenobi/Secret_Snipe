@@ -36,6 +36,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY shared/ /app/shared/
 COPY manager/ /app/manager/
+COPY windows_installer/ /app/windows_installer/
 
 # Create logs directory
 RUN mkdir -p /app/logs && chown -R secretsnipe:secretsnipe /app

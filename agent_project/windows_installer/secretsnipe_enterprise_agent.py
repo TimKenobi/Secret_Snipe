@@ -44,6 +44,13 @@ except ImportError:
 
 
 # ============================================================================
+# VERSION
+# ============================================================================
+
+AGENT_VERSION = "2.0.4"
+
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
 
@@ -57,15 +64,19 @@ class AgentConfig:
     heartbeat_interval: int = 30
     job_poll_interval: int = 10
     max_cpu_percent: int = 50
-    max_memory_mb: int = 512
+    max_memory_mb: int = 90  # Treated as percentage (90%) when < 100
     scan_timeout: int = 3600  # 1 hour max per scan
     verify_ssl: bool = True
     
-    # Scanner settings
+    # Scanner settings - all enabled by default
     enable_custom: bool = True
-    enable_gitleaks: bool = False
-    enable_trufflehog: bool = False
+    enable_gitleaks: bool = True
+    enable_trufflehog: bool = True
     gitleaks_path: str = ""
+    trufflehog_path: str = ""
+    
+    # Additional paths to include in browse (useful for network shares)
+    additional_paths: List[str] = None
     
     # File watcher
     enable_file_watcher: bool = False
@@ -74,6 +85,8 @@ class AgentConfig:
     def __post_init__(self):
         if self.watch_paths is None:
             self.watch_paths = []
+        if self.additional_paths is None:
+            self.additional_paths = []
         if not self.machine_fingerprint:
             self.machine_fingerprint = self._generate_fingerprint()
     
@@ -322,12 +335,61 @@ class CustomRegexScanner(BaseScanner):
         findings = []
         
         try:
-            # Try to read as text
-            content = file_path.read_text(encoding='utf-8', errors='ignore')
-        except:
+            # Read file bytes first to detect encoding properly
+            raw_bytes = file_path.read_bytes()
+            
+            # Detect and decode encoding - order matters!
+            content = None
+            encoding_used = None
+            
+            # Check for BOM markers to detect encoding
+            if raw_bytes.startswith(b'\xff\xfe'):  # UTF-16 LE BOM
+                content = raw_bytes.decode('utf-16-le', errors='ignore')
+                encoding_used = 'utf-16-le'
+            elif raw_bytes.startswith(b'\xfe\xff'):  # UTF-16 BE BOM
+                content = raw_bytes.decode('utf-16-be', errors='ignore')
+                encoding_used = 'utf-16-be'
+            elif raw_bytes.startswith(b'\xef\xbb\xbf'):  # UTF-8 BOM
+                content = raw_bytes[3:].decode('utf-8', errors='ignore')
+                encoding_used = 'utf-8-sig'
+            else:
+                # No BOM - try UTF-8 first
+                try:
+                    content = raw_bytes.decode('utf-8')
+                    encoding_used = 'utf-8'
+                except UnicodeDecodeError:
+                    # Check for null bytes pattern (indicates UTF-16 without BOM)
+                    if b'\x00' in raw_bytes[:100]:
+                        # Likely UTF-16 LE (Windows default)
+                        content = raw_bytes.decode('utf-16-le', errors='ignore')
+                        encoding_used = 'utf-16-le'
+                    else:
+                        # Fallback to latin-1 (always succeeds)
+                        content = raw_bytes.decode('latin-1')
+                        encoding_used = 'latin-1'
+            
+            # Second check: if we have null bytes in content, it's probably misread UTF-16
+            if content and '\x00' in content[:200]:
+                self.logger.warning(f"Detected null bytes in {file_path}, trying UTF-16...")
+                content = raw_bytes.decode('utf-16', errors='ignore')
+                encoding_used = 'utf-16-auto'
+            
+            self.logger.info(f"📄 Scanning file: {file_path} ({len(content)} chars, {encoding_used})")
+            if len(content) > 0:
+                # Log first 100 chars for debugging
+                preview = content[:100].replace('\n', '\\n').replace('\r', '\\r').replace('\x00', '')
+                self.logger.info(f"📝 Content preview: {preview}...")
+        except Exception as e:
+            self.logger.warning(f"Failed to read {file_path}: {e}")
+            return findings
+        
+        if not content or len(content) < 10:
+            self.logger.info(f"File {file_path} is empty or too small")
             return findings
         
         lines = content.split('\n')
+        
+        self.logger.info(f"🔍 Checking {len(self._compiled_patterns)} patterns against {len(lines)} lines")
         
         for pattern_info in self._compiled_patterns:
             for match in pattern_info["pattern"].finditer(content):
@@ -344,6 +406,8 @@ class CustomRegexScanner(BaseScanner):
                 else:
                     masked = '*' * len(matched)
                 
+                self.logger.info(f"🎯 FOUND: {pattern_info['name']} at line {line_num}")
+                
                 findings.append({
                     "file": str(file_path),
                     "line": line_num,
@@ -355,6 +419,7 @@ class CustomRegexScanner(BaseScanner):
                     "timestamp": datetime.utcnow().isoformat()
                 })
         
+        self.logger.info(f"📊 File {file_path.name}: {len(findings)} findings")
         return findings
 
 
@@ -417,10 +482,19 @@ class GitleaksScanner(BaseScanner):
             self.logger.info(f"Running gitleaks: {' '.join(cmd)}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=options.get("timeout", 3600))
             
+            # Log return code and stderr for debugging
+            self.logger.info(f"Gitleaks return code: {result.returncode}")
+            if result.stderr:
+                self.logger.warning(f"Gitleaks stderr: {result.stderr[:500]}")
+            if result.stdout:
+                self.logger.debug(f"Gitleaks stdout: {result.stdout[:500]}")
+            
             # Parse output
             if os.path.exists(output_file):
                 with open(output_file, 'r') as f:
                     gitleaks_findings = json.load(f)
+                
+                self.logger.info(f"Gitleaks output file contains {len(gitleaks_findings)} findings")
                 
                 for finding in gitleaks_findings:
                     findings.append({
@@ -435,6 +509,8 @@ class GitleaksScanner(BaseScanner):
                     })
                 
                 os.remove(output_file)
+            else:
+                self.logger.warning(f"Gitleaks output file not found: {output_file}")
         
         except subprocess.TimeoutExpired:
             self.logger.error("Gitleaks scan timed out")
@@ -455,28 +531,68 @@ class GitleaksScanner(BaseScanner):
 
 
 class TrufflehogScanner(BaseScanner):
-    """Trufflehog-based scanner"""
+    """Trufflehog-based scanner - uses native binary"""
     
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, trufflehog_path: str = None):
         super().__init__(logger)
         self.name = "trufflehog"
+        self.trufflehog_path = trufflehog_path or self._find_trufflehog()
+        self.is_available = self.trufflehog_path is not None
+    
+    def _find_trufflehog(self) -> str:
+        """Find trufflehog executable"""
+        # Check common locations
+        paths = ["trufflehog", "trufflehog.exe"]
+        if platform.system() == "Windows":
+            paths.extend([
+                r"C:\Program Files\SecretSnipe\scanners\trufflehog.exe",
+                r"C:\Program Files\trufflehog\trufflehog.exe"
+            ])
+        else:
+            paths.extend([
+                "/usr/local/bin/trufflehog",
+                "/usr/bin/trufflehog",
+                "/opt/trufflehog/trufflehog"
+            ])
+        
+        for path in paths:
+            if os.path.isfile(path):
+                return path
+            # Check PATH
+            import shutil
+            found = shutil.which(path)
+            if found:
+                return found
+        
+        return None
     
     def scan(self, target_path: str, options: Dict = None) -> List[Dict]:
-        """Run trufflehog scan"""
+        """Run trufflehog scan using native binary"""
+        if not self.trufflehog_path:
+            self.logger.warning("Trufflehog not found, skipping scan")
+            return []
+        
         findings = []
         options = options or {}
         
         try:
-            # Run trufflehog via Python
+            # Run trufflehog binary
             cmd = [
-                sys.executable, "-m", "trufflehog",
+                self.trufflehog_path,
+                "filesystem",
+                target_path,
                 "--json",
-                "--max_depth", "1000",
-                "filesystem", target_path
+                "--no-update"
             ]
             
             self.logger.info(f"Running trufflehog on {target_path}")
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=options.get("timeout", 3600))
+            
+            # Log return code and stderr for debugging
+            self.logger.info(f"Trufflehog return code: {result.returncode}")
+            if result.stderr:
+                self.logger.warning(f"Trufflehog stderr: {result.stderr[:500]}")
+            self.logger.info(f"Trufflehog stdout lines: {len(result.stdout.strip().split(chr(10))) if result.stdout else 0}")
             
             # Parse JSON output (one JSON object per line)
             for line in result.stdout.strip().split('\n'):
@@ -530,14 +646,25 @@ class AgentManagerClient:
     
     def register(self) -> Dict:
         """Register agent with manager"""
-        # Build capabilities list
+        # Build capabilities list - only report scanners that are actually available
         capabilities = []
+        
+        # Check actual scanner availability (not just config flags)
         if self.config.enable_custom:
             capabilities.append("custom_scanner")
+        
+        # For gitleaks, check if executable exists
         if self.config.enable_gitleaks:
-            capabilities.append("gitleaks")
+            gitleaks_scanner = GitleaksScanner(logging.getLogger('capability_check'))
+            if gitleaks_scanner.gitleaks_path:
+                capabilities.append("gitleaks")
+        
+        # For trufflehog, check if binary is available
         if self.config.enable_trufflehog:
-            capabilities.append("trufflehog")
+            trufflehog_scanner = TrufflehogScanner(logging.getLogger('capability_check'), self.config.trufflehog_path)
+            if trufflehog_scanner.is_available:
+                capabilities.append("trufflehog")
+        
         if self.config.enable_file_watcher:
             capabilities.append("file_watcher")
         
@@ -546,7 +673,7 @@ class AgentManagerClient:
             "ip_address": self._get_ip(),
             "os_type": platform.system(),
             "os_version": platform.version(),
-            "agent_version": "2.0.0",
+            "agent_version": AGENT_VERSION,
             "capabilities": capabilities,
             "scan_paths": [],
             "tags": [],
@@ -735,14 +862,28 @@ class SecretSnipeEnterpriseAgent:
         remote_handler.setLevel(logging.INFO)
         self.logger.addHandler(remote_handler)
         
-        # Initialize scanners
+        # Initialize scanners with availability checks
         self.scanners = {}
+        
         if config.enable_custom:
             self.scanners["custom"] = CustomRegexScanner(self.logger)
+            self.logger.info("✅ Custom regex scanner: enabled")
+        
         if config.enable_gitleaks:
-            self.scanners["gitleaks"] = GitleaksScanner(self.logger, config.gitleaks_path)
+            gitleaks_scanner = GitleaksScanner(self.logger, config.gitleaks_path)
+            if gitleaks_scanner.gitleaks_path:
+                self.scanners["gitleaks"] = gitleaks_scanner
+                self.logger.info(f"✅ Gitleaks scanner: enabled ({gitleaks_scanner.gitleaks_path})")
+            else:
+                self.logger.warning("⚠️ Gitleaks scanner: enabled but executable not found - install gitleaks or set path in config")
+        
         if config.enable_trufflehog:
-            self.scanners["trufflehog"] = TrufflehogScanner(self.logger)
+            trufflehog_scanner = TrufflehogScanner(self.logger, config.trufflehog_path)
+            if trufflehog_scanner.is_available:
+                self.scanners["trufflehog"] = trufflehog_scanner
+                self.logger.info(f"✅ Trufflehog scanner: enabled ({trufflehog_scanner.trufflehog_path})")
+            else:
+                self.logger.warning("⚠️ Trufflehog scanner: enabled but executable not found - install trufflehog binary")
         
         self.running = False
         self.current_job = None
@@ -816,6 +957,19 @@ class SecretSnipeEnterpriseAgent:
         try:
             if command == "list_paths":
                 result_data = self._list_available_paths()
+            elif command == "list_dir":
+                # List directory contents
+                dir_path = params.get("path", "C:\\")
+                result_data = self._list_directory(dir_path)
+            elif command == "read_file":
+                # Read first N bytes of a file
+                file_path = params.get("path")
+                max_bytes = params.get("max_bytes", 1000)
+                result_data = self._read_file_preview(file_path, max_bytes)
+            elif command == "test_scan":
+                # Test scan a specific path with detailed output
+                scan_path = params.get("path")
+                result_data = self._test_scan(scan_path)
             elif command == "restart":
                 self.logger.info("Restart command received - will restart after this heartbeat cycle")
                 result_data = {"status": "restart_scheduled"}
@@ -823,11 +977,15 @@ class SecretSnipeEnterpriseAgent:
                 threading.Timer(5.0, self._restart_agent).start()
             elif command == "update":
                 self.logger.info("Update command received")
-                result_data = {"status": "update_not_implemented"}
+                result_data = self._update_agent()
+            elif command == "check_update":
+                self.logger.info("Check update command received")
+                result_data = self._check_for_update()
             elif command == "clear_cache":
                 result_data = {"status": "cache_cleared"}
             else:
                 self.logger.warning(f"Unknown command: {command}")
+                result_data = {"error": f"Unknown command: {command}"}
                 result_data = {"error": f"Unknown command: {command}"}
             
             # Report completion
@@ -838,27 +996,342 @@ class SecretSnipeEnterpriseAgent:
             self.logger.error(f"Command {command} failed: {e}")
             self.client.complete_command(command_id, {"error": str(e)})
     
+    def _list_directory(self, dir_path: str) -> Dict:
+        """List contents of a directory"""
+        try:
+            if not os.path.exists(dir_path):
+                return {"error": f"Path does not exist: {dir_path}"}
+            if not os.path.isdir(dir_path):
+                return {"error": f"Not a directory: {dir_path}"}
+            
+            items = []
+            for item in os.listdir(dir_path):
+                item_path = os.path.join(dir_path, item)
+                try:
+                    stat = os.stat(item_path)
+                    items.append({
+                        "name": item,
+                        "type": "dir" if os.path.isdir(item_path) else "file",
+                        "size": stat.st_size
+                    })
+                except:
+                    items.append({"name": item, "type": "unknown", "size": 0})
+            
+            return {"path": dir_path, "items": items, "count": len(items)}
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _read_file_preview(self, file_path: str, max_bytes: int = 1000) -> Dict:
+        """Read file content preview for debugging"""
+        try:
+            if not file_path:
+                return {"error": "No file path specified"}
+            if not os.path.exists(file_path):
+                return {"error": f"File does not exist: {file_path}"}
+            if not os.path.isfile(file_path):
+                return {"error": f"Not a file: {file_path}"}
+            
+            size = os.path.getsize(file_path)
+            
+            # Try UTF-8 first
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read(max_bytes)
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                # Try UTF-16
+                try:
+                    with open(file_path, 'r', encoding='utf-16') as f:
+                        content = f.read(max_bytes)
+                    encoding = "utf-16"
+                except:
+                    # Fall back to raw bytes
+                    with open(file_path, 'rb') as f:
+                        content = f.read(max_bytes).decode('utf-8', errors='replace')
+                    encoding = "binary"
+            
+            return {
+                "path": file_path,
+                "size": size,
+                "encoding": encoding,
+                "preview_bytes": max_bytes,
+                "content": content
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def _test_scan(self, scan_path: str) -> Dict:
+        """Test scan a path with detailed output"""
+        try:
+            if not scan_path:
+                return {"error": "No scan path specified"}
+            if not os.path.exists(scan_path):
+                return {"error": f"Path does not exist: {scan_path}"}
+            
+            result = {
+                "path": scan_path,
+                "is_file": os.path.isfile(scan_path),
+                "files_found": [],
+                "findings": [],
+                "patterns_loaded": len(self.scanners.get("custom", CustomRegexScanner(self.logger))._compiled_patterns) if "custom" in self.scanners else 0
+            }
+            
+            scanner = self.scanners.get("custom")
+            if not scanner:
+                return {"error": "Custom scanner not available"}
+            
+            if os.path.isfile(scan_path):
+                result["files_found"] = [scan_path]
+                findings = scanner._scan_file(Path(scan_path))
+                result["findings"] = findings
+            else:
+                files = scanner._get_files(Path(scan_path), {})
+                result["files_found"] = [str(f) for f in files[:50]]  # Limit to 50
+                for f in files[:10]:  # Only scan first 10 for test
+                    findings = scanner._scan_file(f)
+                    result["findings"].extend(findings)
+            
+            result["total_findings"] = len(result["findings"])
+            return result
+        except Exception as e:
+            return {"error": str(e)}
+    
     def _list_available_paths(self) -> Dict:
-        """List available scan paths on this machine"""
+        """List available scan paths on this machine with better depth"""
         paths = []
         
+        def safe_listdir(path, max_items=100):
+            """Safely list directory contents"""
+            try:
+                items = os.listdir(path)
+                return items[:max_items]
+            except (PermissionError, OSError):
+                return []
+        
+        def is_interesting_dir(name):
+            """Check if directory name suggests it might contain code/secrets"""
+            interesting = ['project', 'repo', 'code', 'src', 'app', 'web', 'api',
+                          'config', 'script', 'dev', 'work', 'git', 'source',
+                          'deploy', 'build', 'docker', 'ansible', 'terraform',
+                          'puppet', 'chef', 'salt', 'jenkins', 'ci', 'cd', 'test',
+                          'secret', 'key', 'cred', 'pass', 'token', 'backup']
+            name_lower = name.lower()
+            return any(i in name_lower for i in interesting)
+        
+        # Windows-only system folders to skip
+        skip_folders = {'windows', 'system volume information', '$recycle.bin', 
+                       'recovery', 'perflogs', 'msocache', '$windows.~bt', 
+                       '$windows.~ws', 'system32', 'syswow64'}
+        
         if platform.system() == "Windows":
-            # Check common Windows paths
-            for drive in ['C', 'D', 'E', 'F']:
-                drive_path = f"{drive}:\\"
-                if os.path.exists(drive_path):
-                    paths.append(drive_path)
-                    # Add common directories
-                    for subdir in ['Users', 'Projects', 'repos', 'code', 'workspace']:
-                        check_path = os.path.join(drive_path, subdir)
-                        if os.path.exists(check_path):
-                            paths.append(check_path)
+            # Enumerate ALL available drives dynamically (local + network + mapped)
+            import string
+            import ctypes
+            
+            available_drives = []
+            try:
+                # Get all logical drives using Windows API
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for letter in string.ascii_uppercase:
+                    if bitmask & 1:
+                        drive_path = f"{letter}:\\"
+                        available_drives.append(drive_path)
+                    bitmask >>= 1
+            except Exception as e:
+                self.logger.warning(f"Could not enumerate drives via API: {e}")
+                # Fallback to checking common drive letters
+                for letter in string.ascii_uppercase:
+                    drive_path = f"{letter}:\\"
+                    if os.path.exists(drive_path):
+                        available_drives.append(drive_path)
+            
+            # ALSO try to enumerate all drive letters A-Z regardless of API result
+            # This catches drives that might be accessible but not reported by GetLogicalDrives
+            for letter in string.ascii_uppercase:
+                drive_path = f"{letter}:\\"
+                if drive_path not in available_drives:
+                    try:
+                        if os.path.exists(drive_path) and os.path.isdir(drive_path):
+                            available_drives.append(drive_path)
+                            self.logger.info(f"📁 Found additional drive via exists check: {drive_path}")
+                    except:
+                        pass
+            
+            self.logger.info(f"📁 Found {len(available_drives)} drives: {available_drives}")
+            
+            # Process each available drive
+            for drive_path in available_drives:
+                try:
+                    if os.path.exists(drive_path):
+                        paths.append(drive_path)
+                        # Enumerate directories at drive root (except system folders)
+                        for item in safe_listdir(drive_path, 100):
+                            if item.lower() in skip_folders:
+                                continue
+                            item_path = os.path.join(drive_path, item)
+                            if os.path.isdir(item_path):
+                                paths.append(item_path)
+                except PermissionError:
+                    self.logger.debug(f"Access denied to drive: {drive_path}")
+                except Exception as e:
+                    self.logger.debug(f"Could not access drive {drive_path}: {e}")
+            
+            # Also check for UNC network paths (common network shares)
+            try:
+                import subprocess
+                result = subprocess.run(['net', 'use'], capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    for line in result.stdout.split('\n'):
+                        # Look for UNC paths like \\server\share
+                        if '\\\\' in line:
+                            parts = line.split()
+                            for part in parts:
+                                if part.startswith('\\\\'):
+                                    unc_path = part.strip()
+                                    if os.path.exists(unc_path):
+                                        paths.append(unc_path)
+                                        self.logger.info(f"📁 Found network share: {unc_path}")
+            except Exception as e:
+                self.logger.debug(f"Could not enumerate network shares via net use: {e}")
+            
+            # Try WMI to find network shares (works better for service accounts)
+            try:
+                import subprocess
+                # Use wmic to query Win32_LogicalDisk for network drives (DriveType=4)
+                result = subprocess.run(
+                    ['wmic', 'logicaldisk', 'where', 'DriveType=4', 'get', 'DeviceID,ProviderName', '/format:csv'],
+                    capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split('\n')[1:]:  # Skip header
+                        if ',' in line:
+                            parts = line.strip().split(',')
+                            if len(parts) >= 3:
+                                device_id = parts[1].strip()  # e.g., "O:"
+                                provider = parts[2].strip()   # e.g., "\\\\server\\share"
+                                if device_id and device_id not in [p.rstrip('\\') for p in available_drives]:
+                                    drive_path = f"{device_id}\\"
+                                    if os.path.exists(drive_path):
+                                        paths.append(drive_path)
+                                        self.logger.info(f"📁 Found WMI network drive: {drive_path} -> {provider}")
+                                if provider and provider.startswith('\\\\') and provider not in paths:
+                                    if os.path.exists(provider):
+                                        paths.append(provider)
+                                        self.logger.info(f"📁 Found WMI UNC path: {provider}")
+            except Exception as e:
+                self.logger.debug(f"Could not query WMI for network drives: {e}")
+            
+            # Check registry for persistent network mappings across all user profiles
+            try:
+                import winreg
+                # Check all user SIDs for network drive mappings
+                hku = winreg.HKEY_USERS
+                try:
+                    i = 0
+                    while True:
+                        try:
+                            sid = winreg.EnumKey(hku, i)
+                            if sid.startswith('S-1-5-21-'):  # Regular user SIDs
+                                try:
+                                    network_key = winreg.OpenKey(hku, f"{sid}\\Network")
+                                    j = 0
+                                    while True:
+                                        try:
+                                            drive_letter = winreg.EnumKey(network_key, j)
+                                            drive_key = winreg.OpenKey(network_key, drive_letter)
+                                            remote_path, _ = winreg.QueryValueEx(drive_key, "RemotePath")
+                                            winreg.CloseKey(drive_key)
+                                            
+                                            # Add the drive letter
+                                            drive_path = f"{drive_letter}:\\"
+                                            if drive_path not in paths:
+                                                try:
+                                                    if os.path.exists(drive_path):
+                                                        paths.append(drive_path)
+                                                        self.logger.info(f"📁 Found registry mapped drive: {drive_path}")
+                                                except:
+                                                    pass
+                                            
+                                            # Add the UNC path
+                                            if remote_path and remote_path.startswith('\\\\') and remote_path not in paths:
+                                                try:
+                                                    if os.path.exists(remote_path):
+                                                        paths.append(remote_path)
+                                                        self.logger.info(f"📁 Found registry UNC: {remote_path}")
+                                                except:
+                                                    pass
+                                            j += 1
+                                        except OSError:
+                                            break
+                                    winreg.CloseKey(network_key)
+                                except FileNotFoundError:
+                                    pass
+                            i += 1
+                        except OSError:
+                            break
+                except Exception as e:
+                    self.logger.debug(f"Registry enumeration error: {e}")
+            except ImportError:
+                self.logger.debug("winreg not available")
+            except Exception as e:
+                self.logger.debug(f"Could not check registry for network mappings: {e}")
+            
+            # Enumerate Users directory - each user's common folders
+            users_path = "C:\\Users"
+            if os.path.exists(users_path):
+                for user in safe_listdir(users_path):
+                    if user.lower() in ['public', 'default', 'default user', 'all users']:
+                        continue
+                    user_path = os.path.join(users_path, user)
+                    if os.path.isdir(user_path):
+                        paths.append(user_path)
+                        # Add common user subdirectories that might have code
+                        user_subdirs = ['Documents', 'Desktop', 'Downloads', 'source',
+                                       'repos', 'Projects', 'code', 'workspace', 'git',
+                                       'OneDrive', 'AppData\\Local', 'AppData\\Roaming']
+                        for subdir in user_subdirs:
+                            check_path = os.path.join(user_path, subdir)
+                            if os.path.exists(check_path):
+                                paths.append(check_path)
+                                # Go one level deeper for common dev folders
+                                for item in safe_listdir(check_path, 30):
+                                    item_path = os.path.join(check_path, item)
+                                    if os.path.isdir(item_path) and is_interesting_dir(item):
+                                        paths.append(item_path)
         else:
             # Linux/Mac paths
-            paths = ['/home', '/opt', '/var', '/etc']
-            paths = [p for p in paths if os.path.exists(p)]
+            base_paths = ['/home', '/opt', '/var', '/etc', '/srv', '/root', '/tmp']
+            for p in base_paths:
+                if os.path.exists(p):
+                    paths.append(p)
+            
+            # Enumerate home directories
+            home_path = '/home'
+            if os.path.exists(home_path):
+                for user in safe_listdir(home_path):
+                    user_path = os.path.join(home_path, user)
+                    if os.path.isdir(user_path):
+                        paths.append(user_path)
+                        # Common subdirs
+                        for subdir in ['projects', 'repos', 'code', 'workspace', 'git', '.config']:
+                            check_path = os.path.join(user_path, subdir)
+                            if os.path.exists(check_path):
+                                paths.append(check_path)
         
-        self.logger.info(f"📁 Discovered {len(paths)} paths: {paths}")
+        # Add any manually configured additional paths (useful for network shares)
+        if hasattr(self, 'config') and self.config.additional_paths:
+            for extra_path in self.config.additional_paths:
+                if extra_path and extra_path not in paths:
+                    try:
+                        if os.path.exists(extra_path):
+                            paths.append(extra_path)
+                            self.logger.info(f"📁 Added configured path: {extra_path}")
+                    except Exception as e:
+                        self.logger.debug(f"Could not access configured path {extra_path}: {e}")
+        
+        # Remove duplicates and sort
+        paths = sorted(list(set(paths)))
+        self.logger.info(f"📁 Discovered {len(paths)} paths")
         return {"paths": paths, "count": len(paths)}
     
     def _restart_agent(self):
@@ -868,8 +1341,122 @@ class SecretSnipeEnterpriseAgent:
         # Re-execute the current script
         os.execv(sys.executable, [sys.executable] + sys.argv)
     
+    def _update_agent(self) -> Dict:
+        """Download and update agent script from server"""
+        try:
+            self.logger.info("📥 Downloading new agent version...")
+            
+            # Download new agent from server
+            download_url = f"{self.config.manager_url}/api/v1/agent/download"
+            response = requests.get(
+                download_url, 
+                headers={"X-API-Key": self.config.api_key},
+                timeout=60
+            )
+            response.raise_for_status()
+            
+            # Get current script path
+            script_path = os.path.abspath(__file__)
+            backup_path = script_path + ".backup"
+            
+            # Extract version from new script if possible
+            new_content = response.text
+            new_version = "unknown"
+            import re
+            version_match = re.search(r'AGENT_VERSION\s*=\s*["\']([^"\']+)["\']', new_content)
+            if version_match:
+                new_version = version_match.group(1)
+            
+            # Get current version safely (for backwards compatibility with old agents)
+            current_version = globals().get('AGENT_VERSION', '0.0.0')
+            
+            self.logger.info(f"📦 New version: {new_version} (current: {current_version})")
+            
+            if new_version == current_version:
+                return {
+                    "status": "already_current",
+                    "message": f"Already running version {current_version}",
+                    "current_version": current_version
+                }
+            
+            # Backup current script
+            if os.path.exists(script_path):
+                import shutil
+                shutil.copy2(script_path, backup_path)
+                self.logger.info(f"✅ Backed up current script to {backup_path}")
+            
+            # Write new script (without BOM for Windows compatibility)  
+            with open(script_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            self.logger.info("✅ Agent script updated successfully")
+            self.logger.info("🔄 Scheduling restart in 5 seconds...")
+            
+            # Schedule restart
+            threading.Timer(5.0, self._restart_agent).start()
+            
+            return {
+                "status": "success",
+                "message": "Agent updated, restart scheduled",
+                "previous_version": current_version,
+                "new_version": new_version,
+                "new_size": len(new_content)
+            }
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Download failed: {e}")
+            return {"status": "error", "error": f"Download failed: {str(e)}"}
+        except IOError as e:
+            self.logger.error(f"❌ File write failed: {e}")
+            # Try to restore from backup
+            if os.path.exists(backup_path):
+                try:
+                    import shutil
+                    shutil.copy2(backup_path, script_path)
+                    self.logger.info("Restored from backup after write failure")
+                except:
+                    pass
+            return {"status": "error", "error": f"File write failed: {str(e)}"}
+        except Exception as e:
+            self.logger.error(f"❌ Update failed: {e}")
+            return {"status": "error", "error": str(e)}
+    
+    def _check_for_update(self) -> Dict:
+        """Check if an update is available from the server"""
+        try:
+            # Get current version safely (for backwards compatibility)
+            current_version = globals().get('AGENT_VERSION', '0.0.0')
+            
+            version_url = f"{self.config.manager_url}/api/v1/agent/version"
+            response = requests.get(
+                version_url,
+                headers={"X-API-Key": self.config.api_key},
+                timeout=10
+            )
+            response.raise_for_status()
+            data = response.json().get("data", {})
+            
+            server_version = data.get("latest_version", current_version)
+            update_available = server_version != current_version
+            
+            return {
+                "current_version": current_version,
+                "server_version": server_version,
+                "update_available": update_available
+            }
+        except Exception as e:
+            self.logger.debug(f"Version check failed: {e}")
+            current_version = globals().get('AGENT_VERSION', '0.0.0')
+            return {
+                "current_version": current_version,
+                "server_version": "unknown",
+                "update_available": False,
+                "error": str(e)
+            }
+    
     def _job_loop(self):
         """Main job processing loop"""
+        self.logger.info("Job loop started, polling interval: %ss", self.config.job_poll_interval)
         while self.running:
             try:
                 # Check resource usage
@@ -878,21 +1465,24 @@ class SecretSnipeEnterpriseAgent:
                     time.sleep(self.config.job_poll_interval)
                     continue
                 
-                # Get pending jobs
+                # Get pending jobs (poll endpoint already assigns them to us)
+                self.logger.debug("Polling for jobs...")
                 jobs = self.client.get_pending_jobs()
+                self.logger.debug(f"Got {len(jobs)} jobs from poll")
                 
                 for job in jobs:
                     if not self.running:
                         break
                     
-                    job_id = job.get("id")
+                    # API returns job_id, not id
+                    job_id = job.get("job_id") or job.get("id")
                     if not job_id:
+                        self.logger.warning(f"Job missing job_id: {job}")
                         continue
                     
-                    # Try to claim the job
-                    if self.client.claim_job(job_id):
-                        self.logger.info(f"Claimed job {job_id}")
-                        self._process_job(job)
+                    # Job is already assigned by poll endpoint, process it directly
+                    self.logger.info(f"Processing job {job_id}")
+                    self._process_job(job)
             
             except Exception as e:
                 self.logger.error(f"Job loop error: {e}")
@@ -902,48 +1492,81 @@ class SecretSnipeEnterpriseAgent:
     def _check_resources(self) -> bool:
         """Check if resource usage is within limits"""
         cpu = psutil.cpu_percent(interval=0.1)
-        memory = psutil.virtual_memory().percent
+        mem = psutil.virtual_memory()
         
+        # Check CPU - skip if system CPU is too high
         if cpu > self.config.max_cpu_percent:
+            self.logger.debug(f"CPU too high: {cpu}% > {self.config.max_cpu_percent}%")
             return False
-        if memory > (self.config.max_memory_mb / psutil.virtual_memory().total * 100 * 1024 * 1024):
-            return False
+        
+        # Check memory - use percentage of total RAM
+        # Default max_memory_mb is treated as percentage if < 100, otherwise MB
+        if self.config.max_memory_mb < 100:
+            # Treat as percentage
+            if mem.percent > self.config.max_memory_mb:
+                self.logger.debug(f"Memory too high: {mem.percent}% > {self.config.max_memory_mb}%")
+                return False
+        # else: no memory limit check for absolute values (legacy behavior disabled)
         
         return True
     
     def _process_job(self, job: Dict):
         """Process a scan job"""
-        job_id = job.get("id")
+        job_id = job.get("job_id") or job.get("id")
         self.current_job = job_id
         
         try:
-            target_path = job.get("target_path")
-            scan_type = job.get("scan_type", "full")
-            options = job.get("options", {})
+            # Get scan paths - can be array (scan_paths) or single path (target_path)
+            scan_paths = job.get("scan_paths", [])
+            if not scan_paths:
+                target_path = job.get("target_path")
+                if target_path:
+                    scan_paths = [target_path]
             
-            self.logger.info(f"Processing job {job_id}: {target_path}")
+            # Parse if it's a JSON string
+            if isinstance(scan_paths, str):
+                try:
+                    scan_paths = json.loads(scan_paths)
+                except:
+                    scan_paths = [scan_paths]
             
-            # Validate target path exists and is accessible
-            if not os.path.exists(target_path):
-                raise ValueError(f"Target path does not exist: {target_path}")
+            scan_type = job.get("job_type", "full")
+            options = job.get("config", {})
             
-            # Run scans
-            all_findings = []
+            self.logger.info(f"Processing job {job_id}: {scan_paths}")
+            
+            if not scan_paths:
+                raise ValueError("No scan paths specified in job")
             
             # Determine which scanners to use
-            scanners_to_use = options.get("scanners", list(self.scanners.keys()))
+            scanners_to_use = job.get("scanners", list(self.scanners.keys()))
+            if isinstance(scanners_to_use, str):
+                try:
+                    scanners_to_use = json.loads(scanners_to_use)
+                except:
+                    scanners_to_use = [scanners_to_use]
             
-            for scanner_name in scanners_to_use:
-                if scanner_name in self.scanners:
-                    scanner = self.scanners[scanner_name]
-                    self.logger.info(f"Running {scanner_name} scanner...")
-                    
-                    try:
-                        findings = scanner.scan(target_path, options)
-                        self.logger.info(f"{scanner_name} found {len(findings)} issues")
-                        all_findings.extend(findings)
-                    except Exception as e:
-                        self.logger.error(f"{scanner_name} scanner error: {e}")
+            all_findings = []
+            
+            for target_path in scan_paths:
+                # Validate target path exists and is accessible
+                if not os.path.exists(target_path):
+                    self.logger.warning(f"Target path does not exist: {target_path}")
+                    continue
+                
+                self.logger.info(f"Scanning path: {target_path}")
+                
+                for scanner_name in scanners_to_use:
+                    if scanner_name in self.scanners:
+                        scanner = self.scanners[scanner_name]
+                        self.logger.info(f"Running {scanner_name} scanner...")
+                        
+                        try:
+                            findings = scanner.scan(target_path, options)
+                            self.logger.info(f"{scanner_name} found {len(findings)} issues")
+                            all_findings.extend(findings)
+                        except Exception as e:
+                            self.logger.error(f"{scanner_name} scanner error: {e}")
             
             # Deduplicate findings
             all_findings = self._deduplicate_findings(all_findings)
@@ -1038,13 +1661,15 @@ def run_as_service():
             heartbeat_interval=config_data.get("agent", {}).get("heartbeat_interval", 30),
             job_poll_interval=config_data.get("agent", {}).get("job_poll_interval", 10),
             enable_custom=config_data.get("scanners", {}).get("custom", {}).get("enabled", True),
-            enable_gitleaks=config_data.get("scanners", {}).get("gitleaks", {}).get("enabled", False),
-            enable_trufflehog=config_data.get("scanners", {}).get("trufflehog", {}).get("enabled", False),
+            enable_gitleaks=config_data.get("scanners", {}).get("gitleaks", {}).get("enabled", True),
+            enable_trufflehog=config_data.get("scanners", {}).get("trufflehog", {}).get("enabled", True),
             gitleaks_path=config_data.get("scanners", {}).get("gitleaks", {}).get("path", ""),
+            trufflehog_path=config_data.get("scanners", {}).get("trufflehog", {}).get("path", ""),
             max_cpu_percent=config_data.get("resource_limits", {}).get("max_cpu_percent", 50),
-            max_memory_mb=config_data.get("resource_limits", {}).get("max_memory_mb", 512),
+            max_memory_mb=config_data.get("resource_limits", {}).get("max_memory_mb", 90),
             verify_ssl=config_data.get("manager", {}).get("verify_ssl", True),
-            machine_fingerprint=config_data.get("agent", {}).get("machine_fingerprint", "")
+            machine_fingerprint=config_data.get("agent", {}).get("machine_fingerprint", ""),
+            additional_paths=config_data.get("agent", {}).get("additional_paths", [])
         )
         log_startup(f"AgentConfig created successfully")
     except Exception as e:

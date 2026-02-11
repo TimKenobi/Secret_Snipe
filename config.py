@@ -51,6 +51,8 @@ class RedisConfig:
             self.host = os.getenv('REDIS_HOST')
         if os.getenv('REDIS_PORT'):
             self.port = int(os.getenv('REDIS_PORT'))
+        if os.getenv('REDIS_DB'):
+            self.db = int(os.getenv('REDIS_DB'))
         if os.getenv('REDIS_PASSWORD'):
             self.password = os.getenv('REDIS_PASSWORD')
 

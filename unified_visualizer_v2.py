@@ -239,10 +239,30 @@ def test_route():
 @server.route('/login', methods=['POST'])
 def handle_login():
     """Handle login form submission"""
-    # Always redirect for testing
-    session['authenticated'] = True
-    session['username'] = 'admin'
-    return redirect('/', code=302)
+    username = request.form.get('username', '')
+    password = request.form.get('password', '')
+    
+    # Get configured credentials
+    expected_username = config.dashboard.auth_username or 'admin'
+    expected_password = config.dashboard.auth_password_hash or 'secretsnipe'
+    
+    # Validate credentials
+    if username == expected_username and password == expected_password:
+        session['authenticated'] = True
+        session['username'] = username
+        audit_log('login_success', 'system', {'username': username})
+        return redirect('/', code=302)
+    else:
+        audit_log('login_failed', 'system', {'username': username})
+        return redirect('/login?error=1', code=302)
+
+# Show login page for GET requests
+@server.route('/login', methods=['GET'])
+def show_login():
+    """Show login page"""
+    if session.get('authenticated'):
+        return redirect('/', code=302)
+    return render_login_page()
 
 # Logout route
 @server.route('/logout', methods=['POST', 'GET'])
@@ -611,7 +631,7 @@ chart_data_cache = {
     'file_extension_counts': None,
     'secret_type_counts': None,
     'last_update': None,
-    'cache_duration': timedelta(seconds=60)  # Longer TTL for aggregated data
+    'cache_duration': timedelta(minutes=5)  # 5 minute cache - use Refresh button for live updates
 }
 
 
@@ -622,6 +642,23 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
     """
     global chart_data_cache
     now = datetime.now()
+    
+    # Check if we're in agent mode - query agent database instead
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            logger.debug(f"get_chart_data: scan_mode from Redis = {scan_mode}")
+        else:
+            logger.debug("get_chart_data: cache_manager is None")
+    except Exception as e:
+        logger.debug(f"get_chart_data: Redis error: {e}")
+    
+    if scan_mode in ('agents', 'agent_only'):
+        logger.info(f"get_chart_data: Routing to agent database (scan_mode={scan_mode})")
+        return get_agent_chart_data(force_refresh)
+    
+    logger.debug(f"get_chart_data: Using V1 database (scan_mode={scan_mode})")
     
     # Check cache validity
     if (not force_refresh and
@@ -721,6 +758,306 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
             'last_update': None
         }
 
+
+def get_agent_chart_data(force_refresh: bool = False) -> dict:
+    """Get chart data from the agent database (V2 agent mode)."""
+    global chart_data_cache
+    now = datetime.now()
+    
+    logger.info(f"get_agent_chart_data: Called with force_refresh={force_refresh}")
+    
+    # Check cache validity
+    if (not force_refresh and
+        chart_data_cache['last_update'] and
+        now - chart_data_cache['last_update'] < chart_data_cache['cache_duration']):
+        logger.debug("get_agent_chart_data: Returning cached data")
+        return chart_data_cache
+    
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        logger.info(f"get_agent_chart_data: Connecting to agent DB at {agent_db_host}:{agent_db_port}")
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        cur = conn.cursor()
+        
+        # Query 1: Severity counts - normalize case
+        cur.execute("""
+            SELECT INITCAP(severity) as severity, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY INITCAP(severity)
+        """)
+        severity_results = cur.fetchall()
+        chart_data_cache['severity_counts'] = {row['severity']: row['count'] for row in severity_results}
+        
+        # Query 2: Scanner distribution
+        cur.execute("""
+            SELECT scanner as tool_source, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY scanner
+        """)
+        tool_results = cur.fetchall()
+        chart_data_cache['tool_counts'] = {row['tool_source']: row['count'] for row in tool_results}
+        
+        # Query 3: Timeline data
+        cur.execute("""
+            SELECT DATE(found_at) as date, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+              AND found_at >= CURRENT_DATE - INTERVAL '90 days'
+            GROUP BY DATE(found_at)
+            ORDER BY date
+        """)
+        timeline_results = cur.fetchall()
+        chart_data_cache['timeline_data'] = [
+            {'date': str(row['date']), 'count': row['count']} for row in timeline_results
+        ]
+        
+        # Query 4: File extension counts (extract from file_path)
+        cur.execute("""
+            SELECT 
+                COALESCE(SUBSTRING(file_path FROM '\\.[^.\\\\]+$'), 'unknown') as file_extension,
+                COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY SUBSTRING(file_path FROM '\\.[^.\\\\]+$')
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        extension_results = cur.fetchall()
+        chart_data_cache['file_extension_counts'] = {row['file_extension'] or 'unknown': row['count'] for row in extension_results}
+        
+        # Query 5: Secret type counts by scanner
+        cur.execute("""
+            SELECT scanner as tool_source, secret_type, COUNT(*) as count
+            FROM agent_findings
+            WHERE status = 'open'
+            GROUP BY scanner, secret_type
+            ORDER BY count DESC
+        """)
+        secret_results = cur.fetchall()
+        secret_by_tool = {}
+        for row in secret_results:
+            tool = row['tool_source']
+            if tool not in secret_by_tool:
+                secret_by_tool[tool] = {}
+            secret_by_tool[tool][row['secret_type']] = row['count']
+        chart_data_cache['secret_type_counts'] = secret_by_tool
+        
+        cur.close()
+        conn.close()
+        
+        chart_data_cache['last_update'] = now
+        logger.debug("Agent chart data cache refreshed")
+        
+        return chart_data_cache
+        
+    except Exception as e:
+        logger.error(f"Error fetching agent chart data: {e}")
+        return {
+            'severity_counts': {},
+            'tool_counts': {},
+            'timeline_data': [],
+            'file_extension_counts': {},
+            'secret_type_counts': {},
+            'last_update': None
+        }
+
+
+def get_agent_findings_data(limit: int = None) -> pd.DataFrame:
+    """Get findings from the agent database (V2 agent mode)."""
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        
+        limit_clause = f"LIMIT {limit}" if limit else ""
+        
+        query = f"""
+            SELECT
+                af.id, af.file_path, af.secret_type, af.secret_value, 
+                af.line_content as context, INITCAP(af.severity) as severity, af.scanner as tool_source,
+                af.found_at as first_seen, af.found_at as last_seen, 
+                1.0 as confidence_score, af.status as resolution_status,
+                NULL as fp_reason, NULL as fp_marked_by, NULL as fp_marked_at,
+                af.line_number, af.secret_type as finding_category, af.line_content as proof_content,
+                af.found_at as file_last_accessed, af.found_at as file_modified_at,
+                NULL as owner_name, NULL as owner_email,
+                'Agent Scan' as project_name, 'agent' as scan_type,
+                a.hostname as agent_hostname
+            FROM agent_findings af
+            LEFT JOIN agents a ON af.agent_id = a.agent_id
+            WHERE af.status = 'open'
+            ORDER BY af.found_at DESC
+            {limit_clause}
+        """
+        
+        cur = conn.cursor()
+        cur.execute(query)
+        findings = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if findings:
+            df = pd.DataFrame([dict(r) for r in findings])
+            df['first_seen'] = pd.to_datetime(df['first_seen'])
+            df['last_seen'] = pd.to_datetime(df['last_seen'])
+            return df
+        else:
+            return pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"Error fetching agent findings: {e}")
+        return pd.DataFrame()
+
+
+def get_agent_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all', 
+                                secret_type_filter: str = 'all') -> pd.DataFrame:
+    """Get agent findings grouped by file path for V2 agent mode."""
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        
+        # Build WHERE conditions
+        conditions = ["af.status = 'open'"]
+        if tool_filter != 'all':
+            conditions.append(f"af.scanner = '{tool_filter}'")
+        if severity_filter != 'all':
+            conditions.append(f"UPPER(af.severity) = UPPER('{severity_filter}')")
+        if secret_type_filter != 'all':
+            conditions.append(f"af.secret_type = '{secret_type_filter}'")
+        
+        where_clause = " AND ".join(conditions)
+        
+        query = f"""
+            SELECT 
+                af.file_path,
+                COUNT(*) as finding_count,
+                array_agg(DISTINCT af.scanner) as tools,
+                array_agg(DISTINCT INITCAP(af.severity)) as severities,
+                array_agg(DISTINCT af.secret_type) as secret_types,
+                MAX(INITCAP(af.severity)) as max_severity,
+                MAX(af.found_at) as latest_finding,
+                MIN(af.found_at) as earliest_finding,
+                COALESCE(a.hostname, 'Unknown Agent') as project_name,
+                -- Extract parent folder (everything before last \\ or /)
+                REGEXP_REPLACE(af.file_path, '[/\\\\][^/\\\\]+$', '') as parent_folder,
+                COALESCE(a.hostname, 'Agent') as scan_source
+            FROM agent_findings af
+            LEFT JOIN agents a ON af.agent_id = a.agent_id
+            WHERE {where_clause}
+            GROUP BY af.file_path, a.hostname
+            ORDER BY 
+                REGEXP_REPLACE(af.file_path, '[/\\\\][^/\\\\]+$', '') ASC,
+                COUNT(*) DESC,
+                af.file_path ASC
+        """
+        
+        cur = conn.cursor()
+        cur.execute(query)
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if results:
+            df = pd.DataFrame([dict(r) for r in results])
+            # Convert PostgreSQL arrays to Python lists
+            for col in ['tools', 'severities', 'secret_types']:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: list(x) if x else [])
+            return df
+        return pd.DataFrame()
+        
+    except Exception as e:
+        logger.error(f"Error getting agent file-grouped data: {e}")
+        return pd.DataFrame()
+
+
+def get_agent_findings_for_file(file_path: str) -> List[Dict[str, Any]]:
+    """Get all agent findings for a specific file path."""
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        
+        query = """
+            SELECT 
+                af.id, af.secret_type, af.secret_value, af.line_content as context, 
+                INITCAP(af.severity) as severity, af.scanner as tool_source, 
+                af.found_at as first_seen, 1.0 as confidence_score, 
+                af.status as resolution_status, af.line_number
+            FROM agent_findings af
+            WHERE af.file_path = %s AND af.status = 'open'
+            ORDER BY 
+                CASE UPPER(af.severity)
+                    WHEN 'CRITICAL' THEN 1
+                    WHEN 'HIGH' THEN 2
+                    WHEN 'MEDIUM' THEN 3
+                    WHEN 'LOW' THEN 4
+                    ELSE 5
+                END,
+                af.found_at DESC
+        """
+        
+        cur = conn.cursor()
+        cur.execute(query, (file_path,))
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        return [dict(r) for r in results] if results else []
+        
+    except Exception as e:
+        logger.error(f"Error getting agent findings for file {file_path}: {e}")
+        return []
+
+
 def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.DataFrame:
     """Get findings data from database with caching and security.
     
@@ -729,6 +1066,17 @@ def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.Data
         limit: Optional limit on number of rows (for table display)
     """
     now = datetime.now()
+    
+    # Check if we're in agent mode - query agent database instead
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_findings_data(limit)
 
     # Check cache validity (only for unlimited queries)
     if (not force_refresh and limit is None and
@@ -789,6 +1137,17 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
     Returns a DataFrame with one row per file, containing aggregated finding info.
     Includes parent_folder for sorting files in the same directory together.
     """
+    # Check if we're in agent mode
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_file_grouped_data(tool_filter, severity_filter, secret_type_filter)
+    
     try:
         # Build dynamic WHERE clause
         conditions = ["f.resolution_status != 'false_positive'"]
@@ -865,6 +1224,17 @@ def get_file_grouped_data(tool_filter: str = 'all', severity_filter: str = 'all'
 
 def get_findings_for_file(file_path: str) -> List[Dict[str, Any]]:
     """Get all findings for a specific file path."""
+    # Check if we're in agent mode
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_findings_for_file(file_path)
+    
     try:
         query = """
             SELECT 
@@ -899,6 +1269,17 @@ def get_tool_summary_stats(force_refresh: bool = False) -> Dict[str, Dict[str, A
     """Get summary statistics per tool for the separate tool sections."""
     global tool_stats_cache
     now = datetime.now()
+    
+    # Check if we're in agent mode - query agent database instead
+    scan_mode = None
+    try:
+        if redis_manager.cache_manager:
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    if scan_mode in ('agents', 'agent_only'):
+        return get_agent_tool_summary_stats(force_refresh)
     
     # Use cache if available and not forcing refresh
     if (not force_refresh and 
@@ -943,6 +1324,77 @@ def get_tool_summary_stats(force_refresh: bool = False) -> Dict[str, Dict[str, A
         return stats
     except Exception as e:
         logger.error(f"Error getting tool summary stats: {e}")
+        return tool_stats_cache['data'] if tool_stats_cache['data'] else {}
+
+
+def get_agent_tool_summary_stats(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Get summary statistics per tool from agent database."""
+    global tool_stats_cache
+    now = datetime.now()
+    
+    # Use cache if available and not forcing refresh
+    if (not force_refresh and 
+        tool_stats_cache['data'] is not None and 
+        tool_stats_cache['last_update'] and
+        now - tool_stats_cache['last_update'] < data_cache['cache_duration']):
+        return tool_stats_cache['data']
+    
+    try:
+        import psycopg2
+        import psycopg2.extras
+        
+        agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+        agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+        
+        conn = psycopg2.connect(
+            host=agent_db_host,
+            port=agent_db_port,
+            database='secretsnipe_agents',
+            user='secretsnipe',
+            password='secretsnipe_secure_pass',
+            cursor_factory=psycopg2.extras.RealDictCursor
+        )
+        cur = conn.cursor()
+        
+        query = """
+            SELECT 
+                af.scanner as tool_source,
+                COUNT(*) as total_findings,
+                COUNT(DISTINCT af.file_path) as unique_files,
+                SUM(CASE WHEN UPPER(af.severity) = 'CRITICAL' THEN 1 ELSE 0 END) as critical_count,
+                SUM(CASE WHEN UPPER(af.severity) = 'HIGH' THEN 1 ELSE 0 END) as high_count,
+                SUM(CASE WHEN UPPER(af.severity) = 'MEDIUM' THEN 1 ELSE 0 END) as medium_count,
+                SUM(CASE WHEN UPPER(af.severity) = 'LOW' THEN 1 ELSE 0 END) as low_count,
+                MAX(af.found_at) as last_finding_date
+            FROM agent_findings af
+            WHERE af.status = 'open'
+            GROUP BY af.scanner
+        """
+        cur.execute(query)
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        stats = {}
+        for row in results:
+            stats[row['tool_source']] = {
+                'total_findings': row['total_findings'],
+                'unique_files': row['unique_files'],
+                'critical': row['critical_count'],
+                'high': row['high_count'],
+                'medium': row['medium_count'],
+                'low': row['low_count'],
+                'last_finding': row['last_finding_date']
+            }
+        
+        # Cache the results
+        tool_stats_cache['data'] = stats
+        tool_stats_cache['last_update'] = now
+        
+        logger.info(f"Agent tool stats: {stats}")
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting agent tool summary stats: {e}")
         return tool_stats_cache['data'] if tool_stats_cache['data'] else {}
 
 
@@ -1454,48 +1906,112 @@ def update_dashboard(severity_filter, tool_filter, project_filter, secret_type_f
                 row[key] = sanitize_input(value, 500)  # Limit field length for display
 
     # Get accurate counts from database (fast COUNT queries)
+    # Check if in agent mode for summary stats
+    summary_scan_mode = None
     try:
-        # Total count
-        total_query = "SELECT COUNT(*) as count FROM findings WHERE resolution_status != 'false_positive'"
-        total_result = db_manager.execute_query(total_query)
-        total_in_db = total_result[0]['count'] if total_result else 0
-        
-        # Severity counts
-        severity_query = """
-            SELECT severity, COUNT(*) as count 
-            FROM findings 
-            WHERE resolution_status != 'false_positive'
-            GROUP BY severity
-        """
-        severity_result = db_manager.execute_query(severity_query)
-        severity_counts = {r['severity']: r['count'] for r in severity_result} if severity_result else {}
-        
-        # Tool counts
-        tool_query = """
-            SELECT tool_source, COUNT(*) as count 
-            FROM findings 
-            WHERE resolution_status != 'false_positive'
-            GROUP BY tool_source
-        """
-        tool_result = db_manager.execute_query(tool_query)
-        tool_counts = {r['tool_source']: r['count'] for r in tool_result} if tool_result else {}
-        
-        critical_count = severity_counts.get('Critical', 0)
-        high_count = severity_counts.get('High', 0)
-        medium_count = severity_counts.get('Medium', 0)
-        low_count = severity_counts.get('Low', 0)
-        
-        custom_count = tool_counts.get('custom', 0)
-        gitleaks_count = tool_counts.get('gitleaks', 0)
-        trufflehog_count = tool_counts.get('trufflehog', 0)
-        
-    except Exception as e:
-        logger.warning(f"Error getting DB counts: {e}")
-        # Fallback to dataframe counts
-        total_in_db = len(df)
-        critical_count = len(filtered_df[filtered_df['severity'] == 'Critical'])
-        high_count = len(filtered_df[filtered_df['severity'] == 'High'])
-        medium_count = len(filtered_df[filtered_df['severity'] == 'Medium'])
+        if redis_manager.cache_manager:
+            summary_scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+    except Exception:
+        pass
+    
+    if summary_scan_mode in ('agents', 'agent_only'):
+        # Use agent database for summary stats
+        try:
+            import psycopg2
+            import psycopg2.extras
+            agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+            agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+            
+            agent_conn = psycopg2.connect(
+                host=agent_db_host,
+                port=agent_db_port,
+                database='secretsnipe_agents',
+                user='secretsnipe',
+                password='secretsnipe_secure_pass',
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            agent_cur = agent_conn.cursor()
+            
+            # Total count from agent findings
+            agent_cur.execute("SELECT COUNT(*) as count FROM agent_findings WHERE status = 'open'")
+            total_in_db = agent_cur.fetchone()['count']
+            
+            # Severity counts
+            agent_cur.execute("""
+                SELECT INITCAP(severity) as severity, COUNT(*) as count 
+                FROM agent_findings WHERE status = 'open'
+                GROUP BY INITCAP(severity)
+            """)
+            severity_counts = {r['severity']: r['count'] for r in agent_cur.fetchall()}
+            
+            # Tool counts
+            agent_cur.execute("""
+                SELECT scanner as tool_source, COUNT(*) as count 
+                FROM agent_findings WHERE status = 'open'
+                GROUP BY scanner
+            """)
+            tool_counts = {r['tool_source']: r['count'] for r in agent_cur.fetchall()}
+            
+            agent_cur.close()
+            agent_conn.close()
+            
+            critical_count = severity_counts.get('Critical', 0)
+            high_count = severity_counts.get('High', 0)
+            medium_count = severity_counts.get('Medium', 0)
+            low_count = severity_counts.get('Low', 0)
+            
+            custom_count = tool_counts.get('custom', 0)
+            gitleaks_count = tool_counts.get('gitleaks', 0)
+            trufflehog_count = tool_counts.get('trufflehog', 0)
+        except Exception as e:
+            logger.warning(f"Error getting agent DB counts: {e}")
+            total_in_db = len(df)
+            critical_count = high_count = medium_count = low_count = 0
+            custom_count = gitleaks_count = trufflehog_count = 0
+    else:
+        # Use V1 database for summary stats
+        try:
+            # Total count
+            total_query = "SELECT COUNT(*) as count FROM findings WHERE resolution_status != 'false_positive'"
+            total_result = db_manager.execute_query(total_query)
+            total_in_db = total_result[0]['count'] if total_result else 0
+            
+            # Severity counts
+            severity_query = """
+                SELECT severity, COUNT(*) as count 
+                FROM findings 
+                WHERE resolution_status != 'false_positive'
+                GROUP BY severity
+            """
+            severity_result = db_manager.execute_query(severity_query)
+            severity_counts = {r['severity']: r['count'] for r in severity_result} if severity_result else {}
+            
+            # Tool counts
+            tool_query = """
+                SELECT tool_source, COUNT(*) as count 
+                FROM findings 
+                WHERE resolution_status != 'false_positive'
+                GROUP BY tool_source
+            """
+            tool_result = db_manager.execute_query(tool_query)
+            tool_counts = {r['tool_source']: r['count'] for r in tool_result} if tool_result else {}
+            
+            critical_count = severity_counts.get('Critical', 0)
+            high_count = severity_counts.get('High', 0)
+            medium_count = severity_counts.get('Medium', 0)
+            low_count = severity_counts.get('Low', 0)
+            
+            custom_count = tool_counts.get('custom', 0)
+            gitleaks_count = tool_counts.get('gitleaks', 0)
+            trufflehog_count = tool_counts.get('trufflehog', 0)
+            
+        except Exception as e:
+            logger.warning(f"Error getting DB counts: {e}")
+            # Fallback to dataframe counts
+            total_in_db = len(df)
+            critical_count = len(filtered_df[filtered_df['severity'] == 'Critical'])
+            high_count = len(filtered_df[filtered_df['severity'] == 'High'])
+            medium_count = len(filtered_df[filtered_df['severity'] == 'Medium'])
         low_count = len(filtered_df[filtered_df['severity'] == 'Low'])
         custom_count = len(filtered_df[filtered_df['tool_source'] == 'custom'])
         gitleaks_count = len(filtered_df[filtered_df['tool_source'] == 'gitleaks'])
@@ -3967,6 +4483,95 @@ def update_scanner_status(n_intervals):
         # Check Redis connectivity
         redis_connected = redis_manager.redis_manager and redis_manager.redis_manager.ping()
         redis_status = "✅ Connected" if redis_connected else "❌ Disconnected"
+        
+        # Check scan mode - if agent_only or agents, show agent status
+        scan_mode = None
+        if redis_connected and redis_manager.cache_manager:
+            try:
+                scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            except Exception:
+                pass
+        
+        # If in agent mode, show agent-specific status
+        if scan_mode in ('agent_only', 'agents'):
+            try:
+                import psycopg2
+                import psycopg2.extras
+                agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+                agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+                
+                agent_conn = psycopg2.connect(
+                    host=agent_db_host,
+                    port=agent_db_port,
+                    database='secretsnipe_agents',
+                    user='secretsnipe',
+                    password='secretsnipe_secure_pass',
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                )
+                agent_cur = agent_conn.cursor()
+                
+                # Get agent status info
+                agent_cur.execute("""
+                    SELECT COUNT(*) as total_agents,
+                           COUNT(*) FILTER (WHERE last_heartbeat > NOW() - INTERVAL '2 minutes') as online_agents
+                    FROM agents
+                """)
+                agent_info = agent_cur.fetchone()
+                total_agents = agent_info['total_agents'] if agent_info else 0
+                online_agents = agent_info['online_agents'] if agent_info else 0
+                
+                # Get findings by scanner
+                agent_cur.execute("""
+                    SELECT scanner, COUNT(*) as count 
+                    FROM agent_findings WHERE status = 'open' 
+                    GROUP BY scanner
+                """)
+                scanner_counts = {r['scanner']: r['count'] for r in agent_cur.fetchall()}
+                
+                # Get total findings
+                agent_cur.execute("SELECT COUNT(*) as total FROM agent_findings WHERE status = 'open'")
+                total_findings = agent_cur.fetchone()['total']
+                
+                # Get running jobs
+                agent_cur.execute("""
+                    SELECT COUNT(*) as running FROM agent_jobs WHERE status = 'running'
+                """)
+                running_jobs = agent_cur.fetchone()['running']
+                
+                agent_cur.close()
+                agent_conn.close()
+                
+                # Build status based on scanner activity
+                custom_findings = scanner_counts.get('custom', 0)
+                trufflehog_findings = scanner_counts.get('trufflehog', 0)
+                gitleaks_findings = scanner_counts.get('gitleaks', 0)
+                
+                # Determine status
+                if running_jobs > 0:
+                    job_status = "🔄 Scanning"
+                    status_class = "status-item status-running"
+                else:
+                    job_status = "✅ Monitoring"
+                    status_class = "status-item status-success"
+                
+                return (
+                    f"Custom Scanner: {custom_findings:,} findings | {job_status}", 
+                    status_class if custom_findings > 0 else "status-item",
+                    f"Trufflehog: {trufflehog_findings:,} findings", 
+                    "status-item status-success" if trufflehog_findings > 0 else "status-item",
+                    f"Gitleaks: {gitleaks_findings:,} findings", 
+                    "status-item status-success" if gitleaks_findings > 0 else "status-item",
+                    f"📊 Agent Mode | {online_agents}/{total_agents} Agents Online | Total: {total_findings:,} findings | Redis: {redis_status}", 
+                    "status-item status-agent"
+                )
+            except Exception as e:
+                logger.error(f"Error getting agent status: {e}")
+                return (
+                    "Custom Scanner: Agent Mode", "status-item",
+                    "Trufflehog: Agent Mode", "status-item",
+                    "Gitleaks: Agent Mode", "status-item",
+                    f"📊 Agent Mode (DB Error) | Redis: {redis_status}", "status-item status-warning"
+                )
 
         # Try to get real-time progress from Redis
         custom_progress = None
@@ -4707,8 +5312,11 @@ def create_main_dashboard_layout():
                 ], className="scanner-status-grid")
             ], className="scanner-status"),
 
-            # Global Stores
+            # Global Stores - session storage for tab persistence
             dcc.Store(id="finding-detail-store", data={}),
+            dcc.Store(id="chart-data-store", data={}, storage_type='session'),  # Cache chart data across tabs
+            dcc.Store(id="tool-stats-store", data={}, storage_type='session'),  # Cache tool stats across tabs
+            dcc.Store(id="summary-stats-store", data={}, storage_type='session'),  # Cache summary stats across tabs
             
             # Custom Scan Modal (hidden in V2 but kept for compatibility)
             html.Div([
@@ -7665,11 +8273,11 @@ def main():
         return 1
 
     # Initialize Redis with security validation
-    if not init_redis(host=config.redis.host, port=config.redis.port, password=config.redis.password):
+    if not init_redis(host=config.redis.host, port=config.redis.port, db=config.redis.db, password=config.redis.password):
         logger.warning("⚠️ Redis not available - dashboard will work with reduced caching")
         audit_log('redis_unavailable', 'system', {'impact': 'reduced_caching'})
     else:
-        logger.info("✅ Redis connection established")
+        logger.info(f"✅ Redis connection established (db={config.redis.db})")
 
     # V2: Log agent administration status
     if AGENT_ADMIN_AVAILABLE:

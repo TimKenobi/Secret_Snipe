@@ -205,6 +205,27 @@ body {
     background: #fffbf0;
 }
 
+.status-item.status-running {
+    border-left-color: #17a2b8;
+    background: #f0f9ff;
+}
+
+.status-item.status-success {
+    border-left-color: #28a745;
+    background: #f0fff4;
+}
+
+.status-item.status-inactive {
+    border-left-color: #6c757d;
+    background: #f8f9fa;
+    color: #6c757d;
+}
+
+.status-item.status-agent {
+    border-left-color: #9b59b6;
+    background: #f5f0ff;
+}
+
 /* Dark mode adjustments for status items */
 .dark-mode .status-item {
     border-left-color: #28a745;
@@ -218,6 +239,27 @@ body {
 .dark-mode .status-item.status-warning {
     background: #4d4d2d;
     border-left-color: #ffc107;
+}
+
+.dark-mode .status-item.status-running {
+    background: #2d3d4d;
+    border-left-color: #17a2b8;
+}
+
+.dark-mode .status-item.status-success {
+    background: #2d4d2d;
+    border-left-color: #28a745;
+}
+
+.dark-mode .status-item.status-inactive {
+    background: #3d3d3d;
+    border-left-color: #6c757d;
+    color: #888;
+}
+
+.dark-mode .status-item.status-agent {
+    background: #3d2d4d;
+    border-left-color: #9b59b6;
 }
 
 /* ==========================================================================

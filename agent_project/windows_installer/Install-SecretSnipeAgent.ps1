@@ -35,11 +35,11 @@
 .PARAMETER ScanPaths
     Comma-separated list of paths to scan
     
-.PARAMETER EnableGitleaks
-    Enable Gitleaks scanner (requires gitleaks.exe in PATH or install path)
+.PARAMETER DisableGitleaks
+    Skip Gitleaks scanner installation (installed by default)
     
-.PARAMETER EnableTrufflehog
-    Enable Trufflehog scanner (requires Python trufflehog package)
+.PARAMETER DisableTrufflehog
+    Skip Trufflehog scanner installation (installed by default)
     
 .PARAMETER Uninstall
     Remove the agent service and files
@@ -88,10 +88,10 @@ param(
     [string[]]$ScanPaths = @(),
     
     [Parameter(ParameterSetName='Install')]
-    [switch]$EnableGitleaks,
+    [switch]$DisableGitleaks,
     
     [Parameter(ParameterSetName='Install')]
-    [switch]$EnableTrufflehog,
+    [switch]$DisableTrufflehog,
     
     [Parameter(ParameterSetName='Install')]
     [switch]$EnableFileWatcher,
@@ -306,32 +306,8 @@ function Test-Prerequisites {
     
     $ErrorActionPreference = $oldErrorAction
     
-    # Check Gitleaks if enabled
-    if ($EnableGitleaks) {
-        $gitleaks = Get-Command gitleaks -ErrorAction SilentlyContinue
-        if (-not $gitleaks) {
-            Write-Log "Gitleaks not found in PATH - will be disabled" -Level WARN
-            $script:EnableGitleaks = $false
-        } else {
-            Write-Log "Gitleaks found: $($gitleaks.Source)" -Level SUCCESS
-        }
-    }
-    
-    # Check Trufflehog if enabled  
-    if ($EnableTrufflehog) {
-        $oldEA = $ErrorActionPreference
-        $ErrorActionPreference = "SilentlyContinue"
-        try {
-            $checkResult = cmd /c "`"$($pythonPath.Source)`" -c `"import truffleHogRegexes; print('OK')`"" 2>&1
-            if ($checkResult -notmatch 'OK') {
-                Write-Log "Trufflehog not found - attempting install" -Level INFO
-                cmd /c "`"$($pythonPath.Source)`" -m pip install trufflehog --quiet" 2>&1 | Out-Null
-            }
-        } catch {
-            Write-Log "Trufflehog check skipped" -Level INFO
-        }
-        $ErrorActionPreference = $oldEA
-    }
+    # Scanners will be installed by Install-Scanners function
+    Write-Log "Scanners will be installed during setup..." -Level INFO
     
     # Network connectivity check
     Write-Log "Testing connectivity to manager..."
@@ -346,6 +322,287 @@ function Test-Prerequisites {
     }
     
     Write-Log "All prerequisites passed!" -Level SUCCESS
+}
+
+# ============================================================================
+# SCANNER INSTALLATION FUNCTIONS
+# ============================================================================
+
+function Install-Scanners {
+    <#
+    .SYNOPSIS
+    Downloads and installs Gitleaks and Trufflehog scanners
+    #>
+    
+    $scannersPath = "$InstallPath\scanners"
+    if (-not (Test-Path $scannersPath)) {
+        New-Item -ItemType Directory -Path $scannersPath -Force | Out-Null
+    }
+    
+    Write-Log "Installing security scanners..." -Level INFO
+    
+    # ========== INSTALL GITLEAKS ==========
+    if (-not $DisableGitleaks) {
+        Write-Log "Installing Gitleaks scanner..." -Level INFO
+        
+        $gitleaksPath = "$scannersPath\gitleaks.exe"
+        $gitleaksInstalled = $false
+        
+        # Check if already installed
+        if (Test-Path $gitleaksPath) {
+            try {
+                $versionCheck = & $gitleaksPath version 2>&1
+                if ($versionCheck -match 'v?\d+\.\d+') {
+                    Write-Log "Gitleaks already installed: $versionCheck" -Level SUCCESS
+                    $gitleaksInstalled = $true
+                    $script:GitleaksPath = $gitleaksPath
+                }
+            } catch {}
+        }
+        
+        if (-not $gitleaksInstalled) {
+            try {
+                # Get latest release from GitHub
+                Write-Log "Downloading Gitleaks from GitHub..." -Level INFO
+                
+                # GitHub API to get latest release
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $releaseUrl = "https://api.github.com/repos/gitleaks/gitleaks/releases/latest"
+                $headers = @{ "User-Agent" = "SecretSnipe-Installer" }
+                
+                try {
+                    $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -TimeoutSec 30
+                    $version = $release.tag_name
+                    Write-Log "Latest Gitleaks version: $version" -Level INFO
+                    
+                    # Find Windows x64 asset (naming changed from amd64 to x64)
+                    $asset = $release.assets | Where-Object { $_.name -match 'windows.*x64.*\.zip$' } | Select-Object -First 1
+                    
+                    if ($asset) {
+                        $downloadUrl = $asset.browser_download_url
+                        $zipPath = "$env:TEMP\gitleaks.zip"
+                        $extractPath = "$env:TEMP\gitleaks_extract"
+                        
+                        Write-Log "Downloading from: $downloadUrl" -Level INFO
+                        
+                        # Download
+                        $webClient = New-Object System.Net.WebClient
+                        $webClient.DownloadFile($downloadUrl, $zipPath)
+                        
+                        # Extract
+                        if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                        Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                        
+                        # Find and copy executable
+                        $exeFile = Get-ChildItem -Path $extractPath -Filter "gitleaks.exe" -Recurse | Select-Object -First 1
+                        if ($exeFile) {
+                            Copy-Item $exeFile.FullName -Destination $gitleaksPath -Force
+                            Write-Log "Gitleaks installed successfully!" -Level SUCCESS
+                            $script:GitleaksPath = $gitleaksPath
+                            $gitleaksInstalled = $true
+                        } else {
+                            Write-Log "Could not find gitleaks.exe in downloaded archive" -Level WARN
+                        }
+                        
+                        # Cleanup
+                        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                    } else {
+                        Write-Log "Could not find Windows x64 release asset" -Level WARN
+                    }
+                } catch {
+                    Write-Log "GitHub API failed, trying direct download..." -Level WARN
+                    
+                    # Fallback to known version (using x64 naming)
+                    $fallbackVersion = "8.30.0"
+                    $fallbackUrl = "https://github.com/gitleaks/gitleaks/releases/download/v$fallbackVersion/gitleaks_${fallbackVersion}_windows_x64.zip"
+                    $zipPath = "$env:TEMP\gitleaks.zip"
+                    $extractPath = "$env:TEMP\gitleaks_extract"
+                    
+                    Write-Log "Downloading Gitleaks v$fallbackVersion..." -Level INFO
+                    
+                    $webClient = New-Object System.Net.WebClient
+                    $webClient.DownloadFile($fallbackUrl, $zipPath)
+                    
+                    if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                    Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+                    
+                    $exeFile = Get-ChildItem -Path $extractPath -Filter "gitleaks.exe" -Recurse | Select-Object -First 1
+                    if ($exeFile) {
+                        Copy-Item $exeFile.FullName -Destination $gitleaksPath -Force
+                        Write-Log "Gitleaks v$fallbackVersion installed successfully!" -Level SUCCESS
+                        $script:GitleaksPath = $gitleaksPath
+                        $gitleaksInstalled = $true
+                    }
+                    
+                    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+                    Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Log "Failed to install Gitleaks: $_" -Level WARN
+                Write-Log "Gitleaks scanner will be disabled" -Level WARN
+            }
+        }
+        
+        if (-not $gitleaksInstalled) {
+            $script:GitleaksPath = $null
+        }
+    } else {
+        Write-Log "Gitleaks installation skipped (disabled)" -Level INFO
+        $script:GitleaksPath = $null
+    }
+    
+    # ========== INSTALL TRUFFLEHOG ==========
+    if (-not $DisableTrufflehog) {
+        Write-Log "Installing Trufflehog scanner..." -Level INFO
+        
+        $trufflehogPath = "$scannersPath\trufflehog.exe"
+        $trufflehogInstalled = $false
+        
+        # Check if already installed
+        if (Test-Path $trufflehogPath) {
+            try {
+                $versionCheck = & $trufflehogPath --version 2>&1
+                if ($versionCheck -match '\d+\.\d+') {
+                    Write-Log "Trufflehog already installed: $versionCheck" -Level SUCCESS
+                    $trufflehogInstalled = $true
+                    $script:TrufflehogPath = $trufflehogPath
+                    $script:TrufflehogEnabled = $true
+                }
+            } catch {}
+        }
+        
+        if (-not $trufflehogInstalled) {
+            try {
+                # Download Trufflehog binary from GitHub releases
+                Write-Log "Downloading Trufflehog from GitHub..." -Level INFO
+                
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+                $releaseUrl = "https://api.github.com/repos/trufflesecurity/trufflehog/releases/latest"
+                $headers = @{ "User-Agent" = "SecretSnipe-Installer" }
+                
+                try {
+                    $release = Invoke-RestMethod -Uri $releaseUrl -Headers $headers -TimeoutSec 30
+                    $version = $release.tag_name
+                    Write-Log "Latest Trufflehog version: $version" -Level INFO
+                    
+                    # Find Windows amd64 asset (tar.gz format)
+                    $asset = $release.assets | Where-Object { $_.name -match 'windows.*amd64.*\.tar\.gz$' } | Select-Object -First 1
+                    
+                    if ($asset) {
+                        $downloadUrl = $asset.browser_download_url
+                        $tarPath = "$env:TEMP\trufflehog.tar.gz"
+                        $extractPath = "$env:TEMP\trufflehog_extract"
+                        
+                        Write-Log "Downloading from: $downloadUrl" -Level INFO
+                        
+                        # Download
+                        $webClient = New-Object System.Net.WebClient
+                        $webClient.DownloadFile($downloadUrl, $tarPath)
+                        
+                        # Extract tar.gz (PowerShell 5.1+ can handle this with tar command)
+                        if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                        New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+                        
+                        # Use tar command (available on Windows 10+)
+                        Push-Location $extractPath
+                        try {
+                            tar -xzf $tarPath 2>&1 | Out-Null
+                        } catch {
+                            # Fallback: try using 7-zip if available
+                            $7z = Get-Command 7z -ErrorAction SilentlyContinue
+                            if ($7z) {
+                                & 7z x $tarPath -o"$extractPath" -y | Out-Null
+                                $tarFile = Get-ChildItem -Path $extractPath -Filter "*.tar" | Select-Object -First 1
+                                if ($tarFile) {
+                                    & 7z x $tarFile.FullName -o"$extractPath" -y | Out-Null
+                                }
+                            }
+                        }
+                        Pop-Location
+                        
+                        # Find and copy executable
+                        $exeFile = Get-ChildItem -Path $extractPath -Filter "trufflehog.exe" -Recurse | Select-Object -First 1
+                        if ($exeFile) {
+                            Copy-Item $exeFile.FullName -Destination $trufflehogPath -Force
+                            Write-Log "Trufflehog installed successfully!" -Level SUCCESS
+                            $script:TrufflehogPath = $trufflehogPath
+                            $script:TrufflehogEnabled = $true
+                            $trufflehogInstalled = $true
+                        } else {
+                            Write-Log "Could not find trufflehog.exe in downloaded archive" -Level WARN
+                        }
+                        
+                        # Cleanup
+                        Remove-Item $tarPath -Force -ErrorAction SilentlyContinue
+                        Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                    } else {
+                        Write-Log "Could not find Windows amd64 release asset" -Level WARN
+                    }
+                } catch {
+                    Write-Log "GitHub API failed, trying direct download..." -Level WARN
+                    
+                    # Fallback to known version
+                    $fallbackVersion = "3.93.3"
+                    $fallbackUrl = "https://github.com/trufflesecurity/trufflehog/releases/download/v$fallbackVersion/trufflehog_${fallbackVersion}_windows_amd64.tar.gz"
+                    $tarPath = "$env:TEMP\trufflehog.tar.gz"
+                    $extractPath = "$env:TEMP\trufflehog_extract"
+                    
+                    Write-Log "Downloading Trufflehog v$fallbackVersion..." -Level INFO
+                    
+                    $webClient = New-Object System.Net.WebClient
+                    $webClient.DownloadFile($fallbackUrl, $tarPath)
+                    
+                    if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+                    New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+                    
+                    Push-Location $extractPath
+                    try { tar -xzf $tarPath 2>&1 | Out-Null } catch {}
+                    Pop-Location
+                    
+                    $exeFile = Get-ChildItem -Path $extractPath -Filter "trufflehog.exe" -Recurse | Select-Object -First 1
+                    if ($exeFile) {
+                        Copy-Item $exeFile.FullName -Destination $trufflehogPath -Force
+                        Write-Log "Trufflehog v$fallbackVersion installed successfully!" -Level SUCCESS
+                        $script:TrufflehogPath = $trufflehogPath
+                        $script:TrufflehogEnabled = $true
+                        $trufflehogInstalled = $true
+                    }
+                    
+                    Remove-Item $tarPath -Force -ErrorAction SilentlyContinue
+                    Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            } catch {
+                Write-Log "Failed to install Trufflehog: $_" -Level WARN
+                Write-Log "Trufflehog scanner will be disabled" -Level WARN
+            }
+        }
+        
+        if (-not $trufflehogInstalled) {
+            $script:TrufflehogPath = $null
+            $script:TrufflehogEnabled = $false
+        }
+    } else {
+        Write-Log "Trufflehog installation skipped (disabled)" -Level INFO
+        $script:TrufflehogPath = $null
+        $script:TrufflehogEnabled = $false
+    }
+    
+    # Summary
+    Write-Log "" -Level INFO
+    Write-Log "Scanner Installation Summary:" -Level INFO
+    Write-Log "  Custom Regex Scanner: ENABLED (built-in)" -Level SUCCESS
+    if ($script:GitleaksPath) {
+        Write-Log "  Gitleaks Scanner:     ENABLED ($($script:GitleaksPath))" -Level SUCCESS
+    } else {
+        Write-Log "  Gitleaks Scanner:     DISABLED" -Level WARN
+    }
+    if ($script:TrufflehogEnabled) {
+        Write-Log "  Trufflehog Scanner:   ENABLED ($($script:TrufflehogPath))" -Level SUCCESS
+    } else {
+        Write-Log "  Trufflehog Scanner:   DISABLED" -Level WARN
+    }
+    Write-Log "" -Level INFO
 }
 
 # ============================================================================
@@ -555,7 +812,35 @@ function Install-AgentFiles {
 function New-AgentConfiguration {
     Write-Log "Creating secure agent configuration..."
     
-    $fingerprint = Get-MachineFingerprint
+    $configPath = "$InstallPath\config\agent_config.json"
+    $existingConfig = $null
+    
+    # Check for existing config (preserve settings on reinstall)
+    if (Test-Path $configPath) {
+        Write-Log "Found existing configuration, preserving user settings..." -Level INFO
+        try {
+            $existingContent = Get-Content $configPath -Raw
+            $existingConfig = $existingContent | ConvertFrom-Json
+            Write-Log "Loaded existing config (fingerprint: $($existingConfig.agent.machine_fingerprint.Substring(0,8))...)" -Level INFO
+        } catch {
+            Write-Log "Could not parse existing config, creating new one..." -Level WARN
+            $existingConfig = $null
+        }
+    }
+    
+    # Use existing fingerprint if available, otherwise generate new
+    $fingerprint = if ($existingConfig -and $existingConfig.agent.machine_fingerprint) {
+        $existingConfig.agent.machine_fingerprint
+    } else {
+        Get-MachineFingerprint
+    }
+    
+    # Preserve additional_paths from existing config
+    $additionalPaths = if ($existingConfig -and $existingConfig.agent.additional_paths) {
+        $existingConfig.agent.additional_paths
+    } else {
+        @()
+    }
     
     $config = @{
         manager = @{
@@ -569,17 +854,19 @@ function New-AgentConfiguration {
             log_level = "INFO"
             heartbeat_interval = 30
             job_poll_interval = 10
+            additional_paths = $additionalPaths  # Preserved from existing config
         }
         scanners = @{
             custom = @{
                 enabled = $true
             }
             gitleaks = @{
-                enabled = $EnableGitleaks.IsPresent
-                path = if ($EnableGitleaks) { (Get-Command gitleaks -ErrorAction SilentlyContinue).Source } else { $null }
+                enabled = ($null -ne $script:GitleaksPath)
+                path = $script:GitleaksPath
             }
             trufflehog = @{
-                enabled = $EnableTrufflehog.IsPresent
+                enabled = $script:TrufflehogEnabled
+                path = $script:TrufflehogPath
             }
         }
         resource_limits = @{
@@ -597,10 +884,10 @@ function New-AgentConfiguration {
             config_version = 1
             created_at = (Get-Date -Format "o")
             installer_version = $AGENT_VERSION
+            updated_at = (Get-Date -Format "o")
         }
     }
     
-    $configPath = "$InstallPath\config\agent_config.json"
     # Write UTF-8 without BOM (PowerShell 5.x adds BOM with -Encoding UTF8 which breaks Python json.load)
     $jsonContent = $config | ConvertTo-Json -Depth 10
     [System.IO.File]::WriteAllText($configPath, $jsonContent, [System.Text.UTF8Encoding]::new($false))
@@ -893,6 +1180,7 @@ function Main {
     try {
         Test-Prerequisites
         Install-AgentFiles
+        Install-Scanners
         New-AgentConfiguration
         Install-WindowsService
         Start-AgentService

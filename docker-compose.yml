@@ -224,10 +224,10 @@ services:
     build: .
     container_name: secretsnipe-visualizer-v2
     environment:
-      # Database - V2 uses SEPARATE database for clean testing
-      DB_HOST: postgres
+      # Database - V2 uses SAME database as V1 to access scan data
+      DB_HOST: secretsnipe-postgres
       DB_PORT: 5432
-      DB_NAME: secretsnipe_v2
+      DB_NAME: secretsnipe
       DB_USER: secretsnipe
       DB_PASSWORD: ${POSTGRES_PASSWORD:-secretsnipe_password}
       # Agent Database config (for agent mode)

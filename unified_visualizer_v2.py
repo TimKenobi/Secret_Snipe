@@ -799,15 +799,16 @@ def get_chart_data(force_refresh: bool = False) -> Dict[str, Any]:
     now = datetime.now()
     
     # Check if we're in agent mode - query agent database instead
-    scan_mode = None
+    # V2 defaults to agent mode if Redis unavailable
+    scan_mode = 'agents'  # Default to agents for V2
     try:
         if redis_manager.cache_manager:
-            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current') or 'agents'
             logger.debug(f"get_chart_data: scan_mode from Redis = {scan_mode}")
         else:
-            logger.debug("get_chart_data: cache_manager is None")
+            logger.debug("get_chart_data: cache_manager is None, defaulting to agents mode")
     except Exception as e:
-        logger.debug(f"get_chart_data: Redis error: {e}")
+        logger.debug(f"get_chart_data: Redis error: {e}, defaulting to agents mode")
     
     if scan_mode in ('agents', 'agent_only'):
         logger.info(f"get_chart_data: Routing to agent database (scan_mode={scan_mode})")
@@ -1223,10 +1224,11 @@ def get_findings_data(force_refresh: bool = False, limit: int = None) -> pd.Data
     now = datetime.now()
     
     # Check if we're in agent mode - query agent database instead
-    scan_mode = None
+    # V2 defaults to agent mode if Redis unavailable
+    scan_mode = 'agents'  # Default to agents for V2
     try:
         if redis_manager.cache_manager:
-            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            scan_mode = redis_manager.cache_manager.get('scan_mode', 'current') or 'agents'
     except Exception:
         pass
     

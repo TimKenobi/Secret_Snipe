@@ -88,22 +88,69 @@ function Install-PythonDependencies {
     
     Write-Log "Installing Python dependencies..."
     
-    $packages = @(
+    # Core dependencies
+    $corePackages = @(
         "requests>=2.28.0",
         "psutil>=5.9.0",
-        "pywin32>=305",
-        "trufflehog3>=3.0.0"
+        "pywin32>=305"
     )
     
-    foreach ($package in $packages) {
-        Write-Log "  Installing $package..."
+    # Detection Engine dependencies (V1 scanner parity)
+    $detectionPackages = @(
+        "PyMuPDF>=1.23.0",      # PDF extraction (fitz)
+        "openpyxl>=3.1.0",       # Excel .xlsx support
+        "xlrd>=2.0.0",           # Excel .xls support
+        "python-docx>=1.0.0",    # Word document support
+        "Pillow>=10.0.0"         # Image processing for OCR
+    )
+    
+    # OCR dependencies (optional - Tesseract preferred for lower memory)
+    $ocrPackages = @(
+        "pytesseract>=0.3.10"    # Tesseract OCR wrapper
+        # Note: Tesseract OCR engine must be installed separately on Windows
+        # Download from: https://github.com/UB-Mannheim/tesseract/wiki
+    )
+    
+    # Install core packages
+    Write-Log "  Installing core packages..."
+    foreach ($package in $corePackages) {
+        Write-Log "    $package..."
         $result = & $PythonPath -m pip install $package --quiet 2>&1
         if ($LASTEXITCODE -ne 0) {
             Write-Log "    Warning: Failed to install $package" -Level "WARNING"
         }
     }
     
+    # Install detection engine packages
+    Write-Log "  Installing detection engine packages (PDF, Excel, Word)..."
+    foreach ($package in $detectionPackages) {
+        Write-Log "    $package..."
+        $result = & $PythonPath -m pip install $package --quiet 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "    Warning: Failed to install $package" -Level "WARNING"
+        }
+    }
+    
+    # Install OCR packages
+    Write-Log "  Installing OCR packages..."
+    foreach ($package in $ocrPackages) {
+        Write-Log "    $package..."
+        $result = & $PythonPath -m pip install $package --quiet 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "    Warning: Failed to install $package (OCR may be limited)" -Level "WARNING"
+        }
+    }
+    
     Write-Log "Python dependencies installed" -Level "SUCCESS"
+    
+    # Check for Tesseract OCR installation
+    $tesseractPath = "C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if (Test-Path $tesseractPath) {
+        Write-Log "  Tesseract OCR found at $tesseractPath" -Level "SUCCESS"
+    } else {
+        Write-Log "  Tesseract OCR not found - OCR will be limited" -Level "WARNING"
+        Write-Log "  Download from: https://github.com/UB-Mannheim/tesseract/wiki" -Level "WARNING"
+    }
 }
 
 function Install-Gitleaks {
@@ -228,22 +275,54 @@ function Install-AgentService {
 }
 
 function Download-AgentScript {
-    Write-Log "Downloading agent script from server..."
+    Write-Log "Downloading agent scripts from server..."
     
     $agentScript = "$AgentPath\secretsnipe_enterprise_agent.py"
+    $detectionEngine = "$AgentPath\detection_engine.py"
+    $signaturesFile = "$AgentPath\signatures.json"
     $downloadUrl = "$ServerUrl/api/v1/agent/download"
+    $detectionUrl = "$ServerUrl/api/v1/agent/download/detection_engine"
+    $signaturesUrl = "$ServerUrl/api/v1/agent/download/signatures"
     
     try {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        
+        # Download main agent script
+        Write-Log "  Downloading agent script..."
         Invoke-WebRequest -Uri $downloadUrl -OutFile $agentScript -UseBasicParsing
         
         if (Test-Path $agentScript) {
             $size = (Get-Item $agentScript).Length
-            Write-Log "  Downloaded agent script ($size bytes)" -Level "SUCCESS"
-            return $true
+            Write-Log "    Agent script ($size bytes)" -Level "SUCCESS"
         }
+        
+        # Download detection engine
+        Write-Log "  Downloading detection engine..."
+        try {
+            Invoke-WebRequest -Uri $detectionUrl -OutFile $detectionEngine -UseBasicParsing -ErrorAction Stop
+            if (Test-Path $detectionEngine) {
+                $size = (Get-Item $detectionEngine).Length
+                Write-Log "    Detection engine ($size bytes)" -Level "SUCCESS"
+            }
+        } catch {
+            Write-Log "    Detection engine not available from server (will use basic scanning)" -Level "WARNING"
+        }
+        
+        # Download signatures.json
+        Write-Log "  Downloading signatures..."
+        try {
+            Invoke-WebRequest -Uri $signaturesUrl -OutFile $signaturesFile -UseBasicParsing -ErrorAction Stop
+            if (Test-Path $signaturesFile) {
+                $size = (Get-Item $signaturesFile).Length
+                Write-Log "    Signatures file ($size bytes)" -Level "SUCCESS"
+            }
+        } catch {
+            Write-Log "    Signatures file not available (will use defaults)" -Level "WARNING"
+        }
+        
+        return $true
     } catch {
-        Write-Log "  Failed to download agent script: $_" -Level "ERROR"
+        Write-Log "  Failed to download agent scripts: $_" -Level "ERROR"
     }
     return $false
 }

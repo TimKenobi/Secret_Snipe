@@ -232,7 +232,7 @@ class SecretSnipeAgent:
             "ip_address": self._get_ip(),
             "os_type": platform.system(),
             "os_version": platform.release(),
-            "agent_version": "1.0.0",
+            "agent_version": "2.1.0",  # 2.1.0 adds test_share, update_credentials commands
             "capabilities": ["custom"]
         }
         
@@ -303,6 +303,15 @@ class SecretSnipeAgent:
                 self._complete_command(command_id, {"status": "uninstalling"})
                 self._uninstall_agent(wipe_config=params.get("wipe_config", True))
                 return
+            elif command == "test_share":
+                result_data = self._test_share_access(
+                    params.get("path"),
+                    params.get("username"),
+                    params.get("password")
+                )
+            elif command == "update_credentials":
+                # Persist share credentials to local config file
+                result_data = self._save_local_credentials(params.get("share_credentials", {}))
             else:
                 result_data = {"error": f"Unknown command: {command}"}
             
@@ -588,6 +597,152 @@ class SecretSnipeAgent:
         except Exception as e:
             logger.warning(f"Error unmounting {path}: {e}")
     
+    def _test_share_access(self, path: str, username: str = None, password: str = None) -> dict:
+        """Test access to a network share with credentials"""
+        result = {
+            "path": path,
+            "success": False,
+            "message": "",
+            "accessible": False,
+            "files_visible": 0
+        }
+        
+        if not path:
+            result["message"] = "No path specified"
+            return result
+        
+        try:
+            if platform.system() == "Windows":
+                import subprocess
+                
+                # Try to connect to the share
+                if username and password:
+                    cmd = ['net', 'use', path, f'/user:{username}', password, '/persistent:no']
+                    conn_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    
+                    if conn_result.returncode != 0:
+                        # Try with an already mapped drive if initial attempt fails
+                        if "already connected" in conn_result.stderr.lower() or "duplicate" in conn_result.stderr.lower():
+                            result["message"] = "Share already connected (using existing mapping)"
+                        else:
+                            result["message"] = f"Failed to connect: {conn_result.stderr.strip()}"
+                            return result
+                    else:
+                        result["message"] = "Successfully connected with provided credentials"
+                
+                # Test if we can list the directory
+                test_path = Path(path)
+                if test_path.exists():
+                    result["accessible"] = True
+                    try:
+                        files = list(test_path.iterdir())[:10]  # Sample first 10 items
+                        result["files_visible"] = len(files)
+                        result["success"] = True
+                        result["message"] = f"Access confirmed. Found {len(files)} items (showing first 10)."
+                        result["sample_items"] = [f.name for f in files]
+                    except PermissionError as e:
+                        result["message"] = f"Can see path but permission denied: {e}"
+                else:
+                    result["message"] = f"Path does not exist or is not accessible"
+                    
+                # Disconnect if we connected with credentials (clean up)
+                if username and password and result["success"]:
+                    try:
+                        subprocess.run(['net', 'use', path, '/delete', '/y'], capture_output=True, timeout=10)
+                    except:
+                        pass
+            else:
+                # Linux/Mac - just check if path exists
+                if Path(path).exists():
+                    result["success"] = True
+                    result["accessible"] = True
+                    result["message"] = "Path accessible"
+                else:
+                    result["message"] = "Path not accessible on this platform"
+                    
+        except subprocess.TimeoutExpired:
+            result["message"] = "Connection timed out (30 seconds)"
+        except Exception as e:
+            result["message"] = f"Error testing share: {str(e)}"
+            logger.error(f"Error testing share access: {e}")
+        
+        logger.info(f"Share test result for {path}: {result['success']} - {result['message']}")
+        return result
+    
+    def _get_credentials_file_path(self) -> Path:
+        """Get the path to the local credentials file"""
+        if platform.system() == "Windows":
+            return Path(os.environ.get('PROGRAMDATA', 'C:\\ProgramData')) / 'SecretSnipe' / 'credentials.json'
+        else:
+            return Path('/etc/secretsnipe') / 'credentials.json'
+    
+    def _save_local_credentials(self, share_credentials: dict) -> dict:
+        """Save share credentials to local file for persistence across reboots"""
+        result = {
+            "success": False,
+            "message": "",
+            "paths_saved": 0
+        }
+        
+        try:
+            creds_file = self._get_credentials_file_path()
+            creds_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Load existing credentials
+            existing = {}
+            if creds_file.exists():
+                try:
+                    with open(creds_file, 'r') as f:
+                        existing = json.load(f)
+                except:
+                    pass
+            
+            # Merge new credentials
+            existing['share_credentials'] = share_credentials
+            existing['updated_at'] = datetime.now().isoformat()
+            
+            # Save with restrictive permissions
+            with open(creds_file, 'w') as f:
+                json.dump(existing, f, indent=2)
+            
+            # On Windows, try to set restrictive permissions
+            if platform.system() == "Windows":
+                import subprocess
+                try:
+                    # Remove inheritance and set SYSTEM/Administrators only
+                    subprocess.run(['icacls', str(creds_file), '/inheritance:r', 
+                                  '/grant', 'SYSTEM:F', '/grant', 'Administrators:F'],
+                                 capture_output=True)
+                except:
+                    pass
+            
+            result["success"] = True
+            result["paths_saved"] = len(share_credentials)
+            result["message"] = f"Saved credentials for {len(share_credentials)} share(s)"
+            logger.info(f"💾 Saved credentials for {len(share_credentials)} network share(s) to {creds_file}")
+            
+        except Exception as e:
+            result["message"] = f"Failed to save credentials: {str(e)}"
+            logger.error(f"Error saving credentials: {e}")
+        
+        return result
+    
+    def _load_local_credentials(self) -> dict:
+        """Load share credentials from local file (called on startup)"""
+        try:
+            creds_file = self._get_credentials_file_path()
+            if creds_file.exists():
+                with open(creds_file, 'r') as f:
+                    data = json.load(f)
+                    share_creds = data.get('share_credentials', {})
+                    if share_creds:
+                        logger.info(f"📁 Loaded credentials for {len(share_creds)} network share(s) from local config")
+                    return share_creds
+        except Exception as e:
+            logger.warning(f"Could not load local credentials: {e}")
+        
+        return {}
+    
     def poll_for_jobs(self):
         while self.running:
             try:
@@ -604,9 +759,20 @@ class SecretSnipeAgent:
     def _execute_job(self, job):
         job_id = job.get("job_id")
         scan_paths = job.get("scan_paths", [])
-        share_credentials = job.get("share_credentials", {})  # Optional credentials for network shares
+        
+        # Get job config (JSONB column contains share_credentials, continuous settings, etc.)
+        job_config = job.get("config", {}) or {}
+        share_credentials = job_config.get("share_credentials", {})  # Optional credentials from job
+        
+        # Load local persistent credentials as fallback
+        local_credentials = self._load_local_credentials()
+        
+        # Merge: job credentials override local credentials
+        merged_credentials = {**local_credentials, **share_credentials}
         
         logger.info(f"🔍 Starting job {job_id} on {len(scan_paths)} paths")
+        if merged_credentials:
+            logger.info(f"📁 Network share credentials available for {len(merged_credentials)} path(s)")
         
         # Update status to running
         self._api_request("POST", "/jobs/status", {"job_id": job_id, "status": "running"})
@@ -621,8 +787,8 @@ class SecretSnipeAgent:
                 
                 # Check if this is a network share (UNC path)
                 if scan_path.startswith('\\\\') or scan_path.startswith('//'):
-                    # Try to mount the share
-                    share_creds = share_credentials.get(scan_path, {})
+                    # Try to mount the share using merged credentials
+                    share_creds = merged_credentials.get(scan_path, {})
                     actual_path = self._mount_network_share(
                         scan_path,
                         username=share_creds.get('username'),

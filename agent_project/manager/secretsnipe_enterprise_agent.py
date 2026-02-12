@@ -903,6 +903,17 @@ class SecretSnipeEnterpriseAgent:
         self.logger.info(f"🎯 Executing command: {command}")
         result_data = {}
         
+        # High-priority commands that should kill current job first
+        HIGH_PRIORITY_COMMANDS = {"uninstall", "update", "restart", "stop_scan"}
+        
+        # If high-priority command and we have a running job, stop it first
+        if command in HIGH_PRIORITY_COMMANDS and self.current_job:
+            self.logger.info(f"⚡ High-priority command '{command}' received - stopping current job: {self.current_job}")
+            self.cancel_current_job = True
+            # Give current job time to checkpoint and stop
+            import time
+            time.sleep(2)
+        
         try:
             if command == "list_paths":
                 result_data = self._list_available_paths()
@@ -937,6 +948,21 @@ class SecretSnipeEnterpriseAgent:
                 result_data = self._get_detailed_status()
             elif command == "clear_cache":
                 result_data = {"status": "cache_cleared"}
+            elif command == "stop_scan":
+                # Stop current scan
+                if self.current_job:
+                    self.logger.info(f"⛔ Stopping current scan job: {self.current_job}")
+                    self.cancel_current_job = True
+                    result_data = {"status": "stopping", "job_id": self.current_job}
+                else:
+                    result_data = {"status": "no_active_scan"}
+            elif command == "uninstall":
+                # Uninstall the agent
+                self.logger.info("🗑️ Uninstall command received")
+                wipe_data = params.get("wipe_data", False)
+                result_data = {"status": "uninstall_scheduled", "wipe_data": wipe_data}
+                # Schedule uninstall after command completion (5 seconds)
+                threading.Timer(5.0, self._uninstall_agent, args=[wipe_data]).start()
             else:
                 self.logger.warning(f"Unknown command: {command}")
                 result_data = {"error": f"Unknown command: {command}"}
@@ -1143,6 +1169,86 @@ class SecretSnipeEnterpriseAgent:
         self.running = False
         # Re-execute the current script
         os.execv(sys.executable, [sys.executable] + sys.argv)
+    
+    def _uninstall_agent(self, wipe_data: bool = False):
+        """Uninstall this agent"""
+        self.logger.info(f"🗑️ Uninstalling agent (wipe_data={wipe_data})...")
+        self.running = False
+        
+        try:
+            if platform.system() == "Windows":
+                # Windows uninstall
+                import subprocess
+                
+                # Stop the service first
+                try:
+                    subprocess.run(['sc', 'stop', 'SecretSnipeAgent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Delete the service
+                try:
+                    subprocess.run(['sc', 'delete', 'SecretSnipeAgent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Remove from scheduled tasks if exists
+                try:
+                    subprocess.run(['schtasks', '/delete', '/tn', 'SecretSnipeAgent', '/f'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                if wipe_data:
+                    # Wipe all agent data
+                    install_dir = Path(os.environ.get('PROGRAMDATA', 'C:\\ProgramData')) / 'SecretSnipe'
+                    if install_dir.exists():
+                        import shutil
+                        shutil.rmtree(install_dir, ignore_errors=True)
+                        self.logger.info(f"🗑️ Removed install directory: {install_dir}")
+            else:
+                # Linux uninstall
+                import subprocess
+                
+                # Stop the service
+                try:
+                    subprocess.run(['systemctl', 'stop', 'secretsnipe-agent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Disable the service
+                try:
+                    subprocess.run(['systemctl', 'disable', 'secretsnipe-agent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Remove the service file
+                try:
+                    service_file = Path('/etc/systemd/system/secretsnipe-agent.service')
+                    if service_file.exists():
+                        service_file.unlink()
+                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                if wipe_data:
+                    # Wipe all agent data
+                    import shutil
+                    for path in ['/opt/secretsnipe', '/etc/secretsnipe', '/var/log/secretsnipe']:
+                        p = Path(path)
+                        if p.exists():
+                            if p.is_dir():
+                                shutil.rmtree(p, ignore_errors=True)
+                            else:
+                                p.unlink()
+                            self.logger.info(f"🗑️ Removed: {path}")
+            
+            self.logger.info("🗑️ Agent uninstallation complete")
+            
+        except Exception as e:
+            self.logger.error(f"Error during uninstall: {e}")
+        
+        # Exit the process
+        sys.exit(0)
     
     def _update_agent(self) -> Dict:
         """Download and update agent script from server"""

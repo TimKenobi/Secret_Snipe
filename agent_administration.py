@@ -92,8 +92,8 @@ class AgentDatabaseManager:
         """Get aggregate agent statistics from agent manager database"""
         query = """
             SELECT
-                COUNT(*) FILTER (WHERE status = 'online' OR (status = 'idle' AND last_heartbeat > NOW() - INTERVAL '2 minutes')) as online_agents,
-                COUNT(*) FILTER (WHERE status = 'offline' OR (last_heartbeat < NOW() - INTERVAL '2 minutes' AND status != 'online')) as offline_agents,
+                COUNT(*) FILTER (WHERE status IN ('online', 'idle', 'scanning') OR (last_heartbeat > NOW() - INTERVAL '3 minutes')) as online_agents,
+                COUNT(*) FILTER (WHERE status = 'offline' OR (last_heartbeat < NOW() - INTERVAL '3 minutes' AND status NOT IN ('online', 'idle', 'scanning'))) as offline_agents,
                 COUNT(*) FILTER (WHERE status = 'error') as error_agents,
                 COUNT(*) FILTER (WHERE status = 'pending') as pending_agents,
                 (SELECT COUNT(*) FROM agent_jobs WHERE status = 'pending') as pending_jobs,
@@ -146,12 +146,12 @@ class AgentDatabaseManager:
             return []
     
     def mark_stale_agents_offline(self):
-        """Mark agents offline if no heartbeat in 2 minutes"""
+        """Mark agents offline if no heartbeat in 3 minutes"""
         query = """
             UPDATE agents 
             SET status = 'offline'
             WHERE status NOT IN ('offline', 'pending', 'error')
-            AND last_heartbeat < NOW() - INTERVAL '2 minutes'
+            AND last_heartbeat < NOW() - INTERVAL '3 minutes'
         """
         try:
             self._execute_agent_query(query)
@@ -188,7 +188,8 @@ class AgentDatabaseManager:
     
     def create_job(self, agent_id: str, scan_paths: List[str], scanners: List[str] = None,
                    job_type: str = 'scan', priority: int = 5, 
-                   continuous: bool = False, interval_minutes: int = None) -> Optional[Dict]:
+                   continuous: bool = False, interval_minutes: int = None,
+                   share_credentials: dict = None) -> Optional[Dict]:
         """Create a new scan job in agent manager database"""
         import uuid
         job_id = str(uuid.uuid4())
@@ -198,18 +199,22 @@ class AgentDatabaseManager:
             conn = self._get_agent_db_connection()
             cur = conn.cursor()
             
-            # Build metadata for continuous jobs
-            metadata = {}
+            # Build config for job options
+            config = {}
             if continuous and interval_minutes:
-                metadata['continuous'] = True
-                metadata['interval_minutes'] = interval_minutes
-                metadata['next_run'] = None  # Will be set after first completion
+                config['continuous'] = True
+                config['interval_minutes'] = interval_minutes
+                config['next_run'] = None  # Will be set after first completion
+            
+            # Add share credentials if provided (for CIFS/network shares)
+            if share_credentials:
+                config['share_credentials'] = share_credentials
             
             cur.execute("""
-                INSERT INTO agent_jobs (job_id, agent_id, job_type, scan_paths, scanners, priority, status, metadata)
+                INSERT INTO agent_jobs (job_id, agent_id, job_type, scan_paths, scanners, priority, status, config)
                 VALUES (%s::uuid, %s::uuid, %s, %s::jsonb, %s::jsonb, %s, 'pending', %s::jsonb)
                 RETURNING *
-            """, (job_id, agent_id, job_type, json.dumps(scan_paths), json.dumps(scanners), priority, json.dumps(metadata)))
+            """, (job_id, agent_id, job_type, json.dumps(scan_paths), json.dumps(scanners), priority, json.dumps(config)))
             result = cur.fetchone()
             conn.commit()
             cur.close()
@@ -454,6 +459,35 @@ class AgentDatabaseManager:
             logger.error(f"Error queuing agent command: {e}")
             raise
     
+    def get_command_result(self, command_id: str) -> Optional[Dict]:
+        """Get the result of a command by ID"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, agent_id, command, parameters, status, result, created_at, completed_at
+                FROM agent_commands WHERE id = %s
+            """, (command_id,))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if row:
+                return {
+                    'id': str(row['id']),
+                    'agent_id': row['agent_id'],
+                    'command': row['command'],
+                    'parameters': row['parameters'],
+                    'status': row['status'],
+                    'result': row['result'],
+                    'created_at': row['created_at'].isoformat() if row['created_at'] else None,
+                    'completed_at': row['completed_at'].isoformat() if row['completed_at'] else None
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting command result: {e}")
+            return None
+    
     def get_agent_paths(self, agent_id: str) -> List[str]:
         """Get available paths from agent (from command results)"""
         try:
@@ -686,6 +720,168 @@ class AgentDatabaseManager:
         except Exception as e:
             logger.error(f"Error deleting path ownership: {e}")
             return False
+    
+    # ========== AGENT CREDENTIAL STORAGE ==========
+    
+    def get_agent_credentials(self, agent_id: str) -> Dict:
+        """Get stored credentials for an agent (persists across reboots)"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            
+            # Table already exists with schema: config_id, agent_id, config (JSONB), version, updated_at
+            cur.execute("""
+                SELECT config FROM agent_configs
+                WHERE agent_id = %s::uuid
+            """, (agent_id,))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if result and result.get('config'):
+                return result['config'].get('share_credentials', {})
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting agent credentials: {e}")
+            return {}
+    
+    def save_agent_credentials(self, agent_id: str, share_path: str,
+                                username: str, password: str, 
+                                drive_letter: str = None,
+                                created_by: str = 'admin') -> bool:
+        """Save credentials for a specific share path on an agent (persists across reboots)"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            
+            # Get existing config for this agent
+            cur.execute("""
+                SELECT config FROM agent_configs
+                WHERE agent_id = %s::uuid
+            """, (agent_id,))
+            result = cur.fetchone()
+            
+            # Build the config object
+            if result and result.get('config'):
+                current_config = result['config']
+            else:
+                current_config = {}
+            
+            # Ensure share_credentials exists in config
+            if 'share_credentials' not in current_config:
+                current_config['share_credentials'] = {}
+            
+            # Add/update credentials for this path
+            current_config['share_credentials'][share_path] = {
+                'username': username,
+                'password': password,
+                'drive_letter': drive_letter,
+                'updated_at': datetime.now().isoformat()
+            }
+            
+            # Upsert the config
+            cur.execute("""
+                INSERT INTO agent_configs (agent_id, config, version, updated_at)
+                VALUES (%s::uuid, %s::jsonb, 1, NOW())
+                ON CONFLICT (agent_id) 
+                DO UPDATE SET config = %s::jsonb, 
+                              version = agent_configs.version + 1,
+                              updated_at = NOW()
+                RETURNING config_id
+            """, (agent_id, json.dumps(current_config), json.dumps(current_config)))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            return bool(result)
+        except Exception as e:
+            logger.error(f"Error saving agent credentials: {e}")
+            return False
+    
+    def delete_agent_credentials(self, agent_id: str, share_path: str = None) -> bool:
+        """Delete stored credentials for an agent (specific path or all)"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            
+            if share_path:
+                # Get existing config
+                cur.execute("""
+                    SELECT config FROM agent_configs
+                    WHERE agent_id = %s::uuid
+                """, (agent_id,))
+                result = cur.fetchone()
+                
+                if result and result.get('config'):
+                    current_config = result['config']
+                    share_creds = current_config.get('share_credentials', {})
+                    if share_path in share_creds:
+                        del share_creds[share_path]
+                        current_config['share_credentials'] = share_creds
+                        cur.execute("""
+                            UPDATE agent_configs SET config = %s::jsonb, updated_at = NOW()
+                            WHERE agent_id = %s::uuid
+                        """, (json.dumps(current_config), agent_id))
+            else:
+                # Clear all share credentials for this agent (remove from config, don't delete row)
+                cur.execute("""
+                    SELECT config FROM agent_configs
+                    WHERE agent_id = %s::uuid
+                """, (agent_id,))
+                result = cur.fetchone()
+                
+                if result and result.get('config'):
+                    current_config = result['config']
+                    current_config['share_credentials'] = {}
+                    cur.execute("""
+                        UPDATE agent_configs SET config = %s::jsonb, updated_at = NOW()
+                        WHERE agent_id = %s::uuid
+                    """, (json.dumps(current_config), agent_id))
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting agent credentials: {e}")
+            return False
+    
+    def get_credential_test_attempts(self, agent_id: str, share_path: str) -> int:
+        """Get number of failed credential tests to prevent account lockout"""
+        try:
+            conn = self._get_agent_db_connection()
+            cur = conn.cursor()
+            
+            # Count recent failed attempts (last 15 minutes)
+            cur.execute("""
+                SELECT COUNT(*) as count FROM agent_commands
+                WHERE agent_id = %s AND command = 'test_share' 
+                AND parameters->>'path' = %s
+                AND result->>'success' = 'false'
+                AND created_at > NOW() - INTERVAL '15 minutes'
+            """, (agent_id, share_path))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            return result['count'] if result else 0
+        except Exception as e:
+            logger.error(f"Error getting credential test attempts: {e}")
+            return 0
+    
+    def push_credentials_to_agent(self, agent_id: str) -> str:
+        """Queue a command to push stored credentials to agent config"""
+        try:
+            credentials = self.get_agent_credentials(agent_id)
+            if not credentials:
+                return None
+            
+            # Queue command to update agent's local credentials
+            return self.queue_agent_command(agent_id, 'update_credentials', {
+                'share_credentials': credentials
+            })
+        except Exception as e:
+            logger.error(f"Error pushing credentials to agent: {e}")
+            return None
 
 
 # ============================================================================
@@ -750,8 +946,12 @@ def create_scan_configuration_section() -> html.Div:
         html.Div([
             html.Div([
                 html.H4("📁 Scan Targets", style={'margin': '0'}),
-                html.Button("➕ Add Target", id='admin-add-target-btn', className='btn-primary',
-                           title='Add a new scan target with path and scanner configuration')
+                html.Div([
+                    html.Button("🔄 Refresh", id='admin-refresh-targets', className='btn-secondary',
+                               title='Refresh the scan targets list'),
+                    html.Button("➕ Add Target", id='admin-add-target-btn', className='btn-primary',
+                               title='Add a new scan target with path and scanner configuration')
+                ], style={'display': 'flex', 'gap': '10px'})
             ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '15px'}),
             
             html.P("Define what paths to scan and which scanner (server or agent) handles each target.",
@@ -959,6 +1159,17 @@ def create_agent_overview_section() -> html.Div:
                                title='Remove agent registration from database only'),
                 ], style={'marginBottom': '15px'}),
                 
+                # Logging control
+                html.Div([
+                    html.H6("Logging Control", style={'marginBottom': '10px', 'color': '#888', 'marginTop': '15px'}),
+                    html.Div([
+                        html.Button("🔈 Verbose On", id='admin-agent-verbose-on', className='btn-secondary',
+                                   title='Enable verbose/debug logging on agent', style={'marginRight': '10px'}),
+                        html.Button("🔇 Verbose Off", id='admin-agent-verbose-off', className='btn-secondary',
+                                   title='Disable verbose logging (normal mode)'),
+                    ])
+                ], style={'paddingTop': '10px', 'borderTop': '1px solid #333'}),
+                
                 # Uninstall options
                 html.Div([
                     dcc.Checklist(
@@ -986,6 +1197,28 @@ def create_agent_overview_section() -> html.Div:
                 
                 # Agent paths display
                 html.Div(id='admin-agent-paths-display', style={'marginTop': '15px'}),
+                
+                # Agent Config Panel
+                html.Div([
+                    html.H6("📋 Agent Configuration", style={'marginBottom': '10px', 'color': '#888', 'marginTop': '20px'}),
+                    html.Div([
+                        html.Button("🔄 Fetch Config", id='admin-agent-fetch-config', className='btn-secondary',
+                                   title='Fetch current configuration from agent', style={'marginRight': '10px'}),
+                        html.Button("📁 View Credentials", id='admin-agent-view-creds', className='btn-secondary',
+                                   title='View stored CIFS credentials on agent'),
+                    ], style={'marginBottom': '10px'}),
+                    html.Div(id='admin-agent-config-display', style={
+                        'backgroundColor': '#1e1e1e',
+                        'padding': '15px',
+                        'borderRadius': '5px',
+                        'fontFamily': 'monospace',
+                        'fontSize': '12px',
+                        'maxHeight': '300px',
+                        'overflow': 'auto',
+                        'display': 'none'  # Hidden until config is fetched
+                    }),
+                ], style={'paddingTop': '15px', 'borderTop': '1px solid #333'}),
+                
             ], className='admin-form', style={'backgroundColor': '#252525', 'padding': '20px', 'borderRadius': '8px'})
             
         ], className='admin-section')
@@ -1101,6 +1334,46 @@ def create_job_management_section() -> html.Div:
                            title='Create a new scan job for the selected agent and path')
             ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end', 'marginBottom': '15px'}),
             
+            # Network Share Credentials (for CIFS/SMB paths)
+            html.Details([
+                html.Summary("🔐 Network Share Credentials (optional)", style={'cursor': 'pointer', 'color': '#888', 'marginBottom': '10px'}),
+                html.Div([
+                    html.P("For scanning network shares (\\\\server\\share), provide credentials if needed. "
+                           "Note: The agent service should ideally run as a domain account with share access.",
+                           style={'color': '#666', 'fontSize': '12px', 'marginBottom': '15px'}),
+                    html.Div([
+                        html.Div([
+                            html.Label("Username (DOMAIN\\user):"),
+                            dcc.Input(id='admin-share-username', type='text', placeholder='STAHLS\\svc-account',
+                                     style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                           'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                        ], style={'flex': '1'}),
+                        html.Div([
+                            html.Label("Password:"),
+                            dcc.Input(id='admin-share-password', type='password', placeholder='••••••••',
+                                     style={'width': '100%', 'backgroundColor': '#2d2d2d', 'color': '#e0e0e0',
+                                           'border': '1px solid #444', 'padding': '8px', 'borderRadius': '4px'})
+                        ], style={'flex': '1'}),
+                        html.Div([
+                            html.Label("\u00A0"),  # Non-breaking space for alignment
+                            html.Button("🔗 Test", id='admin-test-share-creds', className='btn-secondary',
+                                       title='Test if the credentials can access the share',
+                                       style={'width': '100%', 'whiteSpace': 'nowrap'})
+                        ], style={'flex': '0 0 auto'}),
+                        html.Div([
+                            html.Label("\u00A0"),  # Non-breaking space for alignment
+                            html.Button("💾 Save on Agent", id='admin-persist-share-creds', className='btn-primary',
+                                       title='Save credentials on agent (persists across reboots, no AD lockout risk)',
+                                       style={'width': '100%', 'whiteSpace': 'nowrap'})
+                        ], style={'flex': '0 0 auto'}),
+                    ], style={'display': 'flex', 'gap': '15px', 'alignItems': 'flex-end'}),
+                    # Credential status display
+                    html.Div(id='admin-share-creds-status', style={'marginTop': '10px'}),
+                    # Show configured credentials indicator
+                    html.Div(id='admin-share-creds-indicator', style={'marginTop': '10px'})
+                ], style={'padding': '10px', 'backgroundColor': '#1a1a2e', 'borderRadius': '4px', 'marginBottom': '15px'})
+            ], open=False),
+            
             # Path discovery result (hidden, for dropdown compatibility)
             html.Div(id='admin-path-discovery-result', style={'display': 'none'}),
             dcc.Dropdown(id='admin-job-path-suggestions', style={'display': 'none'}, options=[]),
@@ -1125,13 +1398,18 @@ def create_job_management_section() -> html.Div:
                         style={'width': '150px', 'backgroundColor': '#2d2d2d'}
                     ),
                     html.Button("🔄 Refresh", id='admin-refresh-jobs', className='btn-secondary',
-                               title='Refresh the jobs table')
+                               title='Refresh the jobs table'),
+                    html.Button("🗑️ Clear Jobs", id='admin-clear-jobs', className='btn-warning',
+                               title='Clear all completed and failed jobs'),
+                    html.Button("❌ Cancel Job", id='admin-cancel-job', className='btn-danger',
+                               title='Cancel the selected pending or assigned job')
                 ], style={'display': 'flex', 'gap': '10px'})
             ], style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center'}),
             
             dash_table.DataTable(
                 id='admin-jobs-table',
                 columns=[
+                    {'name': 'ID', 'id': 'job_id'},
                     {'name': 'Status', 'id': 'status_icon'},
                     {'name': 'Agent', 'id': 'agent_hostname'},
                     {'name': 'Type', 'id': 'job_type'},
@@ -1142,6 +1420,7 @@ def create_job_management_section() -> html.Div:
                     {'name': 'Duration', 'id': 'duration'},
                 ],
                 data=[],
+                selected_rows=[],
                 style_table={'overflowX': 'auto'},
                 style_cell={
                     'backgroundColor': '#1e1e1e',
@@ -1153,6 +1432,18 @@ def create_job_management_section() -> html.Div:
                     'backgroundColor': '#2d2d2d',
                     'fontWeight': 'bold'
                 },
+                style_data_conditional=[
+                    {
+                        'if': {'state': 'selected'},
+                        'backgroundColor': '#3d5a80',
+                        'border': '1px solid #4a90d9',
+                    },
+                    {
+                        'if': {'state': 'active'},
+                        'backgroundColor': '#3d5a80',
+                        'border': '1px solid #4a90d9',
+                    }
+                ],
                 row_selectable='single',
                 page_size=15,
             )
@@ -1725,9 +2016,18 @@ def create_downloads_section() -> html.Div:
                 ], style={'marginRight': '20px'}),
                 html.Div([
                     html.H4("Windows Agent", style={'margin': '0 0 5px 0', 'color': '#4dabf7'}),
+                    html.Span("v3.0.0", style={
+                        'backgroundColor': '#0078d4',
+                        'color': '#fff',
+                        'padding': '2px 8px',
+                        'borderRadius': '4px',
+                        'fontSize': '11px',
+                        'marginLeft': '10px'
+                    }),
                     html.P("For Windows Server 2016+, Windows 10/11", 
-                           style={'color': '#888', 'margin': '0 0 10px 0', 'fontSize': '13px'}),
+                           style={'color': '#888', 'margin': '10px 0 10px 0', 'fontSize': '13px'}),
                     html.Ul([
+                        html.Li("Full V1 scanner parity (PDF, Excel, Word, OCR)"),
                         html.Li("Runs as Windows Service via NSSM"),
                         html.Li("DPAPI encryption for secure credential storage"),
                         html.Li("Automatic restart on failure"),
@@ -1757,33 +2057,52 @@ def create_downloads_section() -> html.Div:
             'marginBottom': '20px'
         }),
         
-        # Linux Agent (Coming Soon)
+        # Linux Agent (Now Available!)
         html.Div([
             html.Div([
                 html.Div([
-                    html.Span("🐧", style={'fontSize': '48px', 'opacity': '0.5'}),
+                    html.Span("🐧", style={'fontSize': '48px'}),
                 ], style={'marginRight': '20px'}),
                 html.Div([
-                    html.H4("Linux Agent", style={'margin': '0 0 5px 0', 'color': '#888'}),
-                    html.Span("Coming Soon", style={
-                        'backgroundColor': '#444',
-                        'color': '#888',
+                    html.H4("Linux Agent", style={'margin': '0 0 5px 0', 'color': '#ddd'}),
+                    html.Span("v3.0.0", style={
+                        'backgroundColor': '#28a745',
+                        'color': '#fff',
                         'padding': '2px 8px',
                         'borderRadius': '4px',
                         'fontSize': '11px',
                         'marginLeft': '10px'
                     }),
-                    html.P("For RHEL, Ubuntu, Debian, CentOS", 
-                           style={'color': '#666', 'margin': '10px 0 0 0', 'fontSize': '13px'}),
+                    html.P("For RHEL, Ubuntu, Debian, CentOS, Fedora, SUSE", 
+                           style={'color': '#888', 'margin': '10px 0 10px 0', 'fontSize': '13px'}),
+                    html.Ul([
+                        html.Li("Runs as systemd service"),
+                        html.Li("Full V1 scanner parity (PDF, Excel, Word, OCR)"),
+                        html.Li("Automatic restart on failure"),
+                        html.Li("Scans NFS/SMB shares, local directories"),
+                        html.Li("Supports Gitleaks, TruffleHog, Custom scanner"),
+                    ], style={'color': '#aaa', 'fontSize': '12px', 'marginBottom': '15px'}),
                 ], style={'flex': '1'}),
             ], style={'display': 'flex', 'alignItems': 'flex-start'}),
+            html.Div([
+                html.A(
+                    html.Button("⬇️ Download Installer (Bash)", className='btn-primary',
+                               style={'marginRight': '10px'}),
+                    href='/api/download/agent/linux-installer',
+                    download='install_agent.sh'
+                ),
+                html.A(
+                    html.Button("📄 View Documentation", className='btn-secondary'),
+                    href='/api/download/agent/linux-readme',
+                    target='_blank'
+                ),
+            ], style={'marginTop': '15px'}),
         ], style={
             'backgroundColor': '#252525',
-            'border': '1px solid #444',
+            'border': '1px solid #28a745',
             'borderRadius': '8px',
             'padding': '25px',
-            'marginBottom': '20px',
-            'opacity': '0.6'
+            'marginBottom': '20px'
         }),
         
         # Installation Instructions
@@ -1980,10 +2299,7 @@ def create_administration_layout() -> html.Div:
                    style={'margin': '0', 'color': '#e0e0e0'}),
             html.P("Fleet Management & Monitoring", 
                   style={'margin': '5px 0 0 0', 'color': '#888', 'fontSize': '14px'}),
-            html.Div([
-                html.Span(id='admin-last-updated', style={'color': '#666', 'fontSize': '12px'}),
-                html.Button("↩️ Back to Dashboard", id='admin-back-btn', className='btn-secondary')
-            ], style={'display': 'flex', 'alignItems': 'center', 'gap': '15px'})
+            html.Span(id='admin-last-updated', style={'color': '#666', 'fontSize': '12px'})
         ], style={
             'display': 'flex',
             'justifyContent': 'space-between',
@@ -2036,6 +2352,15 @@ def create_administration_layout() -> html.Div:
 
 ADMIN_CSS = """
 /* Administration Page Styles */
+
+/* Fix input text cutoff */
+input[type="text"], input[type="email"], input[type="password"], input[type="number"] {
+    line-height: 1.4 !important;
+    font-size: 14px !important;
+    box-sizing: border-box !important;
+    padding: 12px !important;
+}
+
 .admin-tab {
     backgroundColor: #2d2d2d !important;
     color: #e0e0e0 !important;
@@ -2225,7 +2550,7 @@ def integrate_with_unified_visualizer(app, db_manager):
         data = []
         for a in agents:
             status_icon = {
-                'online': '🟢', 'idle': '🟢',
+                'online': '🟢', 'idle': '🟢', 'scanning': '🟢',
                 'offline': '🔴',
                 'pending': '🟡',
                 'error': '⚠️'
@@ -2456,14 +2781,17 @@ def integrate_with_unified_visualizer(app, db_manager):
     @app.callback(
         Output('admin-scan-targets-table', 'data'),
         [Input('admin-refresh-interval', 'n_intervals'),
-         Input('admin-tabs', 'value')]
+         Input('admin-tabs', 'value'),
+         Input('admin-refresh-targets', 'n_clicks')]
     )
-    def populate_scan_targets_table(n_intervals, tab):
-        """Populate the scan targets table"""
+    def populate_scan_targets_table(n_intervals, tab, n_clicks):
+        """Populate the scan targets table - combines local scan_targets AND continuous agent jobs"""
         if tab != 'config':
             return no_update
         
-        # Get scan targets from main database (these are local configuration)
+        data = []
+        
+        # First, get scan targets from main database (these are local configuration)
         try:
             query = """
                 SELECT id, name, paths, scanner, tools, schedule, cron_expression, 
@@ -2473,21 +2801,76 @@ def integrate_with_unified_visualizer(app, db_manager):
             """
             results = db_manager.execute_query(query)
             if results:
-                data = []
                 for r in results:
                     data.append({
                         'id': r.get('id'),
                         'name': r.get('name', ''),
                         'paths': r.get('paths', ''),
                         'scanner': r.get('scanner', 'server'),
+                        'scanner_name': '🖥️ Server' if r.get('scanner', 'server') == 'server' else '🤖 Agent',
+                        'tools': r.get('tools', 'All'),
                         'schedule': r.get('schedule', 'manual'),
                         'enabled': '✅' if r.get('enabled', True) else '❌',
-                        'last_scan': str(r.get('last_scan', 'Never'))[:16] if r.get('last_scan') else 'Never'
+                        'last_scan': str(r.get('last_scan', 'Never'))[:16] if r.get('last_scan') else 'Never',
+                        'status': '🟢 Active' if r.get('enabled', True) else '⚪ Disabled',
+                        'source': 'local'
                     })
-                return data
         except Exception as e:
             logger.error(f"Error loading scan targets: {e}")
-        return []
+        
+        # Second, get continuous agent jobs from agent database
+        try:
+            conn = agent_db._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT aj.job_id, aj.scan_paths, aj.config, aj.status, aj.completed_at,
+                       a.hostname, aj.created_at
+                FROM agent_jobs aj
+                LEFT JOIN agents a ON aj.agent_id = a.agent_id
+                WHERE aj.config->>'continuous' = 'true'
+                ORDER BY aj.created_at DESC
+            """)
+            agent_jobs = cur.fetchall()
+            cur.close()
+            conn.close()
+            
+            for job in agent_jobs:
+                # Parse scan_paths
+                paths = job.get('scan_paths', [])
+                if isinstance(paths, str):
+                    try:
+                        paths = json.loads(paths)
+                    except:
+                        paths = [paths]
+                paths_str = ', '.join(paths[:2]) + ('...' if len(paths) > 2 else '') if paths else '-'
+                
+                config = job.get('config', {}) or {}
+                interval = config.get('interval_minutes', 60)
+                
+                # Determine status
+                status = job.get('status', 'pending')
+                status_icon = {
+                    'pending': '⏳ Pending', 'running': '🔄 Running', 'completed': '✅ Last run OK',
+                    'failed': '❌ Failed', 'assigned': '📤 Assigned'
+                }.get(status, f'❓ {status}')
+                
+                data.append({
+                    'id': f"job:{job.get('job_id')}",  # Prefix to distinguish from local targets
+                    'name': f"🔄 {job.get('hostname', 'Agent')} Continuous",
+                    'paths': paths_str,
+                    'scanner': job.get('job_id'),
+                    'scanner_name': f"🤖 {job.get('hostname', 'Agent')}",
+                    'tools': 'All',
+                    'schedule': f"Every {interval}m",
+                    'enabled': '✅',
+                    'last_scan': str(job.get('completed_at', 'Never'))[:16] if job.get('completed_at') else 'Never',
+                    'status': status_icon,
+                    'source': 'agent_job'
+                })
+        except Exception as e:
+            logger.error(f"Error loading continuous agent jobs: {e}")
+        
+        return data
     
     # ========== SAVE SCAN TARGET ==========
     @app.callback(
@@ -2564,21 +2947,43 @@ def integrate_with_unified_visualizer(app, db_manager):
         prevent_initial_call=True
     )
     def delete_scan_target(n_clicks, selected_rows, data):
-        """Delete selected scan target"""
+        """Delete selected scan target - handles both local targets and agent jobs"""
         if not n_clicks or not selected_rows or not data:
             return no_update
         
         try:
             selected_idx = selected_rows[0]
             target_id = data[selected_idx].get('id')
+            source = data[selected_idx].get('source', 'local')
             
-            if target_id:
+            if not target_id:
+                return no_update
+            
+            if source == 'agent_job':
+                # This is a continuous agent job - delete from agent database
+                # ID format is "job:UUID"
+                job_id = target_id.replace('job:', '')
+                try:
+                    conn = agent_db._get_agent_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM agent_jobs WHERE job_id = %s", (job_id,))
+                    conn.commit()
+                    cur.close()
+                    conn.close()
+                    logger.info(f"Deleted agent job: {job_id}")
+                except Exception as e:
+                    logger.error(f"Error deleting agent job: {e}")
+                    return no_update
+            else:
+                # Local scan target - delete from main database
                 db_manager.execute_update(
                     "DELETE FROM scan_targets WHERE id = %s", (target_id,)
                 )
-                # Remove from data
-                data.pop(selected_idx)
-                return data
+                logger.info(f"Deleted scan target: {target_id}")
+            
+            # Remove from data
+            data.pop(selected_idx)
+            return data
         except Exception as e:
             logger.error(f"Error deleting scan target: {e}")
         
@@ -2631,10 +3036,12 @@ def integrate_with_unified_visualizer(app, db_manager):
          State('admin-job-path-suggestions', 'value'),
          State('admin-job-scanners', 'value'),
          State('admin-job-continuous', 'value'),
-         State('admin-job-interval', 'value')],
+         State('admin-job-interval', 'value'),
+         State('admin-share-username', 'value'),
+         State('admin-share-password', 'value')],
         prevent_initial_call=True
     )
-    def create_scan_job(n_clicks, agent_id, paths_input, paths_dropdown, scanners, continuous, interval):
+    def create_scan_job(n_clicks, agent_id, paths_input, paths_dropdown, scanners, continuous, interval, share_user, share_pass):
         """Create a scan job for an agent"""
         if not n_clicks:
             return ""
@@ -2652,18 +3059,33 @@ def integrate_with_unified_visualizer(app, db_manager):
             is_continuous = continuous and 'continuous' in continuous
             scan_interval = interval if is_continuous else None
             
+            # Build share credentials if provided (for UNC/CIFS paths)
+            share_credentials = None
+            if share_user and share_pass:
+                # Apply credentials to all UNC paths in the job
+                share_credentials = {}
+                for path in path_list:
+                    if path.startswith('\\\\') or path.startswith('//'):
+                        share_credentials[path] = {
+                            'username': share_user,
+                            'password': share_pass
+                        }
+            
             job = agent_db.create_job(
                 agent_id=agent_id,
                 scan_paths=path_list,
                 scanners=scanners or ['custom'],
                 continuous=is_continuous,
-                interval_minutes=scan_interval
+                interval_minutes=scan_interval,
+                share_credentials=share_credentials
             )
             
             if job:
                 msg = f"Job created: {str(job.get('job_id', ''))[:8]}..."
                 if is_continuous:
                     msg += f" (continuous, every {interval}min)"
+                if share_credentials:
+                    msg += " (with share credentials)"
                 return html.Div([
                     html.Span("✅ ", style={'color': '#48bb78'}),
                     html.Span(msg)
@@ -2682,6 +3104,197 @@ def integrate_with_unified_visualizer(app, db_manager):
     def toggle_interval_dropdown(continuous):
         """Enable/disable interval dropdown based on continuous checkbox"""
         return not (continuous and 'continuous' in continuous)
+    
+    # ========== SHARE CREDENTIALS INDICATOR ==========
+    @app.callback(
+        Output('admin-share-creds-indicator', 'children'),
+        [Input('admin-share-username', 'value'),
+         Input('admin-share-password', 'value')],
+        prevent_initial_call=False
+    )
+    def update_share_creds_indicator(username, password):
+        """Show indicator when credentials are configured"""
+        if username and password:
+            return html.Div([
+                html.Span("✅ ", style={'color': '#48bb78'}),
+                html.Span(f"Credentials configured: {username}", style={'color': '#48bb78', 'fontSize': '12px'})
+            ])
+        elif username or password:
+            return html.Div([
+                html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                html.Span("Both username and password required", style={'color': '#f59e0b', 'fontSize': '12px'})
+            ])
+        return ""
+    
+    # ========== TEST SHARE CREDENTIALS ==========
+    @app.callback(
+        Output('admin-share-creds-status', 'children'),
+        Input('admin-test-share-creds', 'n_clicks'),
+        [State('admin-job-agent-select', 'value'),
+         State('admin-job-path', 'value'),
+         State('admin-share-username', 'value'),
+         State('admin-share-password', 'value')],
+        prevent_initial_call=True
+    )
+    def test_share_credentials(n_clicks, agent_id, path, username, password):
+        """Test network share credentials by sending a test command to the agent.
+        
+        LOCKOUT PROTECTION: Limited to 2 attempts per path per 15 minutes.
+        After failed test, credentials are NOT retried automatically.
+        """
+        if not n_clicks:
+            return ""
+        
+        if not username or not password:
+            return html.Div([
+                html.Span("❌ ", style={'color': '#f56565'}),
+                html.Span("Enter username and password to test", style={'color': '#f56565'})
+            ])
+        
+        if not agent_id:
+            return html.Div([
+                html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                html.Span("Select an agent to test credentials", style={'color': '#f59e0b'})
+            ])
+        
+        # Use the path input or default to a test
+        test_path = path if path and path.startswith('\\\\') else None
+        
+        if not test_path:
+            return html.Div([
+                html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                html.Span("Enter a network share path (\\\\server\\share) to test", style={'color': '#f59e0b'})
+            ])
+        
+        try:
+            # LOCKOUT PROTECTION: Check how many failed attempts in the last 15 minutes
+            failed_attempts = agent_db.get_credential_test_attempts(agent_id, test_path)
+            
+            if failed_attempts >= 2:
+                return html.Div([
+                    html.Span("🔒 ", style={'color': '#f56565'}),
+                    html.Span("LOCKOUT PROTECTION: ", style={'color': '#f56565', 'fontWeight': 'bold'}),
+                    html.Span(f"Testing blocked - {failed_attempts} failed attempts in last 15 mins. ", 
+                             style={'color': '#f56565'}),
+                    html.Br(),
+                    html.Span("Wait 15 minutes or verify credentials before retrying to avoid account lockout.", 
+                             style={'color': '#fbbf24', 'fontSize': '11px'})
+                ])
+            
+            # Queue a test_share command to the agent (single attempt only)
+            cmd_result = agent_db.queue_agent_command(
+                agent_id=agent_id,
+                command='test_share',
+                parameters={
+                    'path': test_path,
+                    'username': username,
+                    'password': password
+                }
+            )
+            
+            if cmd_result:
+                remaining = 2 - failed_attempts - 1
+                return html.Div([
+                    html.Span("🔄 ", style={'color': '#60a5fa'}),
+                    html.Span(f"Test command queued for agent. ", style={'color': '#60a5fa'}),
+                    html.Br(),
+                    html.Span(f"Path: {test_path}", style={'color': '#888', 'fontSize': '11px'}),
+                    html.Br(),
+                    html.Span(f"⚠️ {remaining} attempt(s) remaining before lockout protection activates", 
+                             style={'color': '#fbbf24', 'fontSize': '10px'})
+                ])
+            else:
+                return html.Div([
+                    html.Span("❌ ", style={'color': '#f56565'}),
+                    html.Span("Failed to queue test command", style={'color': '#f56565'})
+                ])
+        except Exception as e:
+            logger.error(f"Error testing share credentials: {e}")
+            return html.Div([
+                html.Span("❌ ", style={'color': '#f56565'}),
+                html.Span(f"Error: {str(e)}", style={'color': '#f56565'})
+            ])
+    
+    # ========== PERSIST SHARE CREDENTIALS ON AGENT ==========
+    @app.callback(
+        Output('admin-share-creds-status', 'children', allow_duplicate=True),
+        Input('admin-persist-share-creds', 'n_clicks'),
+        [State('admin-job-agent-select', 'value'),
+         State('admin-job-path', 'value'),
+         State('admin-share-username', 'value'),
+         State('admin-share-password', 'value')],
+        prevent_initial_call=True
+    )
+    def persist_share_credentials(n_clicks, agent_id, path, username, password):
+        """Save share credentials on agent for persistence across reboots.
+        
+        This stores credentials in the server database and pushes them to the 
+        agent's local config file so they persist across service restarts/reboots.
+        """
+        if not n_clicks:
+            return no_update
+        
+        if not username or not password:
+            return html.Div([
+                html.Span("❌ ", style={'color': '#f56565'}),
+                html.Span("Enter username and password to save", style={'color': '#f56565'})
+            ])
+        
+        if not agent_id:
+            return html.Div([
+                html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                html.Span("Select an agent to save credentials", style={'color': '#f59e0b'})
+            ])
+        
+        # Use the path input
+        share_path = path if path and path.startswith('\\\\') else None
+        
+        if not share_path:
+            return html.Div([
+                html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                html.Span("Enter a network share path (\\\\server\\share) to save credentials for", style={'color': '#f59e0b'})
+            ])
+        
+        try:
+            # 1. Save to server database (agent_configs table)
+            db_saved = agent_db.save_agent_credentials(
+                agent_id=agent_id,
+                share_path=share_path,
+                username=username,
+                password=password,
+                created_by='admin'
+            )
+            
+            if not db_saved:
+                return html.Div([
+                    html.Span("❌ ", style={'color': '#f56565'}),
+                    html.Span("Failed to save credentials to database", style={'color': '#f56565'})
+                ])
+            
+            # 2. Push to agent's local config file
+            push_result = agent_db.push_credentials_to_agent(agent_id)
+            
+            if push_result:
+                return html.Div([
+                    html.Span("✅ ", style={'color': '#48bb78'}),
+                    html.Span(f"Credentials saved and push command queued. ", style={'color': '#48bb78'}),
+                    html.Br(),
+                    html.Span(f"Path: {share_path}", style={'color': '#888', 'fontSize': '11px'}),
+                    html.Br(),
+                    html.Span("Agent will persist credentials locally on next heartbeat.", 
+                             style={'color': '#60a5fa', 'fontSize': '10px'})
+                ])
+            else:
+                return html.Div([
+                    html.Span("⚠️ ", style={'color': '#f59e0b'}),
+                    html.Span("Credentials saved to DB but failed to push to agent", style={'color': '#f59e0b'})
+                ])
+        except Exception as e:
+            logger.error(f"Error persisting share credentials: {e}")
+            return html.Div([
+                html.Span("❌ ", style={'color': '#f56565'}),
+                html.Span(f"Error: {str(e)}", style={'color': '#f56565'})
+            ])
     
     # ========== JOBS TABLE POPULATION ==========
     @app.callback(
@@ -2730,6 +3343,8 @@ def integrate_with_unified_visualizer(app, db_manager):
                 duration = '-' if status not in ('running', 'assigned') else '...'
             
             data.append({
+                'job_id': str(j.get('job_id', ''))[:8],  # Show truncated job ID
+                'full_job_id': str(j.get('job_id', '')),  # Full ID for operations
                 'status_icon': f"{status_icon} {status.title()}",
                 'agent_hostname': j.get('agent_hostname', 'Unknown'),
                 'job_type': j.get('job_type', 'scan').title(),
@@ -2740,6 +3355,110 @@ def integrate_with_unified_visualizer(app, db_manager):
                 'duration': duration,
             })
         return data
+    
+    # ========== CLEAR JOBS ==========
+    @app.callback(
+        Output('admin-jobs-table', 'data', allow_duplicate=True),
+        Input('admin-clear-jobs', 'n_clicks'),
+        prevent_initial_call=True
+    )
+    def clear_completed_jobs(n_clicks):
+        """Clear all completed and failed jobs from the database"""
+        if not n_clicks:
+            return no_update
+        
+        try:
+            conn = agent_db._get_agent_db_connection()
+            cur = conn.cursor()
+            # Delete all jobs that are completed, failed, or cancelled
+            cur.execute("""
+                DELETE FROM agent_jobs 
+                WHERE status IN ('completed', 'failed', 'cancelled')
+            """)
+            deleted_count = cur.rowcount
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info(f"Cleared {deleted_count} completed/failed jobs")
+            
+            # Return empty list to refresh the table (the populate callback will repopulate with remaining jobs)
+            return []
+        except Exception as e:
+            logger.error(f"Error clearing jobs: {e}")
+            return no_update
+    
+    # ========== CANCEL JOB ==========
+    @app.callback(
+        Output('admin-jobs-table', 'data', allow_duplicate=True),
+        Input('admin-cancel-job', 'n_clicks'),
+        State('admin-jobs-table', 'selected_rows'),
+        State('admin-jobs-table', 'data'),
+        prevent_initial_call=True
+    )
+    def cancel_selected_job(n_clicks, selected_rows, data):
+        """Cancel selected pending or assigned job"""
+        logger.info(f"Cancel job callback: n_clicks={n_clicks}, selected_rows={selected_rows}, data_len={len(data) if data else 0}")
+        if not n_clicks or not selected_rows or not data:
+            logger.warning(f"Cancel job: Missing required params - n_clicks={n_clicks}, selected_rows={selected_rows}")
+            return no_update
+        
+        try:
+            selected_idx = selected_rows[0]
+            job_id = data[selected_idx].get('full_job_id')
+            status = data[selected_idx].get('status_icon', '')
+            logger.info(f"Cancel job: selected_idx={selected_idx}, job_id={job_id}, status={status}")
+            
+            if not job_id:
+                return no_update
+            
+            # Only allow cancelling pending, assigned, or running jobs
+            if 'Pending' not in status and 'Assigned' not in status and 'Running' not in status:
+                logger.warning(f"Cannot cancel job {job_id} with status {status}")
+                return no_update
+            
+            # Update job status to cancelled
+            conn = agent_db._get_agent_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE agent_jobs 
+                SET status = 'cancelled', completed_at = NOW()
+                WHERE job_id = %s::uuid AND status IN ('pending', 'assigned', 'running')
+                RETURNING job_id
+            """, (job_id,))
+            result = cur.fetchone()
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            if result:
+                logger.info(f"Cancelled job: {job_id}")
+                
+                # If job was assigned or running, send stop_scan command to the agent
+                if 'Assigned' in status or 'Running' in status:
+                    try:
+                        # Get agent_id for this job
+                        conn2 = agent_db._get_agent_db_connection()
+                        cur2 = conn2.cursor()
+                        cur2.execute("SELECT agent_id FROM agent_jobs WHERE job_id = %s::uuid", (job_id,))
+                        agent_result = cur2.fetchone()
+                        cur2.close()
+                        conn2.close()
+                        
+                        if agent_result and agent_result[0]:
+                            agent_id = str(agent_result[0])
+                            agent_db.queue_agent_command(agent_id, 'stop_scan', {'job_id': job_id})
+                            logger.info(f"Queued stop_scan command for agent {agent_id}")
+                    except Exception as e:
+                        logger.warning(f"Could not queue stop_scan command: {e}")
+                
+                # Update the row in data
+                data[selected_idx]['status_icon'] = '⛔ Cancelled'
+                return data
+            
+            return no_update
+        except Exception as e:
+            logger.error(f"Error cancelling job: {e}")
+            return no_update
     
     # ========== FINDINGS TABLE POPULATION ==========
     @app.callback(
@@ -3072,13 +3791,14 @@ def integrate_with_unified_visualizer(app, db_manager):
     @app.callback(
         Output('admin-key-action-result', 'children'),
         [Input('admin-revoke-key-btn', 'n_clicks'),
-         Input('admin-extend-key-btn', 'n_clicks')],
+         Input('admin-extend-key-btn', 'n_clicks'),
+         Input('admin-key-usage-btn', 'n_clicks')],
         [State('admin-apikeys-table', 'selected_rows'),
          State('admin-apikeys-table', 'data')],
         prevent_initial_call=True
     )
-    def handle_key_actions(revoke_clicks, extend_clicks, selected_rows, data):
-        """Handle API key actions (revoke, extend)"""
+    def handle_key_actions(revoke_clicks, extend_clicks, usage_clicks, selected_rows, data):
+        """Handle API key actions (revoke, extend, view usage)"""
         from dash import ctx
         if not ctx.triggered or not selected_rows or not data:
             return "Select a key first"
@@ -3107,6 +3827,76 @@ def integrate_with_unified_visualizer(app, db_manager):
                 return html.Div("❌ Failed to extend key", style={'color': '#f56565'})
             except Exception as e:
                 return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})
+        
+        elif trigger == 'admin-key-usage-btn':
+            try:
+                # Since we don't track which API key registered which agent,
+                # show overall system stats instead
+                conn = agent_db._get_agent_db_connection()
+                cur = conn.cursor()
+                
+                # Count all agents
+                cur.execute("SELECT COUNT(*) as count FROM agents")
+                agent_count = cur.fetchone()['count']
+                
+                # Get most recent agents
+                cur.execute("""
+                    SELECT hostname, last_heartbeat, status 
+                    FROM agents 
+                    ORDER BY last_heartbeat DESC NULLS LAST
+                    LIMIT 5
+                """)
+                recent_agents = cur.fetchall()
+                
+                # Count total jobs
+                cur.execute("SELECT COUNT(*) as count FROM agent_jobs")
+                job_count = cur.fetchone()['count']
+                
+                # Count total findings
+                cur.execute("SELECT COUNT(*) as count FROM agent_findings")
+                finding_count = cur.fetchone()['count']
+                
+                cur.close()
+                conn.close()
+                
+                # Build usage display
+                agent_list = []
+                for agent in recent_agents:
+                    status_icon = '🟢' if agent['status'] == 'online' else '⚪'
+                    last_seen = agent['last_heartbeat'].strftime('%Y-%m-%d %H:%M') if agent['last_heartbeat'] else 'Never'
+                    agent_list.append(html.Li(f"{status_icon} {agent['hostname']} - Last seen: {last_seen}"))
+                
+                return html.Div([
+                    html.H4(f"📊 System Stats (Key: {key_name})", style={'color': '#60a5fa', 'marginBottom': '15px'}),
+                    html.P("Note: Agent-to-key tracking not enabled. Showing total system usage.", 
+                           style={'color': '#888', 'fontSize': '12px', 'marginBottom': '10px'}),
+                    html.Div([
+                        html.Div([
+                            html.Strong("Total Agents: "),
+                            html.Span(f"{agent_count}")
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            html.Strong("Total Jobs: "),
+                            html.Span(f"{job_count}")
+                        ], style={'marginBottom': '8px'}),
+                        html.Div([
+                            html.Strong("Total Findings: "),
+                            html.Span(f"{finding_count}")
+                        ], style={'marginBottom': '15px'}),
+                    ]),
+                    html.Div([
+                        html.Strong("Recent Agents:"),
+                        html.Ul(agent_list if agent_list else [html.Li("No agents registered", style={'color': '#888'})])
+                    ], style={'marginTop': '10px'})
+                ], style={
+                    'backgroundColor': '#1a2332', 
+                    'padding': '15px', 
+                    'borderRadius': '6px',
+                    'border': '1px solid #2d4a6f'
+                })
+            except Exception as e:
+                logger.error(f"Error fetching key usage: {e}")
+                return html.Div(f"❌ Error fetching usage: {str(e)}", style={'color': '#f56565'})
         
         return no_update
     
@@ -3144,12 +3934,14 @@ def integrate_with_unified_visualizer(app, db_manager):
          Input('admin-agent-uninstall', 'n_clicks'),
          Input('admin-agent-remove', 'n_clicks'),
          Input('admin-bulk-update', 'n_clicks'),
-         Input('admin-bulk-restart', 'n_clicks')],
+         Input('admin-bulk-restart', 'n_clicks'),
+         Input('admin-agent-verbose-on', 'n_clicks'),
+         Input('admin-agent-verbose-off', 'n_clicks')],
         [State('admin-selected-agent-id', 'data'),
          State('admin-uninstall-wipe-config', 'value')],
         prevent_initial_call=True
     )
-    def handle_agent_commands(restart_clicks, update_clicks, repair_clicks, status_clicks, uninstall_clicks, remove_clicks, bulk_update_clicks, bulk_restart_clicks, agent_id, wipe_config):
+    def handle_agent_commands(restart_clicks, update_clicks, repair_clicks, status_clicks, uninstall_clicks, remove_clicks, bulk_update_clicks, bulk_restart_clicks, verbose_on_clicks, verbose_off_clicks, agent_id, wipe_config):
         """Handle agent management commands"""
         from dash import ctx
         trigger = ctx.triggered_id
@@ -3209,10 +4001,130 @@ def integrate_with_unified_visualizer(app, db_manager):
                 agent_db.delete_agent(agent_id)
                 return html.Div("🗑️ Agent removed from database (not uninstalled from remote machine)", style={'color': '#ecc94b'})
             
+            elif trigger == 'admin-agent-verbose-on':
+                command_id = agent_db.queue_agent_command(agent_id, 'set_log_level', {'level': 'DEBUG'})
+                return html.Div(f"🔈 Verbose logging enabled (ID: {command_id[:8]}...) - Agent will show debug messages", style={'color': '#48bb78'})
+            
+            elif trigger == 'admin-agent-verbose-off':
+                command_id = agent_db.queue_agent_command(agent_id, 'set_log_level', {'level': 'INFO'})
+                return html.Div(f"🔇 Verbose logging disabled (ID: {command_id[:8]}...) - Agent back to normal logging", style={'color': '#4dabf7'})
+            
         except Exception as e:
             return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'})
         
         return no_update
+    
+    # ========== AGENT CONFIG PANEL ==========
+    @app.callback(
+        Output('admin-agent-config-display', 'children'),
+        Output('admin-agent-config-display', 'style'),
+        [Input('admin-agent-fetch-config', 'n_clicks'),
+         Input('admin-agent-view-creds', 'n_clicks')],
+        [State('admin-selected-agent-id', 'data')],
+        prevent_initial_call=True
+    )
+    def handle_agent_config_commands(fetch_clicks, creds_clicks, agent_id):
+        """Handle agent config fetch commands"""
+        from dash import ctx
+        trigger = ctx.triggered_id
+        
+        visible_style = {
+            'backgroundColor': '#1e1e1e',
+            'padding': '15px',
+            'borderRadius': '5px',
+            'fontFamily': 'monospace',
+            'fontSize': '12px',
+            'maxHeight': '300px',
+            'overflow': 'auto',
+            'display': 'block'
+        }
+        
+        if not ctx.triggered or not agent_id:
+            return html.Div("Select an agent first", style={'color': '#888'}), visible_style
+        
+        try:
+            if trigger == 'admin-agent-fetch-config':
+                # Queue get_config command
+                command_id = agent_db.queue_agent_command(agent_id, 'get_config', {})
+                
+                # Try to get recent command result (might need to wait for agent heartbeat)
+                import time
+                result = None
+                for _ in range(10):  # Wait up to 5 seconds
+                    time.sleep(0.5)
+                    cmd_result = agent_db.get_command_result(command_id)
+                    if cmd_result and cmd_result.get('status') == 'completed':
+                        result = cmd_result.get('result', {})
+                        break
+                
+                if result:
+                    # Display config nicely
+                    config_items = []
+                    for key, value in result.items():
+                        if isinstance(value, dict):
+                            config_items.append(html.Div([
+                                html.Span(f"{key}: ", style={'color': '#4dabf7', 'fontWeight': 'bold'}),
+                                html.Pre(json.dumps(value, indent=2), style={'marginLeft': '20px', 'color': '#aaa'})
+                            ]))
+                        elif isinstance(value, list):
+                            config_items.append(html.Div([
+                                html.Span(f"{key}: ", style={'color': '#4dabf7', 'fontWeight': 'bold'}),
+                                html.Span(f"[{len(value)} items]", style={'color': '#888'})
+                            ]))
+                            for item in value[:10]:  # Show first 10
+                                config_items.append(html.Div(f"  • {item}", style={'color': '#aaa', 'marginLeft': '20px'}))
+                            if len(value) > 10:
+                                config_items.append(html.Div(f"  ... and {len(value)-10} more", style={'color': '#666', 'marginLeft': '20px'}))
+                        else:
+                            config_items.append(html.Div([
+                                html.Span(f"{key}: ", style={'color': '#4dabf7', 'fontWeight': 'bold'}),
+                                html.Span(str(value), style={'color': '#48bb78'})
+                            ]))
+                    return html.Div(config_items), visible_style
+                else:
+                    return html.Div([
+                        html.Div(f"⏳ Config request queued (ID: {command_id[:8]}...)", style={'color': '#f6ad55'}),
+                        html.Div("Waiting for agent heartbeat. Refresh in 30 seconds.", style={'color': '#888', 'fontSize': '11px'})
+                    ]), visible_style
+            
+            elif trigger == 'admin-agent-view-creds':
+                # Queue list_credentials command
+                command_id = agent_db.queue_agent_command(agent_id, 'list_credentials', {})
+                
+                # Try to get recent command result
+                import time
+                result = None
+                for _ in range(10):
+                    time.sleep(0.5)
+                    cmd_result = agent_db.get_command_result(command_id)
+                    if cmd_result and cmd_result.get('status') == 'completed':
+                        result = cmd_result.get('result', {})
+                        break
+                
+                if result:
+                    credentials = result.get('credentials', [])
+                    if not credentials:
+                        return html.Div("No stored credentials on this agent", style={'color': '#888'}), visible_style
+                    
+                    cred_items = [html.Div("📁 Stored CIFS Credentials:", style={'color': '#4dabf7', 'fontWeight': 'bold', 'marginBottom': '10px'})]
+                    for cred in credentials:
+                        cred_items.append(html.Div([
+                            html.Span(f"Path: ", style={'color': '#888'}),
+                            html.Span(cred.get('path', 'N/A'), style={'color': '#48bb78'}),
+                            html.Span(f"  User: ", style={'color': '#888', 'marginLeft': '15px'}),
+                            html.Span(cred.get('username', 'N/A'), style={'color': '#f6ad55'}),
+                        ], style={'marginBottom': '5px'}))
+                    return html.Div(cred_items), visible_style
+                else:
+                    return html.Div([
+                        html.Div(f"⏳ Credentials request queued (ID: {command_id[:8]}...)", style={'color': '#f6ad55'}),
+                        html.Div("Waiting for agent heartbeat. Refresh in 30 seconds.", style={'color': '#888', 'fontSize': '11px'})
+                    ]), visible_style
+        
+        except Exception as e:
+            return html.Div(f"❌ Error: {str(e)}", style={'color': '#f56565'}), visible_style
+        
+        return no_update, no_update
     
     # ========== FOLDER BROWSER MODAL ==========
     @app.callback(
@@ -3222,10 +4134,12 @@ def integrate_with_unified_visualizer(app, db_manager):
         [Input('admin-browse-agent-paths', 'n_clicks'),
          Input('folder-browser-cancel', 'n_clicks')],
         [State('admin-job-agent-select', 'value'),
+         State('admin-share-username', 'value'),
+         State('admin-share-password', 'value'),
          State('folder-browser-modal', 'is_open')],
         prevent_initial_call=True
     )
-    def toggle_folder_browser(browse_clicks, cancel_clicks, agent_id, is_open):
+    def toggle_folder_browser(browse_clicks, cancel_clicks, agent_id, share_user, share_pass, is_open):
         """Open/close folder browser modal and populate paths"""
         from dash import ctx
         
@@ -3239,6 +4153,19 @@ def integrate_with_unified_visualizer(app, db_manager):
             try:
                 paths = agent_db.get_agent_paths(agent_id)
                 
+                # Build credential status message
+                creds_status = ""
+                if share_user and share_pass:
+                    creds_status = html.Div([
+                        html.Span("🔐 ", style={'marginRight': '5px'}),
+                        html.Span(f"Network credentials configured: {share_user}", style={'color': '#48bb78', 'fontSize': '12px'})
+                    ], style={'marginTop': '5px'})
+                elif share_user or share_pass:
+                    creds_status = html.Div([
+                        html.Span("⚠️ ", style={'marginRight': '5px'}),
+                        html.Span("Incomplete credentials (need both username and password)", style={'color': '#f6ad55', 'fontSize': '12px'})
+                    ], style={'marginTop': '5px'})
+                
                 if not paths:
                     # Queue discovery and show waiting message
                     agent_db.queue_agent_command(agent_id, 'list_paths', {})
@@ -3250,11 +4177,17 @@ def integrate_with_unified_visualizer(app, db_manager):
                             html.Span("This may take 30-60 seconds. Click 'Browse' again after the agent heartbeats.", 
                                      style={'color': '#888', 'fontSize': '12px'})
                         ], style={'textAlign': 'center', 'padding': '40px', 'color': '#4dabf7'})
-                    ], html.Div("⏳ Waiting for path discovery...", style={'color': '#4dabf7'})
+                    ], html.Div([
+                        html.Div("⏳ Waiting for path discovery...", style={'color': '#4dabf7'}),
+                        creds_status
+                    ])
                 
                 # Build folder tree from paths
                 tree_items = build_folder_tree(paths)
-                status = html.Div(f"✅ Found {len(paths)} available paths", style={'color': '#48bb78'})
+                status = html.Div([
+                    html.Div(f"✅ Found {len(paths)} available paths", style={'color': '#48bb78'}),
+                    creds_status
+                ])
                 
                 return True, tree_items, status
             except Exception as e:

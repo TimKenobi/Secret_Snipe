@@ -37,6 +37,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ /app/shared/
 COPY manager/ /app/manager/
 COPY windows_installer/ /app/windows_installer/
+COPY linux_installer/ /app/linux_installer/
+COPY signatures.json /app/signatures.json
 
 # Create logs directory
 RUN mkdir -p /app/logs && chown -R secretsnipe:secretsnipe /app

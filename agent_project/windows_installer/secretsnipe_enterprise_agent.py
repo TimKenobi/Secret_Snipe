@@ -47,7 +47,24 @@ except ImportError:
 # VERSION
 # ============================================================================
 
-AGENT_VERSION = "2.0.4"
+AGENT_VERSION = "3.0.0"  # 3.0.0: Full V1 scanner parity - OCR, PDF, Excel, Word, validation
+
+
+# ============================================================================
+# DETECTION ENGINE IMPORT
+# ============================================================================
+
+# Try to import the detection engine for full scanning capabilities
+try:
+    from detection_engine import DetectionEngine, PDF_AVAILABLE, TESSERACT_AVAILABLE, EASYOCR_AVAILABLE, DOCX_AVAILABLE, OPENPYXL_AVAILABLE
+    DETECTION_ENGINE_AVAILABLE = True
+except ImportError:
+    DETECTION_ENGINE_AVAILABLE = False
+    PDF_AVAILABLE = False
+    TESSERACT_AVAILABLE = False
+    EASYOCR_AVAILABLE = False
+    DOCX_AVAILABLE = False
+    OPENPYXL_AVAILABLE = False
 
 
 # ============================================================================
@@ -242,14 +259,34 @@ class BaseScanner:
 
 
 class CustomRegexScanner(BaseScanner):
-    """Custom regex-based scanner"""
+    """Custom regex-based scanner - uses DetectionEngine when available for full capabilities"""
     
-    def __init__(self, logger: logging.Logger, signatures: List[Dict] = None):
+    def __init__(self, logger: logging.Logger, signatures: List[Dict] = None, config: Dict = None):
         super().__init__(logger)
         self.name = "custom"
         self.signatures = signatures or DEFAULT_SIGNATURES
         self._compiled_patterns = []
-        self._compile_patterns()
+        self.config = config or {}
+        
+        # Initialize detection engine if available
+        self._detection_engine = None
+        if DETECTION_ENGINE_AVAILABLE:
+            try:
+                engine_config = {
+                    "enable_ocr": self.config.get("enable_ocr", True),
+                    "enable_pdf": self.config.get("enable_pdf", True),
+                    "enable_office": self.config.get("enable_office", True),
+                    "max_file_size_mb": self.config.get("max_file_size_mb", 50),
+                    "ocr_engine": self.config.get("ocr_engine", "tesseract")
+                }
+                self._detection_engine = DetectionEngine(logger=logger, config=engine_config)
+                self.logger.info("🚀 DetectionEngine loaded - full scanning capabilities active")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize DetectionEngine: {e}, using basic patterns")
+                self._compile_patterns()
+        else:
+            self.logger.info("📋 Using basic regex patterns (DetectionEngine not available)")
+            self._compile_patterns()
     
     def _compile_patterns(self):
         """Pre-compile regex patterns for performance"""
@@ -268,44 +305,178 @@ class CustomRegexScanner(BaseScanner):
         """Scan files for secrets using regex patterns"""
         findings = []
         options = options or {}
+        job_id = options.get("job_id", "unknown")
+        
+        self.logger.info(f"🔍 CustomRegexScanner.scan() called for: {target_path}")
         
         target = Path(target_path)
+        self.logger.info(f"🔍 Checking if path exists: {target_path}")
         if not target.exists():
             self.logger.error(f"Target path does not exist: {target_path}")
             return findings
+        
+        self.logger.info(f"✅ Path exists, is_file={target.is_file()}")
         
         # Get files to scan
         if target.is_file():
             files = [target]
         else:
+            self.logger.info(f"📂 Getting file list from directory...")
             files = self._get_files(target, options)
         
-        self.logger.info(f"Scanning {len(files)} files in {target_path}")
+        total_files = len(files)
         
-        for file_path in files:
+        # Check for checkpoint (resume from previous scan)
+        checkpoint_file = self._get_checkpoint_path(job_id)
+        start_index = 0
+        if checkpoint_file.exists():
+            try:
+                checkpoint_data = json.loads(checkpoint_file.read_text())
+                start_index = checkpoint_data.get("last_index", 0)
+                findings = checkpoint_data.get("findings", [])
+                self.logger.info(f"🔄 Resuming from checkpoint: {start_index:,}/{total_files:,} files, {len(findings)} findings already")
+            except Exception as e:
+                self.logger.warning(f"Could not load checkpoint: {e}")
+                start_index = 0
+        
+        self.logger.info(f"🔎 Starting scan of {total_files:,} files in {target_path} (from index {start_index})")
+        scan_start = time.time()
+        scanned = start_index
+        
+        # CPU throttling settings - configurable via options
+        throttle_ms = options.get("throttle_ms", 5)  # 5ms pause between files (default)
+        batch_size = options.get("batch_size", 100)  # Pause every N files
+        batch_pause_ms = options.get("batch_pause_ms", 50)  # 50ms pause after batch
+        checkpoint_interval = options.get("checkpoint_interval", 500)  # Save checkpoint every N files
+        
+        self.logger.info(f"⚡ CPU throttling: {throttle_ms}ms/file, batch_size={batch_size}, checkpoint_interval={checkpoint_interval}")
+        
+        for i, file_path in enumerate(files[start_index:], start=start_index):
             try:
                 file_findings = self._scan_file(file_path)
                 findings.extend(file_findings)
+                scanned += 1
+                
+                # CPU throttling - small sleep between files
+                if throttle_ms > 0:
+                    time.sleep(throttle_ms / 1000.0)
+                
+                # Batch pause - longer sleep every N files to allow other processes
+                if scanned % batch_size == 0:
+                    if batch_pause_ms > 0:
+                        time.sleep(batch_pause_ms / 1000.0)
+                
+                # Save checkpoint periodically
+                if scanned % checkpoint_interval == 0:
+                    self._save_checkpoint(job_id, scanned, findings)
+                
+                # Progress every 1000 files
+                if scanned % 1000 == 0:
+                    elapsed = time.time() - scan_start
+                    rate = (scanned - start_index) / elapsed if elapsed > 0 else 0
+                    remaining = total_files - scanned
+                    eta = remaining / rate if rate > 0 else 0
+                    self.logger.info(f"📊 Scan progress: {scanned:,}/{total_files:,} files ({scanned*100//total_files}%), {rate:.0f} files/sec, ETA: {eta/60:.0f}m")
             except Exception as e:
                 self.logger.warning(f"Error scanning {file_path}: {e}")
+                scanned += 1
+        
+        # Delete checkpoint on completion
+        self._delete_checkpoint(job_id)
+        
+        elapsed = time.time() - scan_start
+        self.logger.info(f"✅ Scan complete: {scanned:,} files scanned, {len(findings)} findings ({elapsed:.0f}s)")
         
         return findings
+    
+    def _get_checkpoint_path(self, job_id: str) -> Path:
+        """Get path for checkpoint file"""
+        checkpoint_dir = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))) / "SecretSnipe" / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        return checkpoint_dir / f"{job_id}.checkpoint.json"
+    
+    def _save_checkpoint(self, job_id: str, last_index: int, findings: List[Dict]):
+        """Save scan checkpoint for resume capability"""
+        try:
+            checkpoint_file = self._get_checkpoint_path(job_id)
+            checkpoint_data = {
+                "job_id": job_id,
+                "last_index": last_index,
+                "findings": findings,
+                "timestamp": time.time()
+            }
+            checkpoint_file.write_text(json.dumps(checkpoint_data))
+            self.logger.debug(f"💾 Checkpoint saved: {last_index} files, {len(findings)} findings")
+        except Exception as e:
+            self.logger.warning(f"Could not save checkpoint: {e}")
+    
+    def _delete_checkpoint(self, job_id: str):
+        """Delete checkpoint after successful completion"""
+        try:
+            checkpoint_file = self._get_checkpoint_path(job_id)
+            if checkpoint_file.exists():
+                checkpoint_file.unlink()
+                self.logger.debug(f"🗑️ Checkpoint deleted for job {job_id}")
+        except Exception as e:
+            self.logger.warning(f"Could not delete checkpoint: {e}")
     
     def _get_files(self, directory: Path, options: Dict) -> List[Path]:
         """Get list of files to scan"""
         files = []
-        exclude_patterns = options.get("exclude_patterns", [
+        
+        # Base exclusions for binary/media files
+        base_exclude = [
             "*.pyc", "*.pyo", "*.class", "*.o", "*.a", "*.so", "*.dll", "*.exe",
-            "*.zip", "*.tar", "*.gz", "*.rar", "*.7z",
-            "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.svg",
-            "*.mp3", "*.mp4", "*.avi", "*.mov",
-            "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx",
+            "*.tar", "*.gz", "*.rar", "*.7z",
+            "*.ico", "*.svg",
+            "*.mp3", "*.mp4", "*.avi", "*.mov", "*.wmv", "*.flv",
             "node_modules/*", ".git/*", "__pycache__/*", "*.min.js", "*.min.css"
-        ])
+        ]
+        
+        # If DetectionEngine is available, we can scan these file types
+        # Otherwise exclude them
+        if not self._detection_engine:
+            # No detection engine - exclude office/pdf/image files
+            base_exclude.extend([
+                "*.pdf", "*.doc", "*.docx", "*.xls", "*.xlsx",
+                "*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.tif",
+                "*.zip"
+            ])
+        else:
+            # Detection engine available - only exclude images if OCR not available
+            caps = self._detection_engine.get_capabilities()
+            if not caps.get("ocr_tesseract") and not caps.get("ocr_easyocr"):
+                base_exclude.extend(["*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.tiff", "*.tif"])
+            if not caps.get("pdf"):
+                base_exclude.append("*.pdf")
+            if not caps.get("excel"):
+                base_exclude.extend(["*.xls", "*.xlsx"])
+            if not caps.get("word"):
+                base_exclude.extend(["*.doc", "*.docx"])
+        
+        exclude_patterns = options.get("exclude_patterns", base_exclude)
         
         max_file_size = options.get("max_file_size", 10 * 1024 * 1024)  # 10MB default
+        max_files = options.get("max_files", 500000)  # 500K files limit
+        max_directories = options.get("max_directories", 100000)  # 100K directories limit
+        
+        self.logger.info(f"📂 Starting directory enumeration: {directory}")
+        self.logger.info(f"📊 Limits: max_files={max_files:,}, max_directories={max_directories:,}")
+        dir_count = 0
+        start_time = time.time()
         
         for root, dirs, filenames in os.walk(directory):
+            dir_count += 1
+            # Progress every 1000 directories
+            if dir_count <= 5 or dir_count % 1000 == 0:
+                elapsed = time.time() - start_time
+                self.logger.info(f"📁 Enumeration progress: {dir_count:,} dirs, {len(files):,} files ({elapsed:.0f}s elapsed)")
+            
+            # Check directory limit
+            if dir_count >= max_directories:
+                self.logger.warning(f"⚠️ Directory limit reached ({max_directories:,}), stopping enumeration")
+                break
+            
             # Skip excluded directories
             dirs[:] = [d for d in dirs if not any(
                 Path(root) / d == Path(directory) / p.rstrip('/*') 
@@ -313,6 +484,11 @@ class CustomRegexScanner(BaseScanner):
             )]
             
             for filename in filenames:
+                # Check file limit
+                if len(files) >= max_files:
+                    self.logger.warning(f"⚠️ File limit reached ({max_files:,}), stopping enumeration")
+                    break
+                
                 file_path = Path(root) / filename
                 
                 # Check exclusions
@@ -327,11 +503,35 @@ class CustomRegexScanner(BaseScanner):
                     continue
                 
                 files.append(file_path)
+            
+            # Break outer loop if file limit reached
+            if len(files) >= max_files:
+                break
+        
+        elapsed = time.time() - start_time
+        self.logger.info(f"✅ Directory enumeration complete: {len(files):,} files in {dir_count:,} dirs ({elapsed:.0f}s)")
         
         return files
     
     def _scan_file(self, file_path: Path) -> List[Dict]:
-        """Scan a single file for secrets"""
+        """Scan a single file for secrets - uses DetectionEngine when available"""
+        
+        # Use DetectionEngine if available (provides OCR, PDF, Excel, Word, validation)
+        if self._detection_engine:
+            try:
+                findings = self._detection_engine.scan_file(file_path)
+                # Convert DetectionEngine format to agent format
+                for f in findings:
+                    f["scanner"] = self.name
+                return findings
+            except Exception as e:
+                self.logger.warning(f"DetectionEngine failed for {file_path}: {e}, fallback to basic scan")
+        
+        # Fallback to basic regex scanning (text files only)
+        return self._scan_file_basic(file_path)
+    
+    def _scan_file_basic(self, file_path: Path) -> List[Dict]:
+        """Basic regex scanning for text files only"""
         findings = []
         
         try:
@@ -370,26 +570,18 @@ class CustomRegexScanner(BaseScanner):
             
             # Second check: if we have null bytes in content, it's probably misread UTF-16
             if content and '\x00' in content[:200]:
-                self.logger.warning(f"Detected null bytes in {file_path}, trying UTF-16...")
+                self.logger.debug(f"Detected null bytes in {file_path}, trying UTF-16...")
                 content = raw_bytes.decode('utf-16', errors='ignore')
                 encoding_used = 'utf-16-auto'
             
-            self.logger.info(f"📄 Scanning file: {file_path} ({len(content)} chars, {encoding_used})")
-            if len(content) > 0:
-                # Log first 100 chars for debugging
-                preview = content[:100].replace('\n', '\\n').replace('\r', '\\r').replace('\x00', '')
-                self.logger.info(f"📝 Content preview: {preview}...")
         except Exception as e:
             self.logger.warning(f"Failed to read {file_path}: {e}")
             return findings
         
         if not content or len(content) < 10:
-            self.logger.info(f"File {file_path} is empty or too small")
             return findings
         
         lines = content.split('\n')
-        
-        self.logger.info(f"🔍 Checking {len(self._compiled_patterns)} patterns against {len(lines)} lines")
         
         for pattern_info in self._compiled_patterns:
             for match in pattern_info["pattern"].finditer(content):
@@ -406,20 +598,17 @@ class CustomRegexScanner(BaseScanner):
                 else:
                     masked = '*' * len(matched)
                 
-                self.logger.info(f"🎯 FOUND: {pattern_info['name']} at line {line_num}")
-                
                 findings.append({
                     "file": str(file_path),
                     "line": line_num,
                     "rule": pattern_info["name"],
                     "severity": pattern_info["severity"],
                     "match": masked,
-                    "line_content": line_content[:200],  # Truncate long lines
+                    "line_content": line_content[:200],
                     "scanner": self.name,
                     "timestamp": datetime.utcnow().isoformat()
                 })
         
-        self.logger.info(f"📊 File {file_path.name}: {len(findings)} findings")
         return findings
 
 
@@ -774,6 +963,21 @@ class AgentManagerClient:
         except:
             return False
     
+    def update_job_status(self, job_id: str, status: str, files_scanned: int = 0) -> bool:
+        """Update job status (e.g., to 'running')"""
+        data = {
+            "status": status,
+            "files_scanned": files_scanned
+        }
+        
+        try:
+            resp = self.session.post(self._url(f"/jobs/{job_id}/status"), json=data, timeout=30)
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to update job status: {e}")
+            return False
+    
     def _get_ip(self) -> str:
         """Get primary IP address"""
         try:
@@ -887,16 +1091,50 @@ class SecretSnipeEnterpriseAgent:
         
         self.running = False
         self.current_job = None
+        self.cancel_current_job = False  # Flag to stop current scan
         self._heartbeat_thread = None
     
     def start(self):
         """Start the agent"""
         self.logger.info("=" * 60)
         self.logger.info("SecretSnipe Enterprise Agent Starting")
+        self.logger.info(f"Version: {AGENT_VERSION}")
         self.logger.info(f"Machine Fingerprint: {self.config.machine_fingerprint}")
         self.logger.info(f"Manager URL: {self.config.manager_url}")
         self.logger.info(f"Scanners: {list(self.scanners.keys())}")
         self.logger.info("=" * 60)
+        
+        # Lower process priority on Windows for resource-friendly scanning
+        try:
+            if platform.system() == "Windows":
+                import ctypes
+                BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+                handle = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS)
+                self.logger.info("⚡ Process priority set to BELOW_NORMAL for resource-friendly scanning")
+            else:
+                # Unix/Linux: use nice
+                os.nice(10)  # Lower priority (higher nice value = lower priority)
+                self.logger.info("⚡ Process niceness set to 10 for resource-friendly scanning")
+        except Exception as e:
+            self.logger.warning(f"Could not lower process priority: {e}")
+        
+        # Check for updates on startup
+        try:
+            self.logger.info("🔍 Checking for agent updates...")
+            update_info = self._check_for_update()
+            if update_info.get("update_available"):
+                self.logger.info(f"📦 Update available: {update_info.get('current_version')} -> {update_info.get('server_version')}")
+                result = self._update_agent()
+                if result.get("status") == "success":
+                    self.logger.info("🔄 Agent updated, restarting...")
+                    return  # Let the restart happen
+                elif result.get("status") == "already_current":
+                    self.logger.info("✅ Agent is already up to date")
+            else:
+                self.logger.info(f"✅ Agent version {update_info.get('current_version')} is current")
+        except Exception as e:
+            self.logger.warning(f"Update check failed, continuing with current version: {e}")
         
         # Register with manager
         try:
@@ -922,19 +1160,38 @@ class SecretSnipeEnterpriseAgent:
             self._heartbeat_thread.join(timeout=5)
     
     def _heartbeat_loop(self):
-        """Background heartbeat loop"""
+        """Background heartbeat loop - runs independently of main scan operations"""
+        consecutive_failures = 0
+        
         while self.running:
             try:
                 status = "scanning" if self.current_job else "idle"
-                self.client.heartbeat(status, self.current_job)
-                # Check for pending commands from server
-                self._check_pending_commands()
-                # Flush buffered logs to server
-                self.client.flush_logs()
+                result = self.client.heartbeat(status, self.current_job)
+                
+                if result:  # Heartbeat succeeded
+                    consecutive_failures = 0
+                    # Only check commands if heartbeat worked
+                    try:
+                        self._check_pending_commands()
+                    except Exception as cmd_error:
+                        self.logger.debug(f"Command check error: {cmd_error}")
+                    
+                    # Flush buffered logs
+                    try:
+                        self.client.flush_logs()
+                    except Exception as log_error:
+                        self.logger.debug(f"Log flush error: {log_error}")
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        self.logger.warning(f"Heartbeat failed {consecutive_failures} times in a row")
             except Exception as e:
-                self.logger.warning(f"Heartbeat error: {e}")
+                consecutive_failures += 1
+                self.logger.warning(f"Heartbeat error ({consecutive_failures}): {e}")
             
-            time.sleep(self.config.heartbeat_interval)
+            # Shorter sleep interval when scanning to ensure heartbeats get through
+            sleep_time = 15 if self.current_job else self.config.heartbeat_interval
+            time.sleep(sleep_time)
     
     def _check_pending_commands(self):
         """Check for and execute pending commands from the server"""
@@ -953,6 +1210,17 @@ class SecretSnipeEnterpriseAgent:
         
         self.logger.info(f"🎯 Executing command: {command}")
         result_data = {}
+        
+        # High-priority commands that should kill current job first
+        HIGH_PRIORITY_COMMANDS = {"uninstall", "update", "restart", "stop_scan"}
+        
+        # If high-priority command and we have a running job, stop it first
+        if command in HIGH_PRIORITY_COMMANDS and self.current_job:
+            self.logger.info(f"⚡ High-priority command '{command}' received - stopping current job: {self.current_job}")
+            self.cancel_current_job = True
+            # Give current job time to checkpoint and stop
+            import time
+            time.sleep(2)
         
         try:
             if command == "list_paths":
@@ -983,9 +1251,52 @@ class SecretSnipeEnterpriseAgent:
                 result_data = self._check_for_update()
             elif command == "clear_cache":
                 result_data = {"status": "cache_cleared"}
+            elif command == "test_share":
+                # Test network share access with credentials
+                result_data = self._test_share_access(
+                    params.get("path"),
+                    params.get("username"),
+                    params.get("password")
+                )
+            elif command == "update_credentials":
+                # Persist share credentials to local config file
+                result_data = self._save_local_credentials(params.get("share_credentials", {}))
+            elif command == "set_log_level":
+                # Toggle verbose logging
+                level = params.get("level", "INFO").upper()
+                numeric_level = getattr(logging, level, logging.INFO)
+                self.logger.setLevel(numeric_level)
+                # Also update all handlers
+                for handler in self.logger.handlers:
+                    handler.setLevel(numeric_level)
+                self.logger.info(f"📝 Log level set to {level}")
+                result_data = {"status": "ok", "level": level}
+            elif command == "stop_scan":
+                # Stop current scan
+                if self.current_job:
+                    self.logger.info(f"⛔ Stopping current scan job: {self.current_job}")
+                    self.cancel_current_job = True
+                    result_data = {"status": "stopping", "job_id": self.current_job}
+                else:
+                    result_data = {"status": "no_active_scan"}
+            elif command == "get_config":
+                # Return current agent configuration
+                result_data = self._get_full_config()
+            elif command == "list_credentials":
+                # List stored CIFS credentials (paths only, not passwords)
+                result_data = self._list_stored_credentials()
+            elif command == "list_cifs_paths":
+                # List paths from stored CIFS credentials for folder browser
+                result_data = self._list_cifs_paths()
+            elif command == "uninstall":
+                # Uninstall the agent
+                self.logger.info("🗑️ Uninstall command received")
+                wipe_data = params.get("wipe_data", False)
+                result_data = {"status": "uninstall_scheduled", "wipe_data": wipe_data}
+                # Schedule uninstall after command completion (5 seconds)
+                threading.Timer(5.0, self._uninstall_agent, args=[wipe_data]).start()
             else:
                 self.logger.warning(f"Unknown command: {command}")
-                result_data = {"error": f"Unknown command: {command}"}
                 result_data = {"error": f"Unknown command: {command}"}
             
             # Report completion
@@ -1341,6 +1652,309 @@ class SecretSnipeEnterpriseAgent:
         # Re-execute the current script
         os.execv(sys.executable, [sys.executable] + sys.argv)
     
+    def _uninstall_agent(self, wipe_data: bool = False):
+        """Uninstall this agent"""
+        self.logger.info(f"🗑️ Uninstalling agent (wipe_data={wipe_data})...")
+        self.running = False
+        
+        try:
+            if platform.system() == "Windows":
+                # Windows uninstall
+                import subprocess
+                
+                # Stop the service first
+                try:
+                    subprocess.run(['sc', 'stop', 'SecretSnipeAgent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Delete the service
+                try:
+                    subprocess.run(['sc', 'delete', 'SecretSnipeAgent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Remove from scheduled tasks if exists
+                try:
+                    subprocess.run(['schtasks', '/delete', '/tn', 'SecretSnipeAgent', '/f'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                if wipe_data:
+                    # Wipe all agent data
+                    install_dir = Path(os.environ.get('PROGRAMDATA', 'C:\\ProgramData')) / 'SecretSnipe'
+                    if install_dir.exists():
+                        import shutil
+                        shutil.rmtree(install_dir, ignore_errors=True)
+                        self.logger.info(f"🗑️ Removed install directory: {install_dir}")
+            else:
+                # Linux uninstall
+                import subprocess
+                
+                # Stop the service
+                try:
+                    subprocess.run(['systemctl', 'stop', 'secretsnipe-agent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Disable the service
+                try:
+                    subprocess.run(['systemctl', 'disable', 'secretsnipe-agent'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                # Remove the service file
+                try:
+                    service_file = Path('/etc/systemd/system/secretsnipe-agent.service')
+                    if service_file.exists():
+                        service_file.unlink()
+                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                except:
+                    pass
+                
+                if wipe_data:
+                    # Wipe all agent data
+                    import shutil
+                    for path in ['/opt/secretsnipe', '/etc/secretsnipe', '/var/log/secretsnipe']:
+                        p = Path(path)
+                        if p.exists():
+                            if p.is_dir():
+                                shutil.rmtree(p, ignore_errors=True)
+                            else:
+                                p.unlink()
+                            self.logger.info(f"🗑️ Removed: {path}")
+            
+            self.logger.info("🗑️ Agent uninstallation complete")
+            
+        except Exception as e:
+            self.logger.error(f"Error during uninstall: {e}")
+        
+        # Exit the process
+        sys.exit(0)
+    
+    def _get_credentials_file_path(self) -> Path:
+        """Get the path to the local credentials file"""
+        if platform.system() == "Windows":
+            return Path(os.environ.get('PROGRAMDATA', 'C:\\ProgramData')) / 'SecretSnipe' / 'credentials.json'
+        else:
+            return Path('/etc/secretsnipe') / 'credentials.json'
+    
+    def _test_share_access(self, path: str, username: str = None, password: str = None) -> Dict:
+        """Test access to a network share with credentials"""
+        result = {
+            "path": path,
+            "success": False,
+            "message": "",
+            "accessible": False,
+            "files_visible": 0
+        }
+        
+        if not path:
+            result["message"] = "No path specified"
+            return result
+        
+        try:
+            if platform.system() == "Windows":
+                import subprocess
+                
+                # Try to connect to the share
+                if username and password:
+                    cmd = ['net', 'use', path, f'/user:{username}', password, '/persistent:no']
+                    conn_result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                    
+                    if conn_result.returncode != 0:
+                        if "already connected" in conn_result.stderr.lower() or "duplicate" in conn_result.stderr.lower():
+                            result["message"] = "Share already connected (using existing mapping)"
+                        else:
+                            result["message"] = f"Failed to connect: {conn_result.stderr.strip()}"
+                            return result
+                    else:
+                        result["message"] = "Successfully connected with provided credentials"
+                
+                # Test if we can list the directory
+                test_path = Path(path)
+                if test_path.exists():
+                    result["accessible"] = True
+                    try:
+                        files = list(test_path.iterdir())[:10]
+                        result["files_visible"] = len(files)
+                        result["success"] = True
+                        result["message"] = f"Access confirmed. Found {len(files)} items (showing first 10)."
+                        result["sample_items"] = [f.name for f in files]
+                    except PermissionError as e:
+                        result["message"] = f"Can see path but permission denied: {e}"
+                else:
+                    result["message"] = f"Path does not exist or is not accessible"
+                    
+                # Disconnect if we connected with credentials
+                if username and password and result["success"]:
+                    try:
+                        subprocess.run(['net', 'use', path, '/delete', '/y'], capture_output=True, timeout=10)
+                    except:
+                        pass
+            else:
+                if Path(path).exists():
+                    result["success"] = True
+                    result["accessible"] = True
+                    result["message"] = "Path accessible"
+                else:
+                    result["message"] = "Path not accessible on this platform"
+                    
+        except subprocess.TimeoutExpired:
+            result["message"] = "Connection timed out (30 seconds)"
+        except Exception as e:
+            result["message"] = f"Error testing share: {str(e)}"
+            self.logger.error(f"Error testing share access: {e}")
+        
+        self.logger.info(f"Share test result for {path}: {result['success']} - {result['message']}")
+        return result
+    
+    def _save_local_credentials(self, share_credentials: Dict) -> Dict:
+        """Save share credentials to local file for persistence across reboots"""
+        result = {
+            "success": False,
+            "message": "",
+            "paths_saved": 0
+        }
+        
+        try:
+            creds_file = self._get_credentials_file_path()
+            creds_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Load existing credentials
+            existing = {}
+            if creds_file.exists():
+                try:
+                    with open(creds_file, 'r') as f:
+                        existing = json.load(f)
+                except:
+                    pass
+            
+            # Merge new credentials
+            existing['share_credentials'] = share_credentials
+            existing['updated_at'] = datetime.now().isoformat()
+            
+            # Save with restrictive permissions
+            with open(creds_file, 'w') as f:
+                json.dump(existing, f, indent=2)
+            
+            # On Windows, try to set restrictive permissions
+            if platform.system() == "Windows":
+                import subprocess
+                try:
+                    subprocess.run(['icacls', str(creds_file), '/inheritance:r', 
+                                  '/grant', 'SYSTEM:F', '/grant', 'Administrators:F'],
+                                 capture_output=True)
+                except:
+                    pass
+            
+            result["success"] = True
+            result["paths_saved"] = len(share_credentials)
+            result["message"] = f"Saved credentials for {len(share_credentials)} share(s)"
+            self.logger.info(f"💾 Saved credentials for {len(share_credentials)} network share(s) to {creds_file}")
+            
+        except Exception as e:
+            result["message"] = f"Failed to save credentials: {str(e)}"
+            self.logger.error(f"Error saving credentials: {e}")
+        
+        return result
+    
+    def _load_local_credentials(self) -> Dict:
+        """Load share credentials from local file (called on startup)"""
+        try:
+            creds_file = self._get_credentials_file_path()
+            if creds_file.exists():
+                with open(creds_file, 'r') as f:
+                    data = json.load(f)
+                    share_creds = data.get('share_credentials', {})
+                    if share_creds:
+                        self.logger.info(f"📁 Loaded credentials for {len(share_creds)} network share(s) from local config")
+                    return share_creds
+        except Exception as e:
+            self.logger.warning(f"Could not load local credentials: {e}")
+        
+        return {}
+    
+    def _get_full_config(self) -> Dict:
+        """Return full agent configuration for GUI display"""
+        try:
+            config_data = {
+                "agent_version": AGENT_VERSION,
+                "machine_fingerprint": self.config.machine_fingerprint,
+                "manager_url": self.config.manager_url,
+                "hostname": platform.node(),
+                "platform": platform.system(),
+                "python_version": platform.python_version(),
+                "scanners_enabled": list(self.scanners.keys()),
+                "heartbeat_interval": self.config.heartbeat_interval,
+                "job_poll_interval": self.config.job_poll_interval,
+                "max_concurrent_jobs": self.config.max_concurrent_jobs,
+                "max_cpu_percent": self.config.max_cpu_percent,
+                "max_memory_mb": self.config.max_memory_mb,
+                "current_job": self.current_job,
+                "running": self.running,
+            }
+            
+            # Add detection engine capabilities
+            config_data["detection_engine"] = {
+                "available": DETECTION_ENGINE_AVAILABLE,
+                "pdf_support": PDF_AVAILABLE,
+                "ocr_tesseract": TESSERACT_AVAILABLE,
+                "ocr_easyocr": EASYOCR_AVAILABLE,
+                "word_support": DOCX_AVAILABLE,
+                "excel_support": OPENPYXL_AVAILABLE,
+            }
+            
+            # Get actual capabilities from custom scanner if available
+            if "custom" in self.scanners:
+                scanner = self.scanners.get("custom")
+                if hasattr(scanner, "_detection_engine") and scanner._detection_engine:
+                    config_data["detection_capabilities"] = scanner._detection_engine.get_capabilities()
+            
+            # Add stored credentials info (paths only, not passwords)
+            creds = self._load_local_credentials()
+            config_data["stored_credentials"] = {
+                path: {"username": cred.get("username", ""), "has_password": bool(cred.get("password"))}
+                for path, cred in creds.items()
+            }
+            
+            return {"status": "ok", "config": config_data}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    
+    def _list_stored_credentials(self) -> Dict:
+        """List stored CIFS credentials (paths and usernames, not passwords)"""
+        try:
+            creds = self._load_local_credentials()
+            credentials_list = []
+            for path, cred in creds.items():
+                credentials_list.append({
+                    "path": path,
+                    "username": cred.get("username", ""),
+                    "has_password": bool(cred.get("password")),
+                    "domain": cred.get("domain", "")
+                })
+            return {"status": "ok", "credentials": credentials_list, "count": len(credentials_list)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    
+    def _list_cifs_paths(self) -> Dict:
+        """List CIFS paths from stored credentials for folder browser"""
+        try:
+            creds = self._load_local_credentials()
+            paths = []
+            for path in creds.keys():
+                # Check if path is accessible
+                accessible = os.path.exists(path)
+                paths.append({
+                    "path": path,
+                    "accessible": accessible,
+                    "type": "network_share"
+                })
+            return {"status": "ok", "paths": paths, "count": len(paths)}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    
     def _update_agent(self) -> Dict:
         """Download and update agent script from server"""
         try:
@@ -1514,6 +2128,12 @@ class SecretSnipeEnterpriseAgent:
         """Process a scan job"""
         job_id = job.get("job_id") or job.get("id")
         self.current_job = job_id
+        self.cancel_current_job = False  # Reset cancel flag for new job
+        connected_shares = []  # Track shares we connected to for cleanup
+        
+        # Update job status to running
+        self.client.update_job_status(job_id, "running")
+        self.logger.info(f"▶️ Job {job_id} status updated to 'running'")
         
         try:
             # Get scan paths - can be array (scan_paths) or single path (target_path)
@@ -1533,7 +2153,15 @@ class SecretSnipeEnterpriseAgent:
             scan_type = job.get("job_type", "full")
             options = job.get("config", {})
             
+            # Get share credentials from job config and local storage
+            job_credentials = options.get("share_credentials", {})
+            local_credentials = self._load_local_credentials()
+            # Merge: job credentials take priority
+            share_credentials = {**local_credentials, **job_credentials}
+            
             self.logger.info(f"Processing job {job_id}: {scan_paths}")
+            if share_credentials:
+                self.logger.info(f"📁 Share credentials available for {len(share_credentials)} path(s)")
             
             if not scan_paths:
                 raise ValueError("No scan paths specified in job")
@@ -1549,20 +2177,44 @@ class SecretSnipeEnterpriseAgent:
             all_findings = []
             
             for target_path in scan_paths:
+                actual_path = target_path
+                
+                # Check if this is a UNC path (network share)
+                if target_path.startswith('\\\\') or target_path.startswith('//'):
+                    # Try to connect to the network share with credentials
+                    creds = share_credentials.get(target_path, {})
+                    if creds:
+                        username = creds.get('username')
+                        password = creds.get('password')
+                        if username and password:
+                            self.logger.info(f"🔗 Connecting to network share: {target_path}")
+                            connected = self._connect_network_share(target_path, username, password)
+                            if connected:
+                                connected_shares.append(target_path)
+                            else:
+                                self.logger.warning(f"Failed to connect to {target_path}, trying without credentials")
+                
                 # Validate target path exists and is accessible
-                if not os.path.exists(target_path):
+                if not os.path.exists(actual_path):
                     self.logger.warning(f"Target path does not exist: {target_path}")
                     continue
                 
                 self.logger.info(f"Scanning path: {target_path}")
                 
                 for scanner_name in scanners_to_use:
+                    # Check for cancellation before each scanner
+                    if self.cancel_current_job:
+                        self.logger.warning(f"⛔ Job {job_id} cancelled - stopping scan")
+                        raise InterruptedError("Job cancelled by server")
+                    
                     if scanner_name in self.scanners:
                         scanner = self.scanners[scanner_name]
                         self.logger.info(f"Running {scanner_name} scanner...")
                         
                         try:
-                            findings = scanner.scan(target_path, options)
+                            # Pass job_id in options for checkpoint functionality
+                            scan_options = {**options, "job_id": job_id}
+                            findings = scanner.scan(target_path, scan_options)
                             self.logger.info(f"{scanner_name} found {len(findings)} issues")
                             all_findings.extend(findings)
                         except Exception as e:
@@ -1581,6 +2233,63 @@ class SecretSnipeEnterpriseAgent:
         
         finally:
             self.current_job = None
+            # Disconnect from any network shares we connected to
+            for share_path in connected_shares:
+                self._disconnect_network_share(share_path)
+    
+    def _connect_network_share(self, unc_path: str, username: str, password: str) -> bool:
+        """Connect to a network share using credentials"""
+        if platform.system() != "Windows":
+            self.logger.warning("Network share mounting only supported on Windows")
+            return False
+        
+        try:
+            import subprocess
+            
+            # Normalize path
+            unc_path = unc_path.replace('/', '\\')
+            if not unc_path.startswith('\\\\'):
+                unc_path = '\\\\' + unc_path.lstrip('\\')
+            
+            # Check if already accessible
+            if os.path.exists(unc_path):
+                self.logger.info(f"Network share already accessible: {unc_path}")
+                return True
+            
+            # Connect with credentials
+            cmd = ['net', 'use', unc_path, f'/user:{username}', password, '/persistent:no']
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                self.logger.info(f"✅ Connected to network share: {unc_path}")
+                return True
+            else:
+                # Check if already connected error
+                if "already" in result.stderr.lower() or "duplicate" in result.stderr.lower():
+                    self.logger.info(f"Network share already connected: {unc_path}")
+                    return True
+                self.logger.error(f"Failed to connect to {unc_path}: {result.stderr}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"Timeout connecting to {unc_path}")
+            return False
+        except Exception as e:
+            self.logger.error(f"Error connecting to network share: {e}")
+            return False
+    
+    def _disconnect_network_share(self, unc_path: str):
+        """Disconnect from a network share"""
+        if platform.system() != "Windows":
+            return
+        
+        try:
+            import subprocess
+            subprocess.run(['net', 'use', unc_path, '/delete', '/y'], 
+                         capture_output=True, timeout=10)
+            self.logger.info(f"Disconnected from {unc_path}")
+        except Exception as e:
+            self.logger.warning(f"Could not disconnect from {unc_path}: {e}")
     
     def _deduplicate_findings(self, findings: List[Dict]) -> List[Dict]:
         """Remove duplicate findings"""

@@ -245,9 +245,9 @@ services:
       DASHBOARD_PORT: 8052
       DASHBOARD_DEBUG: "false"
       DASHBOARD_RATE_LIMIT: "true"
-      # Dashboard Authentication
-      DASH_USERNAME: ${DASH_USERNAME:-admin}
-      DASH_PASSWORD: ${DASH_PASSWORD:-secretsnipe}
+      # Dashboard Authentication (set in .env file)
+      DASH_USERNAME: ${DASH_USERNAME}
+      DASH_PASSWORD: ${DASH_PASSWORD}
       # Email Configuration (optional - can also be set via GUI)
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}

@@ -374,12 +374,12 @@ def api_trigger_scan():
 
 @server.route('/api/download/agent/windows-installer', methods=['GET'])
 def download_windows_installer():
-    """Download the Windows agent installer script"""
+    """Download the Windows agent installer script - public endpoint for easy deployment"""
     from flask import send_file, jsonify
     import os
     
-    if not session.get('authenticated'):
-        return jsonify({'error': 'Not authenticated'}), 401
+    # NOTE: This endpoint is intentionally public to allow easy deployment
+    # The installer script contains no secrets - the API key is provided during installation
     
     # Path to the installer script
     installer_path = os.path.join(os.path.dirname(__file__), 
@@ -394,8 +394,11 @@ def download_windows_installer():
         logger.error(f"Windows installer not found at {installer_path}")
         return jsonify({'error': 'Installer not found'}), 404
     
-    logger.info(f"User {session.get('username')} downloaded Windows agent installer")
-    audit_log('agent_download', session.get('username'), {'type': 'windows-installer'})
+    if session.get('authenticated'):
+        logger.info(f"User {session.get('username')} downloaded Windows agent installer")
+        audit_log('agent_download', session.get('username'), {'type': 'windows-installer'})
+    else:
+        logger.info("Anonymous download of Windows agent installer")
     
     # Read file content to ensure proper encoding
     with open(installer_path, 'rb') as f:
@@ -494,6 +497,158 @@ Restart-Service SecretSnipeAgent
 1. Test connectivity: `Test-NetConnection -ComputerName your-server -Port 8443`
 2. Verify firewall allows outbound HTTPS
 3. Check API key is valid in Administration console
+
+## Support
+
+For issues, check the logs first, then contact your SecretSnipe administrator.
+'''
+    
+    return Response(readme_content, mimetype='text/markdown')
+
+
+@server.route('/api/download/agent/linux-installer', methods=['GET'])
+def download_linux_installer():
+    """Download the Linux agent installer script - public endpoint for easy deployment"""
+    from flask import send_file, jsonify
+    import os
+    
+    # Path to the installer script
+    installer_path = os.path.join(os.path.dirname(__file__), 
+                                   'agent_project', 'linux_installer', 
+                                   'install_agent.sh')
+    
+    # Also check in mounted path (for Docker)
+    if not os.path.exists(installer_path):
+        installer_path = '/app/agent_project/linux_installer/install_agent.sh'
+    
+    if not os.path.exists(installer_path):
+        logger.error(f"Linux installer not found at {installer_path}")
+        return jsonify({'error': 'Installer not found'}), 404
+    
+    if session.get('authenticated'):
+        logger.info(f"User {session.get('username')} downloaded Linux agent installer")
+        audit_log('agent_download', session.get('username'), {'type': 'linux-installer'})
+    else:
+        logger.info("Anonymous download of Linux agent installer")
+    
+    # Read file content
+    with open(installer_path, 'rb') as f:
+        content = f.read()
+    
+    from flask import Response
+    return Response(
+        content,
+        mimetype='application/octet-stream',
+        headers={
+            'Content-Disposition': 'attachment; filename=install_agent.sh',
+            'Content-Type': 'application/octet-stream; charset=utf-8'
+        }
+    )
+
+
+@server.route('/api/download/agent/linux-readme', methods=['GET'])
+def download_linux_readme():
+    """View/download the Linux agent documentation"""
+    from flask import Response
+    
+    if not session.get('authenticated'):
+        return Response("Not authenticated", status=401)
+    
+    readme_content = '''# SecretSnipe Linux Agent Installation Guide
+
+## Prerequisites
+
+- Linux (RHEL 8+, Ubuntu 20.04+, Debian 11+, CentOS 8+, Fedora 35+, SUSE)
+- Python 3.8 or later
+- Root/sudo access for installation
+- Network access to SecretSnipe Manager API (port 8443)
+
+## Quick Installation
+
+```bash
+# Download and run installer (as root or with sudo)
+curl -sL http://your-server:8443/api/download/agent/linux-installer -o install_agent.sh
+chmod +x install_agent.sh
+sudo SS_API_KEY="your-api-key" SS_SERVER_URL="http://your-server:8443" ./install_agent.sh install
+```
+
+## Installation Options
+
+| Command | Description |
+|---------|-------------|
+| `install` | Full installation (default) |
+| `update` | Update agent to latest version |
+| `uninstall` | Remove the agent completely |
+| `status` | Show agent status |
+| `restart` | Restart the agent service |
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SS_SERVER_URL` | Manager server URL | http://10.150.110.24:8443 |
+| `SS_API_KEY` | API key for registration | (prompted if not set) |
+
+## Post-Installation
+
+### Verify Service Status
+```bash
+sudo systemctl status secretsnipe-agent
+```
+
+### View Logs
+```bash
+sudo journalctl -u secretsnipe-agent -f
+# or
+tail -f /opt/secretsnipe/logs/agent.log
+```
+
+### Restart Service
+```bash
+sudo systemctl restart secretsnipe-agent
+```
+
+## Features
+
+- **Full V1 Scanner Parity**: PDF, Excel, Word, OCR support
+- **Systemd Integration**: Automatic start, restart on failure
+- **Resource Limits**: CPU and memory limits via systemd
+- **Gitleaks Integration**: Enterprise-grade secret scanning
+- **NFS/SMB Support**: Scan network shares
+
+## File Locations
+
+| Path | Description |
+|------|-------------|
+| `/opt/secretsnipe/` | Installation directory |
+| `/opt/secretsnipe/config.json` | Configuration file |
+| `/opt/secretsnipe/logs/` | Log files |
+| `/opt/secretsnipe/scanners/` | Gitleaks and other scanners |
+
+## Uninstallation
+
+```bash
+sudo ./install_agent.sh uninstall
+```
+
+## Dependencies Installed
+
+- PyMuPDF (PDF extraction)
+- openpyxl, xlrd (Excel support)
+- python-docx (Word documents)
+- pytesseract (OCR with Tesseract)
+- Gitleaks (secret scanner)
+
+## Troubleshooting
+
+### Service Won't Start
+1. Check logs: `journalctl -u secretsnipe-agent -n 50`
+2. Verify Python: `python3 --version`
+3. Check config: `cat /opt/secretsnipe/config.json`
+
+### OCR Not Working
+1. Install Tesseract: `sudo apt install tesseract-ocr` (Ubuntu/Debian)
+2. Or: `sudo dnf install tesseract` (RHEL/Fedora)
 
 ## Support
 
@@ -2184,11 +2339,12 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                     )
                 ], style={'textAlign': 'center'}),
                 
-                # Owner/notification info
+                # Owner/notification info with assignment dropdown
                 html.Div([
                     html.Div([
-                        html.Label("👤 Owner:"),
-                        html.Div(row.get('owner_name', 'Not assigned'), className="detail-value")
+                        html.Label("👤 Current Owner:"),
+                        html.Div(row.get('owner_name', 'Not assigned'), className="detail-value", 
+                                style={'color': '#22c55e' if row.get('owner_name') else '#9ca3af'})
                     ], className="detail-field-small"),
                     html.Div([
                         html.Label("📧 Owner Email:"),
@@ -2199,6 +2355,40 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
                         html.Div("Yes" if row.get('email_notified') else "No", className="detail-value")
                     ], className="detail-field-small"),
                 ], className="detail-metadata-row", style={'marginTop': '15px'}),
+                
+                # Owner assignment dropdown (V2 feature - integrates with Contacts/Address Book)
+                html.Div([
+                    html.Label("🔄 Assign/Change Owner:", style={'color': '#60a5fa', 'fontWeight': 'bold'}),
+                    html.Div([
+                        dcc.Dropdown(
+                            id='finding-owner-dropdown',
+                            placeholder='Select from contacts...',
+                            clearable=True,
+                            style={
+                                'backgroundColor': '#2d2d2d',
+                                'color': '#e0e0e0',
+                                'borderColor': '#444',
+                                'minWidth': '250px'
+                            }
+                        ),
+                        html.Button(
+                            "Assign",
+                            id='assign-owner-btn',
+                            n_clicks=0,
+                            style={
+                                'marginLeft': '10px',
+                                'backgroundColor': '#22c55e',
+                                'color': 'white',
+                                'border': 'none',
+                                'padding': '8px 16px',
+                                'borderRadius': '4px',
+                                'cursor': 'pointer',
+                                'fontWeight': 'bold'
+                            }
+                        ),
+                    ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '8px'}),
+                    html.Div(id='owner-assignment-status', style={'marginTop': '8px', 'fontSize': '12px'})
+                ], style={'marginTop': '15px', 'padding': '10px', 'backgroundColor': '#1e3a5f', 'borderRadius': '6px'}),
                 
                 # Metadata row
                 html.Div([
@@ -2277,6 +2467,147 @@ def show_finding_detail(active_cell, close_bottom_clicks, table_data, current_cl
             return "modal-container show", detail_content, finding_store_data
     
     return current_class or "modal-container", [], {}
+
+
+# Owner Assignment Callbacks (V2 Feature - integrates with Contacts/Address Book)
+@app.callback(
+    Output("finding-owner-dropdown", "options"),
+    [Input("finding-detail-modal", "className")],
+    prevent_initial_call=True
+)
+def populate_owner_dropdown(modal_class):
+    """Populate owner dropdown with contacts from address book when modal opens"""
+    if "show" not in (modal_class or ""):
+        return []
+    
+    try:
+        if AGENT_ADMIN_AVAILABLE:
+            # Use agent database for contacts
+            import psycopg2
+            import psycopg2.extras
+            
+            agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+            agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+            
+            conn = psycopg2.connect(
+                host=agent_db_host,
+                port=agent_db_port,
+                database='secretsnipe_agents',
+                user='secretsnipe',
+                password='secretsnipe_secure_pass',
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT contact_id, name, email, department 
+                FROM address_book 
+                WHERE is_active = true 
+                ORDER BY name
+            """)
+            contacts = cur.fetchall()
+            cur.close()
+            conn.close()
+            
+            options = []
+            for contact in contacts:
+                label = f"{contact['name']}"
+                if contact.get('department'):
+                    label += f" ({contact['department']})"
+                label += f" - {contact['email']}"
+                options.append({
+                    'label': label,
+                    'value': str(contact['contact_id'])
+                })
+            return options
+        else:
+            return [{'label': 'Contacts not available', 'value': '', 'disabled': True}]
+    except Exception as e:
+        logger.error(f"Error loading contacts for dropdown: {e}")
+        return [{'label': f'Error loading contacts', 'value': '', 'disabled': True}]
+
+
+@app.callback(
+    Output("owner-assignment-status", "children"),
+    [Input("assign-owner-btn", "n_clicks")],
+    [State("finding-owner-dropdown", "value"),
+     State("finding-detail-store", "data")],
+    prevent_initial_call=True
+)
+def assign_finding_owner(n_clicks, contact_id, finding_data):
+    """Assign a contact as owner of the current finding"""
+    if not n_clicks or not contact_id or not finding_data:
+        return ""
+    
+    finding_id = finding_data.get('id')
+    if not finding_id:
+        return html.Span("Error: No finding selected", style={'color': '#ef4444'})
+    
+    try:
+        if AGENT_ADMIN_AVAILABLE:
+            import psycopg2
+            import psycopg2.extras
+            
+            agent_db_host = os.environ.get('AGENT_DB_HOST', '10.150.110.24')
+            agent_db_port = int(os.environ.get('AGENT_DB_PORT', 5433))
+            
+            conn = psycopg2.connect(
+                host=agent_db_host,
+                port=agent_db_port,
+                database='secretsnipe_agents',
+                user='secretsnipe',
+                password='secretsnipe_secure_pass',
+                cursor_factory=psycopg2.extras.RealDictCursor
+            )
+            cur = conn.cursor()
+            
+            # Get contact info
+            cur.execute("SELECT name, email FROM address_book WHERE contact_id = %s::uuid", (contact_id,))
+            contact = cur.fetchone()
+            
+            if not contact:
+                cur.close()
+                conn.close()
+                return html.Span("Error: Contact not found", style={'color': '#ef4444'})
+            
+            # Check if this is an agent finding (in agent_findings table)
+            scan_mode = None
+            try:
+                if redis_manager.cache_manager:
+                    scan_mode = redis_manager.cache_manager.get('scan_mode', 'current')
+            except Exception:
+                pass
+            
+            if scan_mode in ('agents', 'agent_only'):
+                # Update agent_findings table
+                cur.execute("""
+                    UPDATE agent_findings 
+                    SET owner_id = %s::uuid, owner_email = %s, owner_name = %s, 
+                        owner_assigned_at = NOW(), owner_assigned_by = 'dashboard'
+                    WHERE id = %s::uuid
+                """, (contact_id, contact['email'], contact['name'], finding_id))
+            else:
+                # Update V1 findings table
+                cur.execute("""
+                    UPDATE findings 
+                    SET assigned_owner = %s, owner_email = %s
+                    WHERE id = %s::uuid
+                """, (contact['name'], contact['email'], finding_id))
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            logger.info(f"Assigned owner {contact['name']} to finding {finding_id}")
+            return html.Span(
+                f"✅ Owner assigned: {contact['name']} ({contact['email']})", 
+                style={'color': '#22c55e'}
+            )
+        else:
+            return html.Span("Agent admin module not available", style={'color': '#ef4444'})
+            
+    except Exception as e:
+        logger.error(f"Error assigning owner: {e}")
+        return html.Span(f"Error: {str(e)}", style={'color': '#ef4444'})
 
 
 # Quick date range buttons callback
@@ -5258,14 +5589,7 @@ def create_main_dashboard_layout():
     """Create the main findings dashboard layout (V2 - Simplified)"""
     # V2: Simplified dashboard - scan controls moved to Administration
     return html.Div([
-        # Notification area - visible at top
-        html.Div([
-            html.Div(id="scan-result-notification", className="notification-area"),
-            html.Div(id="cleanup-result-notification", className="notification-area"),
-        ], id="notification-container", style={
-            'position': 'fixed', 'top': '10px', 'right': '10px', 'zIndex': '10000',
-            'maxWidth': '400px'
-        }),
+        # V2: Notifications moved to Administration page
 
         # Main container
         html.Div([
@@ -5278,17 +5602,18 @@ def create_main_dashboard_layout():
                 ], className="header-content"),
 
                 html.Div([
-                    # V2: Simplified controls - Detailed config is in Administration
+                    # V2: Simplified controls - Scan/Cleanup moved to Administration
                     html.Div([
                         html.Button("🔄 Refresh Data", id="refresh-btn", className="refresh-btn",
                             title="Refresh findings data from database"),
-                        html.Button("▶️ Run Scans", id="quick-scan-btn", className="scan-btn",
-                            title="Run all configured scan targets (see Administration for config)"),
-                        html.Button("🧹 Cleanup Old Data", id="cleanup-btn", className="cleanup-btn",
-                            title="Remove findings older than 30 days"),
-                        # Hidden buttons for compatibility - callbacks still exist
+                        # Hidden buttons for callback compatibility
+                        html.Button("", id="quick-scan-btn", style={'display': 'none'}),
+                        html.Button("", id="cleanup-btn", style={'display': 'none'}),
                         html.Button("", id="custom-scan-btn", style={'display': 'none'}),
                         html.Button("", id="btn-project-manager", n_clicks=0, style={'display': 'none'}),
+                        # Hidden notification outputs for callback compatibility
+                        html.Div(id="scan-result-notification", style={'display': 'none'}),
+                        html.Div(id="cleanup-result-notification", style={'display': 'none'}),
                     ], className="control-item")
                 ], className="header-controls")
             ], className="header"),
@@ -7069,14 +7394,16 @@ SecretSnipe Security Team''',
                     html.Div([
                         html.Label("Owner Name:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
                         dcc.Input(id='notify-owner-name', type='text', placeholder='John Smith',
-                                  style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
-                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                                  style={'width': '100%', 'padding': '12px', 'backgroundColor': '#1e1e1e',
+                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px',
+                                         'lineHeight': '1.4', 'fontSize': '14px', 'boxSizing': 'border-box'}),
                     ], style={'marginBottom': '15px'}),
                     html.Div([
                         html.Label("Owner Email:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
                         dcc.Input(id='notify-owner-email', type='email', placeholder='jsmith@company.com',
-                                  style={'width': '100%', 'padding': '10px', 'backgroundColor': '#1e1e1e',
-                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                                  style={'width': '100%', 'padding': '12px', 'backgroundColor': '#1e1e1e',
+                                         'color': '#e0e0e0', 'border': '1px solid #555', 'borderRadius': '4px',
+                                         'lineHeight': '1.4', 'fontSize': '14px', 'boxSizing': 'border-box'}),
                     ], style={'marginBottom': '15px'}),
                     html.Div([
                         html.Label("Escalation Timeline:", style={'color': '#e0e0e0', 'marginBottom': '5px', 'display': 'block'}),
@@ -7431,6 +7758,15 @@ app.index_string = '''
                 margin: 0;
                 padding: 0;
                 background-color: #1a1a1a;
+            }
+
+            /* Fix input text cutoff - global rule */
+            input[type="text"], input[type="email"], input[type="password"], input[type="number"],
+            .Select-input input, .dash-dropdown input {
+                line-height: 1.4 !important;
+                font-size: 14px !important;
+                box-sizing: border-box !important;
+                min-height: 38px !important;
             }
 
             /* Dark mode override for body background */

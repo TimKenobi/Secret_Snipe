@@ -1299,6 +1299,77 @@ async def download_installer_script():
     raise HTTPException(status_code=404, detail="Installer script not found")
 
 
+@app.get(f"/api/{API_VERSION}/agent/download/detection_engine")
+async def download_detection_engine():
+    """Download the detection engine module - public endpoint (no auth required)"""
+    from fastapi.responses import FileResponse
+    
+    script_locations = [
+        Path(__file__).parent.parent / "windows_installer" / "detection_engine.py",
+        Path(__file__).parent / "detection_engine.py",
+        Path("/app/windows_installer/detection_engine.py"),
+    ]
+    
+    for script_path in script_locations:
+        if script_path.exists():
+            logger.info(f"Serving detection engine from {script_path}")
+            return FileResponse(
+                path=str(script_path),
+                filename="detection_engine.py",
+                media_type="text/x-python"
+            )
+    
+    raise HTTPException(status_code=404, detail="Detection engine not found")
+
+
+@app.get(f"/api/{API_VERSION}/agent/download/signatures")
+async def download_signatures():
+    """Download the signatures.json file - public endpoint (no auth required)"""
+    from fastapi.responses import FileResponse
+    
+    # Look in main project directory and fallback locations
+    script_locations = [
+        Path(__file__).parent.parent.parent / "signatures.json",  # Main project dir
+        Path(__file__).parent.parent / "windows_installer" / "signatures.json",
+        Path("/app/signatures.json"),
+        Path("/app/windows_installer/signatures.json"),
+    ]
+    
+    for script_path in script_locations:
+        if script_path.exists():
+            logger.info(f"Serving signatures from {script_path}")
+            return FileResponse(
+                path=str(script_path),
+                filename="signatures.json",
+                media_type="application/json"
+            )
+    
+    raise HTTPException(status_code=404, detail="Signatures file not found")
+
+
+@app.get(f"/api/{API_VERSION}/installer/linux/download")
+async def download_linux_installer():
+    """Download the Linux installer script - public endpoint (no auth required)"""
+    from fastapi.responses import FileResponse
+    
+    script_locations = [
+        Path(__file__).parent.parent / "linux_installer" / "install_agent.sh",
+        Path(__file__).parent / "install_agent.sh",
+        Path("/app/linux_installer/install_agent.sh"),
+    ]
+    
+    for script_path in script_locations:
+        if script_path.exists():
+            logger.info(f"Serving Linux installer from {script_path}")
+            return FileResponse(
+                path=str(script_path),
+                filename="install_agent.sh",
+                media_type="application/octet-stream"
+            )
+    
+    raise HTTPException(status_code=404, detail="Linux installer script not found")
+
+
 @app.post(f"/api/{API_VERSION}/agents/{{agent_id}}/action")
 async def trigger_agent_action(
     agent_id: str, 
@@ -1551,6 +1622,29 @@ async def submit_job_results(job_id: str, request: JobResultsSubmission, key_inf
             "findings_submitted": len(request.findings),
             "findings_inserted": findings_inserted
         }
+    ).to_dict()
+
+
+class JobStatusOnlyUpdate(BaseModel):
+    """Request model for status-only update"""
+    status: str
+    files_scanned: Optional[int] = 0
+
+
+@app.post(f"/api/{API_VERSION}/jobs/{{job_id}}/status")
+async def update_job_status_only(job_id: str, request: JobStatusOnlyUpdate, key_info: Dict = Depends(verify_api_key)):
+    """Update job status only (e.g., to 'running') - lightweight update without results"""
+    status_update = JobStatusUpdate(
+        status=request.status,
+        files_scanned=request.files_scanned
+    )
+    db_manager.update_job_status(job_id, status_update)
+    
+    logger.info(f"Job {job_id} status updated to: {request.status}")
+    return APIResponse(
+        success=True,
+        message="Status updated",
+        data={"job_id": job_id, "status": request.status}
     ).to_dict()
 
 
